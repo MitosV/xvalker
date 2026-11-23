@@ -4021,7 +4021,12 @@ const MESH_OUTPUT_BYTES: u32 = 32768;
 /// mesh output limit as they are, else the triangles are split into runs whose own vertex
 /// copies (3 per triangle) fit. `elements`: output elements besides SV_Position.
 pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
-    let vbytes = 16 * (1 + elements as u32);
+    // DXC's mesh validator rounds the per-vertex stride up to a power of two of
+    // 16-byte output elements (SV_Position included): 17 elements cost 32 slots,
+    // not 17. Check the same 32 KB budget it checks, otherwise the pass-through
+    // fails with "vertex plus primitive output size is greater than 32768".
+    let slots = (1 + elements as u32).next_power_of_two();
+    let vbytes = 16 * slots;
     if vbytes * ms.max_vertices <= MESH_OUTPUT_BYTES {
         return 1;
     }

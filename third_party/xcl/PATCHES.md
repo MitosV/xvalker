@@ -245,3 +245,13 @@ Compute/mesh/geometry run one logical wave64 as two 32-lane subgroups in one wor
 `ds_bpermute`, `v_readlane` and `v_writelane` of the other half publish values in
 `groupshared uint xcl_xchg[64]` and exchange them with two group barriers. VS/PS have no
 workgroup and still refuse these reads (one invocation per fragment/vertex).
+
+## `src/gpu/recomp/emit.rs` (mesh pass-through vertex stride)
+
+`passthrough_split` budgeted the per-vertex output as `16 * (1 + elements)`, but DXC's
+mesh validator pads the stride to a power of two of 16-byte elements (SV_Position
+included): 21 outputs cost 32 slots = 512 bytes per vertex. With 78 vertices that
+exceeded the 32 KB group limit and DXC reported "vertex plus primitive output size is
+greater than 32768" (19 MS programs). Round the stride the same way before deciding
+how many groups a mesh record needs.
+
