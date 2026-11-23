@@ -1,5 +1,21 @@
 # Third party
 
+## BCPack decoder (GPL-3.0-or-later, MIT, Apache-2.0)
+
+`third_party/bcpack/` is the BCPack decoder of the `xbox-emulator` project
+(the `crates/compat/xcrdapi/src/bcpack/` module, commit `d8d37e4`), copied byte
+for byte: the rANS entropy layer and the BC1 block rebuilder, with the tests
+and the golden hashes. The rANS code comes from `bcpack-rs` (MIT OR
+Apache-2.0) and `silicon-rans` (MIT); their license texts are next to the
+sources as `LICENSE-*`.
+
+`tools/bcpack/src/bc1_history.rs`, `tools/bcpack/src/bc1_quad.rs` and
+`tools/bcpack/src/bc345.rs` are a Rust port of the clean-room BCPack decoder
+of the Leonida project (`tools/bcpack.py` and `tools/bcpack_tables.py`,
+GPL-3.0-or-later): the BC1 built-in history and quadrant codes, and the
+strict BC3, BC4 and BC5 block rebuilders. Only the entries that decoder marks
+as confirmed are used.
+
 ## xbdepends tables (Microsoft, MIT)
 
 `src/analysis/xbdepends_data.hpp` is generated from the DLL and API name
