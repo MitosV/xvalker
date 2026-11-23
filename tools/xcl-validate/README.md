@@ -109,3 +109,27 @@ The 23 GPU timeouts are `GPU did not finish within 10 s (device removed: Ok(()))
 from XCL's runner; they are reported as not-run, not as equal. The 8 XCL
 `cannot decode` errors and the cpu_ref unsupported cases are harness coverage
 limits, not shader result mismatches.
+
+## Exact program code (s4-r4)
+
+The carved `.bin` files append the FSSM constant data blocks after the program's
+last `s_endpgm` (44–84 bytes). XCL classifies them as `data_blocks`, not code; their
+first word after the guard `s_endpgm` is a constant such as `0x00000008`, which the
+translator reports as `cannot decode (Unknown(8))`. To use the program exactly as
+XCL parses it:
+
+```sh
+cd tools/xcl-recomp
+cargo build --release
+./target/release/xcl-corpus /mnt/games/GTA/GTA6.Xbox.v1.0.2.1/shaders.rpf \
+  --dump-code /tmp/opencode/s4-r4/xcl-codes.json
+cd ../xcl-validate
+python3 build_scenarios.py --xcl-code /tmp/opencode/s4-r4/xcl-codes.json \
+  --out /tmp/opencode/s4-r4/scenarios
+```
+
+The builder strips the same 6-instruction (24-byte) entry prologue as the carve and
+uses `f.programs[p.offset..p.offset+p.len]`, so no data block reaches the translator.
+All 8 shaders that previously failed to decode now run on the GPU; their CPU
+reference is unsupported (`v_cos_f32`, `s_getpc_b64`, `v_xnor_b32`, `v_mul_hi_i32`,
+a16/d16 image access, non-finite sample coordinate).
