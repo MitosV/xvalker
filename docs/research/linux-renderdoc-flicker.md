@@ -57,3 +57,9 @@ That is what was seen; why was not looked into. The user is made in
 in, not a guest, `xuid` 2535400000000001, local id 1, gamertag `Player` (or `XV_GAMERTAG`),
 every privilege allowed, and a token request that fails with `0x80072EFD` so that the title
 goes offline. It replaces the profile's xuid and gamertag when set. Not tried with a title.
+
+## XCL backend status (2026-11-23)
+
+`XV_SHADER_BACKEND=xcl` no longer loses the device in Minecraft (draws whose ABI cannot be bound are skipped), but the
+frame it presents is the title's font atlas, not the menu: what reaches the screen is still wrong. The default backend
+is unaffected.
