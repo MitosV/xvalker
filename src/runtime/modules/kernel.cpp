@@ -91,21 +91,29 @@ std::wstring console_path(const wchar_t *name) {
     if (!name)
         return {};
     const std::wstring_view path(name);
+    // the drive alone ("T:") is its root too: titles that make a folder's parents first ask
+    // for each of them, the drive included
     const auto drive = [&](std::wstring_view prefix) {
-        return path.size() > prefix.size() &&
+        return path.size() >= prefix.size() &&
                CompareStringOrdinal(path.data(), static_cast<int>(prefix.size()), prefix.data(),
                                     static_cast<int>(prefix.size()), TRUE) == CSTR_EQUAL &&
-               (path[prefix.size()] == L'\\' || path[prefix.size()] == L'/');
+               (path.size() == prefix.size() || path[prefix.size()] == L'\\' ||
+                path[prefix.size()] == L'/');
+    };
+    // what follows the drive and its separator
+    const auto rest = [&](std::wstring_view prefix) {
+        return path.size() > prefix.size() + 1 ? path.substr(prefix.size() + 1)
+                                               : std::wstring_view{};
     };
     std::error_code error;
-    if (drive(L"G:") || drive(L"GAME:")) {
-        const auto rest = path.substr(path.find(L':') + 2);
-        return (package_directory(std::filesystem::current_path(error)) / rest).wstring();
-    }
+    for (const auto prefix : {std::wstring_view(L"G:"), std::wstring_view(L"GAME:")})
+        if (drive(prefix))
+            return (package_directory(std::filesystem::current_path(error)) / rest(prefix))
+                .wstring();
     if (drive(L"T:")) {
         const auto folder = save_directory() / "Temp";
         std::filesystem::create_directories(folder, error);
-        return (folder / path.substr(3)).wstring();
+        return (folder / rest(L"T:")).wstring();
     }
     // C:\Users\DefaultUser and C:\Users\<Xbox user id> are where a GDK title keeps what it
     // writes on the console. On the host they are another user's folders, or nobody's.
@@ -232,7 +240,15 @@ HANDLE WINAPI find_first_file_a(const char *name, WIN32_FIND_DATAA *data) {
     return find;
 }
 BOOL WINAPI create_directory_w(const wchar_t *name, SECURITY_ATTRIBUTES *security) {
-    return CreateDirectoryW(console_path(name).c_str(), security);
+    const auto made = CreateDirectoryW(console_path(name).c_str(), security);
+    if (static const bool trace = std::getenv("XV_FILE_TRACE") != nullptr; trace) {
+        const auto error = made ? 0 : GetLastError();
+        std::fprintf(stderr, "[Runtime] CreateDirectoryW(%ls) thread %lu: %s %lu\n", name,
+                     GetCurrentThreadId(), made ? "made" : "error", error);
+        std::fflush(stderr);
+        SetLastError(error);
+    }
+    return made;
 }
 BOOL WINAPI remove_directory_w(const wchar_t *name) {
     return RemoveDirectoryW(console_path(name).c_str());
@@ -243,6 +259,13 @@ BOOL WINAPI move_file_ex_w(const wchar_t *from, const wchar_t *to, DWORD flags) 
 }
 BOOL WINAPI set_file_attributes_w(const wchar_t *name, DWORD attributes) {
     return SetFileAttributesW(console_path(name).c_str(), attributes);
+}
+// std::filesystem::copy_file of the C++ runtime a title brings
+HRESULT WINAPI copy_file2(const wchar_t *from, const wchar_t *to,
+                          COPYFILE2_EXTENDED_PARAMETERS *parameters) {
+    const auto result = CopyFile2(console_path(from).c_str(), console_path(to).c_str(), parameters);
+    note_missing("CopyFile2", from, FAILED(result));
+    return result;
 }
 // the ANSI ones, which titles of the older kits use for their own folders on the drives
 BOOL WINAPI create_directory_a(const char *name, SECURITY_ATTRIBUTES *security) {
@@ -348,7 +371,11 @@ int crt_wrename(const wchar_t *from, const wchar_t *to) {
     return XV_TITLE_CRT(_wrename)(console_path(from).c_str(), console_path(to).c_str());
 }
 int crt_wrmdir(const wchar_t *name) { return XV_TITLE_CRT(_wrmdir)(console_path(name).c_str()); }
-int crt_wmkdir(const wchar_t *name) { return XV_TITLE_CRT(_wmkdir)(console_path(name).c_str()); }
+int crt_wmkdir(const wchar_t *name) {
+    const auto result = XV_TITLE_CRT(_wmkdir)(console_path(name).c_str());
+    note_missing("_wmkdir", name, result != 0);
+    return result;
+}
 #undef XV_TITLE_CRT
 // What a title writes for a debugger: its own log, which is what says why it gives up.
 // Lines go to stderr as they come, without the trailing newline titles usually add.
@@ -553,6 +580,7 @@ const ApiFunction functions[] = {
     {"CreateDirectoryW", erase(create_directory_w)},
     {"RemoveDirectoryW", erase(remove_directory_w)},
     {"DeleteFileW", erase(delete_file_w)},
+    {"CopyFile2", erase(copy_file2)},
     {"MoveFileExW", erase(move_file_ex_w)},
     {"SetFileAttributesW", erase(set_file_attributes_w)},
     {"CreateDirectoryA", erase(create_directory_a)},
