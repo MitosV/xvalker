@@ -21,6 +21,7 @@
 #ifndef XVALKER_XCL_RECOMP_H
 #define XVALKER_XCL_RECOMP_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
