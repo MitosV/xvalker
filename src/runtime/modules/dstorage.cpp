@@ -1,5 +1,6 @@
 #include "runtime/modules/dstorage.hpp"
 #include "runtime/common/runtime.hpp"
+#include "runtime/modules/bcpack.h"
 #include "runtime/modules/inflate.hpp"
 #include "runtime/modules/kernel.hpp"
 #include "runtime/modules/placement.hpp"
@@ -20,8 +21,9 @@
 // DirectStorage as the Series console has it (dstorage_xs.dll, and XCRDAPI.dll for the
 // factory): queues of read requests, with marks in between that set a status or signal a
 // fence once everything before them is done. Here a queue does its work when it is
-// submitted, on the thread that submits it, in order. Reads may be inflated (zlib); the
-// console's texture compression (BCPack) is not known here, and such a request fails.
+// submitted, on the thread that submits it, in order. Reads may be inflated (zlib) and
+// decoded (BCPack, through bcpack.dll); the console's physical pages are not known here,
+// and such a request fails.
 namespace xv::runtime::modules {
 namespace {
 constexpr GUID file_iid{
@@ -168,29 +170,52 @@ class Status final : public Object<StatusInterface> {
     std::vector<Entry> entries_;
 };
 
+// The BCPack decoder, in bcpack.dll next to the executable. It is loaded when the first
+// compressed request comes; without it such a request fails as it did before.
+XvBcpackDecode bcpack_decoder() {
+    static XvBcpackDecode decoder = [] {
+        const auto module = LoadLibraryExW(L"bcpack.dll", nullptr,
+                                           LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
+                                               LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!module) {
+            if (static std::atomic<int> shown{0}; shown++ < 4)
+                std::fprintf(stderr,
+                             "[Runtime] DirectStorage: bcpack.dll is not next to the "
+                             "executable: compressed textures are not decoded\n");
+            return static_cast<XvBcpackDecode>(nullptr);
+        }
+        return reinterpret_cast<XvBcpackDecode>(
+            GetProcAddress(module, "xv_bcpack_decode"));
+    }();
+    return decoder;
+}
+
 HRESULT read(const Request &request) {
     constexpr UINT64 zlib = 1, bcpack = 0xf << 1, destination_pages = 1ull << 21,
                      from_memory = 1ull << 22, source_pages = 1ull << 23;
-    if (request.options & (bcpack | destination_pages | source_pages)) {
+    if (request.options & (destination_pages | source_pages)) {
         if (static std::atomic<bool> shown{false}; !shown.exchange(true))
             std::fprintf(stderr,
-                         "[Runtime] DirectStorage: a request with options 0x%llx (texture "
-                         "compression or physical pages), which is not done\n",
+                         "[Runtime] DirectStorage: a request with options 0x%llx (physical "
+                         "pages), which is not done\n",
                          request.options);
         return E_NOTIMPL;
     }
     if (!request.destination || !request.source)
         return E_INVALIDARG;
     const bool inflated = request.options & zlib;
+    const auto mode = static_cast<UINT32>((request.options & bcpack) >> 1);
     std::vector<std::uint8_t> packed;
     const std::uint8_t *data = nullptr;
     if (request.options & from_memory) {
         data = static_cast<const std::uint8_t *>(request.source);
     } else {
-        // read straight to where it goes unless it has to be inflated first
-        auto *const target = inflated ? (packed.resize(request.source_size), packed.data())
-                                      : static_cast<std::uint8_t *>(request.destination);
-        if (!inflated) {
+        // read straight to where it goes unless it has to be inflated or decoded first
+        const bool straight = !inflated && !mode;
+        auto *const target =
+            straight ? static_cast<std::uint8_t *>(request.destination)
+                     : (packed.resize(request.source_size), packed.data());
+        if (straight) {
             if (request.source_size > request.destination_size)
                 return E_INVALIDARG;
             prepare_title_write(target, request.source_size);
@@ -203,22 +228,35 @@ HRESULT read(const Request &request) {
                       request.source_size, &done, &at) ||
             done != request.source_size)
             return HRESULT_FROM_WIN32(GetLastError() ? GetLastError() : ERROR_HANDLE_EOF);
-        if (!inflated)
+        if (straight)
             return S_OK;
         data = packed.data();
     }
     prepare_title_write(request.destination, request.destination_size);
-    if (!inflated) {
-        if (request.source_size > request.destination_size)
-            return E_INVALIDARG;
-        std::memcpy(request.destination, data, request.source_size);
+    std::vector<std::uint8_t> plain;
+    if (inflated) {
+        if (!inflate_zlib({data, request.source_size}, plain) ||
+            plain.size() > request.destination_size)
+            return E_FAIL;
+        data = plain.data();
+    }
+    if (mode) {
+        // the console's texture compression, in bcpack.dll
+        const auto decoder = bcpack_decoder();
+        if (!decoder)
+            return E_NOTIMPL;
+        const auto result = decoder(mode, data, request.source_size,
+                                    static_cast<std::uint8_t *>(request.destination),
+                                    request.destination_size);
+        return FAILED(result) ? result : S_OK;
+    }
+    if (inflated) {
+        std::memcpy(request.destination, data, plain.size());
         return S_OK;
     }
-    std::vector<std::uint8_t> plain;
-    if (!inflate_zlib({data, request.source_size}, plain) ||
-        plain.size() > request.destination_size)
-        return E_FAIL;
-    std::memcpy(request.destination, plain.data(), plain.size());
+    if (request.source_size > request.destination_size)
+        return E_INVALIDARG;
+    std::memcpy(request.destination, data, request.source_size);
     return S_OK;
 }
 
