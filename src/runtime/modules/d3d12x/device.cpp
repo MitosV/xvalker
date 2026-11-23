@@ -3,6 +3,9 @@
 #include "runtime/modules/console_shader.hpp"
 #include "runtime/modules/d3d12x.hpp"
 #include "runtime/modules/d3d12x/internal.hpp"
+#include "runtime/modules/d3d12x/title_textures.hpp"
+#include "runtime/modules/d3d12x/uma.hpp"
+#include "runtime/modules/d3d12x/xcl_backend.hpp"
 #include "runtime/modules/placement.hpp"
 #include <algorithm>
 #include <array>
@@ -30,6 +33,10 @@ namespace xv::runtime::modules::d3d12x {
 namespace {
 Target console = Target::durango;
 AdapterWrapper adapter_wrapper = nullptr;
+// the console's resource states and layout, as the host's (defined further down)
+D3D12_RESOURCE_STATES host_state(D3D12_RESOURCE_STATES state);
+D3D12_RESOURCE_DESC host_resource_desc(const D3D12_RESOURCE_DESC &desc);
+bool mapped_address(const void *resource, std::uint64_t &address);
 template <class... Interfaces> bool is_any(REFIID iid) {
     return ((iid == __uuidof(Interfaces)) || ...);
 }
@@ -292,6 +299,21 @@ Slot *original_vtable(void *object) {
 template <class Method> Method original(void *object, std::size_t index) {
     return reinterpret_cast<Method>(original_vtable(object)[index]);
 }
+// A buffer of the title placed on a heap of the console's unified memory. A heap opened over
+// process memory takes these flags; the host's states and layout have been made already.
+HRESULT place_uma_buffer(ID3D12Device *self, ID3D12Heap *heap, std::uint64_t offset,
+                         const D3D12_RESOURCE_DESC &desc, D3D12_RESOURCE_STATES state,
+                         const D3D12_CLEAR_VALUE *clear, REFIID iid, void **resource) {
+    using Place = HRESULT(STDMETHODCALLTYPE *)(void *, ID3D12Heap *, UINT64,
+                                               const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES,
+                                               const D3D12_CLEAR_VALUE *, REFIID, void **);
+    auto host = desc;
+    host.Alignment = 0;
+    host.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        host.Flags | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+        D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+    return original<Place>(self, 29)(self, heap, offset, &host, state, clear, iid, resource);
+}
 // The host's runtime calls its own objects through their vtable too: a slot the console has
 // differently runs the console's method only when the title calls it, and the host's
 // otherwise (its callers pass the object first; the title's, for methods that return a
@@ -455,7 +477,8 @@ void console_resource(void *resource) {
 // Map (8) of a resource the host does not map, and the address of one that has none. All of the
 // console's memory is the CPU's as well, and a title maps a texture of the default heap to fill it
 // (one clears its back buffers that way). The title gets memory of ours of the resource's size
-// instead, and what it writes there goes nowhere.
+// instead; a texture the console layout library can place there is kept in step with it
+// (title_textures), the rest keeps what it writes to itself.
 std::mutex scratch_mutex;
 struct Scratch {
     void *memory = nullptr;
@@ -467,31 +490,59 @@ void *scratch_memory(ID3D12Resource *self) {
     if (FAILED(self->GetDevice(IID_PPV_ARGS(&device))))
         return nullptr;
     const auto desc = self->GetDesc();
-    const auto size = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+    auto size = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
     device->Release();
     if (size == ~0ull)
         return nullptr;
+    // the title writes the console layout, which may take more than the host's own
+    size = std::max(size, title_textures::console_bytes(self));
     const std::lock_guard lock(scratch_mutex);
     // a resource made where a released one was finds that one's memory, which may be smaller
     auto &scratch = scratch_maps[self];
     if (scratch.size < size) {
         if (scratch.memory)
             VirtualFree(scratch.memory, 0, MEM_RELEASE);
-        scratch = {VirtualAlloc(nullptr, static_cast<SIZE_T>(size), MEM_RESERVE | MEM_COMMIT,
-                                PAGE_READWRITE),
+        // write-watched when the writes are followed: what the CPU wrote is uploaded
+        const DWORD watched = title_textures::available() ? MEM_WRITE_WATCH : 0;
+        scratch = {VirtualAlloc(nullptr, static_cast<SIZE_T>(size),
+                                MEM_RESERVE | MEM_COMMIT | watched, PAGE_READWRITE),
                    size};
-        if (static std::atomic<int> shown{0}; shown++ < 4) {
-            std::fprintf(stderr,
-                         "[Runtime] the title writes a %llux%u texture's memory, which the host "
-                         "does not give: what it writes there is lost\n",
-                         desc.Width, desc.Height);
-            std::fflush(stderr);
+        const bool tracked =
+            scratch.memory && title_textures::track_scratch(self, scratch.memory, scratch.size);
+        // When the DLL is there the scratch is write-watched anyway: warn about a console
+        // layout we cannot model only if the title really writes the memory, not when it
+        // only asks for its address. An MSAA render target/depth is defined by the GPU's
+        // rendering, so a CPU write to its scratch is not a missing texture. Without the
+        // DLL, keep the old immediate warning.
+        const bool gpu_defined =
+            desc.SampleDesc.Count > 1 &&
+            (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
+        if (!tracked && scratch.memory &&
+            !title_textures::watch_lost_writes(self, scratch.memory, scratch.size, desc,
+                                               gpu_defined)) {
+            if (static std::atomic<int> shown{0}; shown++ < 4) {
+                std::fprintf(stderr,
+                             "[Runtime] the title writes a %llux%u texture's memory, which the "
+                             "host does not give: what it writes there is lost\n",
+                             desc.Width, desc.Height);
+                std::fflush(stderr);
+            }
         }
     }
     return scratch.memory;
 }
 HRESULT STDMETHODCALLTYPE map_resource(ID3D12Resource *self, UINT subresource,
                                        const D3D12_RANGE *range, void **data) {
+    // A buffer in the console's unified memory is the memory the title writes to: mapping it
+    // gives the console address itself, not a copy of it.
+    if (std::uint64_t address = 0;
+        !subresource && mapped_address(self, address) &&
+        d3d12x::uma_contains(static_cast<std::uintptr_t>(address))) {
+        if (data)
+            *data = reinterpret_cast<void *>(address);
+        return S_OK;
+    }
     using Map = HRESULT(STDMETHODCALLTYPE *)(void *, UINT, const D3D12_RANGE *, void **);
     const auto result = original<Map>(self, 8)(self, subresource, range, data);
     if (SUCCEEDED(result) || !data)
@@ -510,6 +561,10 @@ HRESULT STDMETHODCALLTYPE map_resource(ID3D12Resource *self, UINT subresource,
 }
 void STDMETHODCALLTYPE unmap_resource(ID3D12Resource *self, UINT subresource,
                                       const D3D12_RANGE *range) {
+    if (std::uint64_t address = 0;
+        !subresource && mapped_address(self, address) &&
+        d3d12x::uma_contains(static_cast<std::uintptr_t>(address)))
+        return;
     {
         const std::lock_guard lock(scratch_mutex);
         if (scratch_maps.contains(self))
@@ -527,9 +582,25 @@ std::uint64_t STDMETHODCALLTYPE resource_address(ID3D12Resource *self) {
     // the host has no address for a texture; the console's is its memory
     return address ? address : reinterpret_cast<std::uint64_t>(scratch_memory(self));
 }
+// Release (2): the title's last reference lets a kept-in-step texture go (its scratch memory
+// with it); the host's runtime's own releases go to the host's method as they are
+ULONG STDMETHODCALLTYPE release_resource(ID3D12Resource *self) {
+    using Release = ULONG(STDMETHODCALLTYPE *)(void *);
+    const auto left = original<Release>(self, 2)(self);
+    if (left <= 1) {
+        title_textures::forget(self);
+        const std::lock_guard lock(scratch_mutex);
+        if (const auto it = scratch_maps.find(self); it != scratch_maps.end()) {
+            VirtualFree(it->second.memory, 0, MEM_RELEASE);
+            scratch_maps.erase(it);
+        }
+    }
+    return left;
+}
 void mappable_resource(void *resource) {
     console_vtable<Family::resource>(resource, 15, 17,
-                                     {{8, reinterpret_cast<Slot>(&map_resource)},
+                                     {{2, reinterpret_cast<Slot>(&release_resource)},
+                                      {8, reinterpret_cast<Slot>(&map_resource)},
                                       {9, reinterpret_cast<Slot>(&unmap_resource)},
                                       {11, reinterpret_cast<Slot>(&resource_address)}});
 }
@@ -889,6 +960,21 @@ std::uint64_t host_address(std::uint64_t address) {
         return address;
     --found;
     return address < found->second.end ? found->second.gpu + (address - found->first) : address;
+}
+// A buffer in the unified memory: the title's address of it is the console address (the
+// window's memory itself), and the host's GPU address is the window's plus the offset in it.
+void track_console_buffer(ID3D12Resource *resource, std::uintptr_t address) {
+    const auto desc = resource->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        return;
+    const auto gpu = resource->GetGPUVirtualAddress();
+    const std::lock_guard lock(buffer_mutex);
+    for (auto old = mapped_at.lower_bound(address);
+         old != mapped_at.end() && old->first < address + desc.Width;)
+        old = mapped_at.erase(old);
+    mapped_at[address] = {address + desc.Width, gpu};
+    mapped_start[resource] = address;
+    buffers_at[address] = {address + desc.Width, resource};
 }
 void track_buffer(ID3D12Resource *resource, bool mapped = false) {
     const auto desc = resource->GetDesc();
@@ -1579,6 +1665,7 @@ HRESULT STDMETHODCALLTYPE create_root_signature(ID3D12Device *self, UINT node, c
     if (SUCCEEDED(result) && signature && *signature) {
         read_root_signature(*signature, blob, size);
         remember_signature(static_cast<ID3D12RootSignature *>(*signature), blob, size);
+        xcl::remember_root_signature(*signature, blob, size);
     }
     if (FAILED(result)) {
         std::fprintf(stderr, "[Runtime] CreateRootSignature from %zu bytes: 0x%08lx\n",
@@ -1614,16 +1701,44 @@ HRESULT STDMETHODCALLTYPE create_placed_resource_x(ID3D12Device *self, std::uint
         std::fflush(stderr);
     }
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    const auto result = create_committed_resource(self, &heap, D3D12_HEAP_FLAG_NONE, desc, state,
-                                                  clear, iid, resource);
+    HRESULT result = E_FAIL;
+    // With the XCL shader backend the title's graphics memory is in a window Direct3D 12
+    // opened as a heap: a buffer the title places there is made on that heap, at its
+    // console address, so the GPU works on the memory itself.
+    ID3D12Heap *uma_heap = nullptr;
+    std::uint64_t uma_offset = 0;
+    if (uma_enabled() && uma_heap_of(address, uma_heap, uma_offset) && desc &&
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        const auto host = host_resource_desc(*desc);
+        result = place_uma_buffer(self, uma_heap, uma_offset, host, host_state(state), clear, iid,
+                                  resource);
+        if (SUCCEEDED(result) && resource && *resource) {
+            console_resource(*resource);
+            mappable_resource(*resource);
+            // the title's address of the buffer stays its console address; a view naming it
+            // is translated to the host's GPU address when the host takes it
+            track_console_buffer(static_cast<ID3D12Resource *>(*resource), address);
+        } else if (FAILED(result)) {
+            std::fprintf(stderr, "[Runtime] CreatePlacedResourceX on the UMA heap at %llx: "
+                                 "0x%08lx\n",
+                         static_cast<unsigned long long>(uma_offset),
+                         static_cast<unsigned long>(result));
+            result = E_FAIL;
+        }
+    } else {
+        result = create_committed_resource(self, &heap, D3D12_HEAP_FLAG_NONE, desc, state, clear,
+                                           iid, resource);
+    }
     // a texture the title fills in its memory: the host's copy follows it
     if (SUCCEEDED(result) && resource && *resource && desc &&
         !(desc->Flags &
           (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
-        track_placement(static_cast<ID3D12Resource *>(*resource),
-                        reinterpret_cast<const void *>(address),
-                        console == Target::scarlett ? desc : nullptr);
+           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
+        auto *const made = static_cast<ID3D12Resource *>(*resource);
+        if (!title_textures::track_placed(made, address, *desc, state))
+            track_placement(made, reinterpret_cast<const void *>(address),
+                            console == Target::scarlett ? desc : nullptr);
+    }
     return result;
 }
 // The console's GPU draws rectangle lists and quad lists (topology types 19 and 32, the
@@ -1728,6 +1843,65 @@ bool host_graphics_pair(ID3D12Device *device, D3D12_SHADER_BYTECODE &vs, D3D12_S
     const bool vertex = host_bytecode(ShaderStage::vertex, vs);
     const bool pixel = host_bytecode(ShaderStage::pixel, ps);
     return vertex || pixel;
+}
+// The XCL shader backend translates every stage of a pipeline or none: a pipeline with a
+// shader the recompiler turns down goes through the current translator unchanged.
+ID3D12RootSignature *xcl_compute_shader(ID3D12Device *self, D3D12_SHADER_BYTECODE &cs) {
+    if (!xcl_backend() || !xcl::available())
+        return nullptr;
+    const auto container = shader_bytes(cs);
+    // A console container carries RDNA2 code in an XDAT part, often next to DXIL. XCL gets
+    // first refusal even then; a foreign blob is declined quickly and takes the old path.
+    if (container.size() < 32 || std::memcmp(container.data(), "DXBC", 4))
+        return nullptr;
+    std::string why;
+    const auto *const made = xcl::shader(modules::ShaderStage::compute, container, &why);
+    if (!made) {
+        if (static std::atomic<bool> shown{false}; !shown.exchange(true))
+            std::fprintf(stderr, "[Runtime] XCL compute declined: %s\n", why.c_str());
+        return nullptr;
+    }
+    if (static std::atomic<bool> shown{false}; !shown.exchange(true))
+        std::fprintf(stderr, "[Runtime] XCL compute translated (%zu DXIL bytes)\n",
+                     made->dxil.size());
+    auto *const signature = xcl::abi_root_signature(self, false, {made});
+    if (!signature)
+        return nullptr;
+    cs = {made->dxil.data(), made->dxil.size()};
+    return signature;
+}
+ID3D12RootSignature *xcl_graphics_shaders(ID3D12Device *self, D3D12_SHADER_BYTECODE &vs,
+                                          D3D12_SHADER_BYTECODE &ps) {
+    if (!xcl_backend() || !xcl::available())
+        return nullptr;
+    const auto vertex = shader_bytes(vs), pixel = shader_bytes(ps);
+    const auto console = [](std::span<const std::uint8_t> bytes) {
+        return bytes.size() >= 32 && !std::memcmp(bytes.data(), "DXBC", 4);
+    };
+    if (!console(vertex) || !console(pixel))
+        return nullptr;
+    std::string why;
+    const auto *const made_vs =
+        xcl::shader(modules::ShaderStage::vertex, vertex, &why);
+    if (!made_vs) {
+        if (static std::atomic<bool> shown{false}; !shown.exchange(true))
+            std::fprintf(stderr, "[Runtime] XCL vertex declined: %s\n", why.c_str());
+        return nullptr;
+    }
+    const auto *const made_ps = xcl::shader(modules::ShaderStage::pixel, pixel, &why);
+    if (!made_ps) {
+        if (static std::atomic<bool> shown{false}; !shown.exchange(true))
+            std::fprintf(stderr, "[Runtime] XCL pixel declined: %s\n", why.c_str());
+        return nullptr;
+    }
+    if (static std::atomic<bool> shown{false}; !shown.exchange(true))
+        std::fprintf(stderr, "[Runtime] XCL graphics translated\n");
+    auto *const signature = xcl::abi_root_signature(self, true, {made_vs, made_ps});
+    if (!signature)
+        return nullptr;
+    vs = {made_vs->dxil.data(), made_vs->dxil.size()};
+    ps = {made_ps->dxil.data(), made_ps->dxil.size()};
+    return signature;
 }
 // A pipeline without a root signature has it in its shaders, and the shader made for the
 // host does not carry it. On the host a pipeline is bound to the root signature it was made
@@ -1877,6 +2051,21 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
     if (desc) {
         host = *desc;
         host.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+        // XCL's ABI replaces the title's root signature only when both drawing shaders were
+        // translated; a mixed pipeline keeps the current translator entirely
+        if (!host.GS.pShaderBytecode && !host.HS.pShaderBytecode && !host.DS.pShaderBytecode)
+            if (auto *const abi = xcl_graphics_shaders(self, host.VS, host.PS)) {
+                host.pRootSignature = abi;
+                const auto xcl_result =
+                    original<Create>(self, 10)(self, &host, iid, state);
+                if (SUCCEEDED(xcl_result) && state && *state)
+                    xcl::remember_pipeline(static_cast<ID3D12PipelineState *>(*state), abi, true);
+                else if (FAILED(xcl_result))
+                    std::fprintf(stderr, "[Runtime] CreateGraphicsPipelineState with XCL: "
+                                         "0x%08lx\n",
+                                 static_cast<unsigned long>(xcl_result));
+                return xcl_result;
+            }
         // The console's R10G10B10_SNORM_A2_UNORM (189), what packed normals are in, is no
         // vertex format of the host's: its bits are read unsigned there
         if (host.InputLayout.pInputElementDescs) {
@@ -1979,6 +2168,16 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
     if (desc) {
         host = *desc;
         host.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+        if (auto *const abi = xcl_compute_shader(self, host.CS)) {
+            host.pRootSignature = abi;
+            const auto xcl_result = original<Create>(self, 11)(self, &host, iid, state);
+            if (SUCCEEDED(xcl_result) && state && *state)
+                xcl::remember_pipeline(static_cast<ID3D12PipelineState *>(*state), abi, false);
+            else if (FAILED(xcl_result))
+                std::fprintf(stderr, "[Runtime] CreateComputePipelineState with XCL: 0x%08lx\n",
+                             static_cast<unsigned long>(xcl_result));
+            return xcl_result;
+        }
         if (host_bytecode(modules::ShaderStage::compute, host.CS) && !host.pRootSignature)
             host.pRootSignature = from_shader = shader_root_signature(self, false, {desc->CS});
     }
@@ -2264,6 +2463,7 @@ HRESULT STDMETHODCALLTYPE create_committed_resource(
         state = D3D12_RESOURCE_STATE_GENERIC_READ;
     // resource flags above the desktop's (0x100000, 0x200000 on Unreal's render targets) are
     // the console's own
+    const auto *const asked = heap;
     D3D12_RESOURCE_DESC host_desc{};
     if (desc) {
         host_desc = *desc;
@@ -2281,11 +2481,40 @@ HRESULT STDMETHODCALLTYPE create_committed_resource(
         }
         host_rules(heap, host_desc.Flags, state);
     }
+    // With the XCL shader backend a title buffer of the default heap is made directly on a
+    // heap of the console's unified memory: its console address is the memory the title and
+    // the shaders see, and the host's GPU address of it is found from the heap.
+    if (uma_enabled() && resource && asked && asked->Type == D3D12_HEAP_TYPE_DEFAULT && desc &&
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        void *const console_address = uma_alloc(host_desc.Width, 0x10000);
+        if (console_address) {
+            ID3D12Heap *uma_heap = nullptr;
+            std::uint64_t uma_offset = 0;
+            if (uma_heap_of(reinterpret_cast<std::uintptr_t>(console_address), uma_heap,
+                            uma_offset)) {
+                ID3D12Resource *placed = nullptr;
+                const auto placed_result = place_uma_buffer(
+                    self, uma_heap, uma_offset, host_desc, host_state(state), clear, iid,
+                    reinterpret_cast<void **>(&placed));
+                if (SUCCEEDED(placed_result) && placed) {
+                    console_resource(placed);
+                    mappable_resource(placed);
+                    track_console_buffer(placed,
+                                         reinterpret_cast<std::uintptr_t>(console_address));
+                    *resource = placed;
+                    return placed_result;
+                }
+                std::fprintf(stderr, "[Runtime] CreateCommittedResource on the UMA heap: "
+                                     "0x%08lx\n",
+                             static_cast<unsigned long>(placed_result));
+            }
+            uma_free(console_address);
+        }
+    }
     // All of the console's memory is the CPU's as well: a title maps a buffer of the default
     // heap and writes to it. The host only maps what is in a heap the CPU can reach, so such
     // a buffer goes in one (unless it is written by the GPU, which those heaps do not take).
     D3D12_HEAP_PROPERTIES mappable{};
-    const auto *const asked = heap;
     if (console == Target::scarlett && heap && desc && heap->Type == D3D12_HEAP_TYPE_DEFAULT &&
         desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         mappable = {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
@@ -2310,6 +2539,8 @@ HRESULT STDMETHODCALLTYPE create_committed_resource(
     if (SUCCEEDED(result) && resource && *resource) {
         console_resource(*resource);
         track_buffer(static_cast<ID3D12Resource *>(*resource), console == Target::scarlett);
+        if (desc)
+            title_textures::note_desc(static_cast<ID3D12Resource *>(*resource), *desc, state);
         if (console == Target::scarlett)
             mappable_resource(*resource);
     }
@@ -2496,6 +2727,9 @@ ULONG STDMETHODCALLTYPE list_release(void *self) {
 // handles. The depth clear has a float in a register the generic path does not carry.
 using Handle = D3D12_CPU_DESCRIPTOR_HANDLE;
 std::atomic<ID3D12Device *> d3d12_device{nullptr};
+} // namespace
+ID3D12Device *host_device() { return d3d12_device.load(); }
+namespace {
 HRESULT STDMETHODCALLTYPE close_list(void *self) {
     const auto result = host_of(self)->Close();
     if (FAILED(result))
@@ -2676,6 +2910,9 @@ void STDMETHODCALLTYPE copy_texture_region(void *self, const D3D12_TEXTURE_COPY_
                                            const D3D12_TEXTURE_COPY_LOCATION *source,
                                            const D3D12_BOX *box) {
     auto *const host = host_of(self);
+    // a texture the GPU copies into: its CPU view is stale from then on (title_textures)
+    if (target && target->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX)
+        title_textures::note_gpu_write(target->pResource);
     if (!x && !y && !z && copy_feedback_map(host, target, source))
         return;
     ID3D12Device *device = nullptr;
@@ -2856,6 +3093,7 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
     list->heaps[0] = list->heaps[1] = nullptr;
     list->topology = 0;
     list->indices = {};
+    xcl::clear_list(self);
     return host_of(self)->Reset(allocator, state);
 }
 // the host's GPU handle for a console one, which is the descriptor's address in the shadow
@@ -2869,21 +3107,25 @@ D3D12_GPU_DESCRIPTOR_HANDLE host_gpu(D3D12_GPU_DESCRIPTOR_HANDLE handle) {
 // as the table says, once bound
 void STDMETHODCALLTYPE set_compute_root_signature(void *self, ID3D12RootSignature *signature) {
     static_cast<ListProxy *>(self)->compute_root = signature;
+    xcl::set_root_signature(self, signature, false);
     host_of(self)->SetComputeRootSignature(signature);
 }
 void STDMETHODCALLTYPE set_graphics_root_signature(void *self, ID3D12RootSignature *signature) {
     static_cast<ListProxy *>(self)->graphics_root = signature;
+    xcl::set_root_signature(self, signature, true);
     host_of(self)->SetGraphicsRootSignature(signature);
 }
 void STDMETHODCALLTYPE set_compute_root_table(void *self, UINT parameter,
                                               D3D12_GPU_DESCRIPTOR_HANDLE table) {
     decode_table(static_cast<ListProxy *>(self)->compute_root, parameter, table.ptr);
+    xcl::write_table(self, parameter, table.ptr, false);
     bind_heap_of(self, table.ptr);
     host_of(self)->SetComputeRootDescriptorTable(parameter, host_gpu(table));
 }
 void STDMETHODCALLTYPE set_graphics_root_table(void *self, UINT parameter,
                                                D3D12_GPU_DESCRIPTOR_HANDLE table) {
     decode_table(static_cast<ListProxy *>(self)->graphics_root, parameter, table.ptr);
+    xcl::write_table(self, parameter, table.ptr, true);
     bind_heap_of(self, table.ptr);
     host_of(self)->SetGraphicsRootDescriptorTable(parameter, host_gpu(table));
 }
@@ -2953,6 +3195,7 @@ D3D12_INDEX_BUFFER_VIEW quad_indices(UINT quads) {
 void STDMETHODCALLTYPE draw_instanced(void *self, UINT vertices, UINT instances, UINT first,
                                       UINT first_instance) {
     count_draw(self);
+    xcl::before_draw(self, host_of(self));
     auto *const list = static_cast<ListProxy *>(self);
     if (list->topology == quad_list) {
         const auto view = quad_indices(vertices / 4);
@@ -2969,6 +3212,7 @@ void STDMETHODCALLTYPE draw_instanced(void *self, UINT vertices, UINT instances,
 void STDMETHODCALLTYPE draw_indexed_instanced(void *self, UINT indices, UINT instances, UINT first,
                                               INT base, UINT first_instance) {
     count_draw(self);
+    xcl::before_draw(self, host_of(self));
     if (static std::atomic<bool> shown{false};
         static_cast<ListProxy *>(self)->topology == quad_list && !shown.exchange(true)) {
         std::fprintf(stderr, "[Runtime] an indexed quad list is drawn as a triangle list, which "
@@ -3108,22 +3352,55 @@ std::uint64_t root_constants(std::uint64_t address) {
 }
 void STDMETHODCALLTYPE set_graphics_root_cbv(void *self, UINT index, std::uint64_t address) {
     trace_address("SetGraphicsRootConstantBufferView", address);
+    xcl::write_view(self, index, address, true);
     host_of(self)->SetGraphicsRootConstantBufferView(index, root_constants(address));
 }
 void STDMETHODCALLTYPE set_compute_root_cbv(void *self, UINT index, std::uint64_t address) {
+    xcl::write_view(self, index, address, false);
     host_of(self)->SetComputeRootConstantBufferView(index, root_constants(address));
 }
 void STDMETHODCALLTYPE set_compute_root_srv(void *self, UINT index, std::uint64_t address) {
+    xcl::write_view(self, index, address, false);
     host_of(self)->SetComputeRootShaderResourceView(index, root_address(address));
 }
 void STDMETHODCALLTYPE set_graphics_root_srv(void *self, UINT index, std::uint64_t address) {
+    xcl::write_view(self, index, address, true);
     host_of(self)->SetGraphicsRootShaderResourceView(index, root_address(address));
 }
 void STDMETHODCALLTYPE set_compute_root_uav(void *self, UINT index, std::uint64_t address) {
-    host_of(self)->SetComputeRootUnorderedAccessView(index, host_address(address));
+    xcl::write_view(self, index, address, false);
+    host_of(self)->SetComputeRootUnorderedAccessView(index, root_address(address));
 }
 void STDMETHODCALLTYPE set_graphics_root_uav(void *self, UINT index, std::uint64_t address) {
-    host_of(self)->SetGraphicsRootUnorderedAccessView(index, host_address(address));
+    xcl::write_view(self, index, address, true);
+    host_of(self)->SetGraphicsRootUnorderedAccessView(index, root_address(address));
+}
+// Root constants are captured for the XCL ABI; the title's own call still goes to the host
+void STDMETHODCALLTYPE set_compute_root_constant(void *self, UINT index, UINT value, UINT at) {
+    xcl::write_constant(self, index, at, 1, &value, false);
+    host_of(self)->SetComputeRoot32BitConstant(index, value, at);
+}
+void STDMETHODCALLTYPE set_graphics_root_constant(void *self, UINT index, UINT value, UINT at) {
+    xcl::write_constant(self, index, at, 1, &value, true);
+    host_of(self)->SetGraphicsRoot32BitConstant(index, value, at);
+}
+void STDMETHODCALLTYPE set_compute_root_constants(void *self, UINT index, UINT count,
+                                                  const void *values, UINT at) {
+    xcl::write_constant(self, index, at, count, values, false);
+    host_of(self)->SetComputeRoot32BitConstants(index, count, values, at);
+}
+void STDMETHODCALLTYPE set_graphics_root_constants(void *self, UINT index, UINT count,
+                                                   const void *values, UINT at) {
+    xcl::write_constant(self, index, at, count, values, true);
+    host_of(self)->SetGraphicsRoot32BitConstants(index, count, values, at);
+}
+void STDMETHODCALLTYPE set_pipeline_state(void *self, ID3D12PipelineState *pipeline) {
+    xcl::set_pipeline(self, pipeline);
+    host_of(self)->SetPipelineState(pipeline);
+}
+void STDMETHODCALLTYPE dispatch_x(void *self, UINT groups_x, UINT groups_y, UINT groups_z) {
+    xcl::before_draw(self, host_of(self));
+    host_of(self)->Dispatch(groups_x, groups_y, groups_z);
 }
 void STDMETHODCALLTYPE so_set_targets(void *self, UINT start, UINT count,
                                       const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) {
@@ -3275,6 +3552,12 @@ std::array<Slot, list_slots> list_vtable_of(std::index_sequence<Index...>) {
     vtable[44] = reinterpret_cast<Slot>(&set_graphics_root_srv);
     vtable[45] = reinterpret_cast<Slot>(&set_compute_root_uav);
     vtable[46] = reinterpret_cast<Slot>(&set_graphics_root_uav);
+    vtable[37] = reinterpret_cast<Slot>(&set_compute_root_constant);
+    vtable[38] = reinterpret_cast<Slot>(&set_graphics_root_constant);
+    vtable[39] = reinterpret_cast<Slot>(&set_compute_root_constants);
+    vtable[40] = reinterpret_cast<Slot>(&set_graphics_root_constants);
+    vtable[25] = reinterpret_cast<Slot>(&set_pipeline_state);
+    vtable[78] = reinterpret_cast<Slot>(&dispatch_x);
     vtable[49] = reinterpret_cast<Slot>(&so_set_targets);
     vtable[47] = reinterpret_cast<Slot>(&set_index_buffer);
     vtable[48] = reinterpret_cast<Slot>(&set_vertex_buffers);
@@ -3739,6 +4022,7 @@ void STDMETHODCALLTYPE execute_command_lists(ID3D12CommandQueue *self, UINT coun
     if (const auto *text = std::getenv("XV_D3D_SLOW"))
         Sleep(std::atoi(text));
     decode_written_heaps();
+    title_textures::refresh(self);
     upload_placements_d3d12(self);
     std::vector<ID3D12CommandList *> host(count);
     for (UINT i = 0; i < count; ++i)
@@ -3901,8 +4185,13 @@ HRESULT STDMETHODCALLTYPE create_committed_resource_2(
         host_rules(heap, host_desc.Flags, state);
     const auto result = original<Create>(self, 69)(self, heap, flags, desc ? &host_desc : nullptr,
                                                    state, clear, session, iid, resource);
-    if (SUCCEEDED(result) && resource && *resource)
+    if (SUCCEEDED(result) && resource && *resource) {
         console_resource(*resource);
+        if (desc)
+            title_textures::note_desc(
+                static_cast<ID3D12Resource *>(*resource),
+                *reinterpret_cast<const D3D12_RESOURCE_DESC *>(desc), state);
+    }
     if (FAILED(result) && desc) {
         std::fprintf(stderr,
                      "[Runtime] CreateCommittedResource2 dimension %d %llux%ux%u mips %u format "
@@ -4207,6 +4496,9 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
     if (SUCCEEDED(result)) {
         d3d12_device = host;
         graphics::drawing_with("Direct3D 12");
+        // The unified memory of the console, opened as a heap on the host: the shaders of the
+        // XCL backend reach it through the ABI's memory windows.
+        uma_reserve();
     }
     if (ID3D12InfoQueue *queue = nullptr;
         SUCCEEDED(result) && SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&queue))))

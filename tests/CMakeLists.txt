@@ -1,11 +1,21 @@
 add_executable(xv_tests tests.cpp pe_directories.cpp loader_image.cpp xvd.cpp pri.cpp gameruntime.cpp
-  console_shader.cpp)
+  console_shader.cpp dstorage.cpp)
 target_link_libraries(xv_tests PRIVATE xv_options xv_pe xv_core xv_catch xv_xvd xv_pri xv_loader
   xv_runtime_common xv_runtime_modules d3dcompiler)
+# The UMA heap probe: a standalone program (no window, no swap chain) that opens a heap over
+# committed process memory, as the XCL shader backend does.
+add_executable(xv_uma_heap_probe uma_heap_probe.cpp)
+target_link_libraries(xv_uma_heap_probe PRIVATE xv_options d3d12 dxgi)
+
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME fixture COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/corpus/generate.py"
   --all "${CMAKE_CURRENT_BINARY_DIR}")
 set_tests_properties(fixture PROPERTIES FIXTURES_SETUP pe_file)
+# the BCPack chunk the DirectStorage test reads, from the crate's test vectors
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/../tools/bcpack/tests/data/bc1.bcpack
+  ${CMAKE_CURRENT_BINARY_DIR}/bc1.bcpack COPYONLY)
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/../tools/bcpack/tests/data/bc1.expected
+  ${CMAKE_CURRENT_BINARY_DIR}/bc1.expected COPYONLY)
 add_test(NAME parsers COMMAND xv_tests)
 set_tests_properties(parsers PROPERTIES FIXTURES_REQUIRED pe_file)
 if(XV_VULKAN)

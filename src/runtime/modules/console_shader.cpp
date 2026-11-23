@@ -68,7 +68,7 @@ Bytes part(Bytes container, const char *name) {
 class Inflate {
   public:
     explicit Inflate(Bytes input) : in_(input) {}
-    bool run(std::vector<std::uint8_t> &out) {
+    bool run(std::vector<std::uint8_t> &out, std::size_t limit = 0) {
         if (in_.size() < 2 || (in_[0] & 0x0f) != 8)
             return false;
         at_ = 2;
@@ -95,7 +95,7 @@ class Inflate {
             } else {
                 return false;
             }
-            if (failed_ || out.size() > 64u << 20)
+            if (failed_ || out.size() > (limit ? limit : 64u << 20))
                 return false;
         }
         return true;
@@ -679,7 +679,9 @@ std::set<std::string> making;                          // by cache name, on some
 std::atomic<unsigned> translated{0}, stood_in{0};
 } // namespace
 
-bool inflate_zlib(Bytes stream, std::vector<std::uint8_t> &out) { return Inflate(stream).run(out); }
+bool inflate_zlib(Bytes stream, std::vector<std::uint8_t> &out, std::size_t limit) {
+    return Inflate(stream).run(out, limit);
+}
 
 // A shader that carries the console's DXIL is not translated from machine code: its DXIL
 // calls the console's own intrinsics, which the host's compiler does not know. Lower them and

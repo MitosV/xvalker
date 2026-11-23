@@ -1,0 +1,13 @@
+[package]
+name = "xv-bcpack"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "C ABI wrapper for xvalker's vendored BCPack decoder and strict BC3/BC4/BC5 rebuilders"
+
+[lib]
+name = "bcpack"
+crate-type = ["cdylib", "rlib"]
+
+[dev-dependencies]
+miniz_oxide = "0.8"
