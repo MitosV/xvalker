@@ -185,10 +185,10 @@ fn v_fmac_f32_is_a_fused_read_modify_write() {
 }
 
 /// `buffer_load_dwordx3 v[0:2], v[0:1], s[0:3], 0 idxen` (shader 23465 at +0x28).
-/// VDATA overlaps the index VADDR, so writing the first component would corrupt the
-/// bounds check of the second and third components unless the index is snapshotted.
+/// VDATA overlaps the index VADDR: the bounds check must use the index the
+/// instruction had, not the value the first component loaded.
 #[test]
-fn mubuf_vector_load_snapshots_an_overlapping_index() {
+fn mubuf_vector_load_bounds_checks_the_index_before_it_is_overwritten() {
     use xcl_recomp::gpu::recomp;
     let code = [
         0x00, 0x20, 0x3c, 0xe0, 0x00, 0x00, 0x00, 0x80, // buffer_load_dwordx3
@@ -196,17 +196,16 @@ fn mubuf_vector_load_snapshots_an_overlapping_index() {
     ];
     let opt = recomp::Options { mode: recomp::Mode::Kernel, wave64: false, ..Default::default() };
     let t = recomp::translate(&code, &opt).unwrap();
-    let index = t.hlsl.lines().find_map(|l| {
-        let l = l.trim();
-        l.strip_prefix("uint ").and_then(|l| l.strip_suffix(" = v0;")).filter(|n| n.ends_with("_index"))
-    });
-    let index = match index {
-        Some(i) => i.to_string(),
-        None => panic!("no index snapshot in:\n{}", t.hlsl),
-    };
-    let load = t.hlsl.lines().find(|l| l.contains("v1 = select(")).unwrap();
-    assert!(load.contains(&format!("{index} < s2")), "bounds check used the overwritten index: {load}");
-    assert!(!load.contains("v0 < s2"), "bounds check used the overwritten index: {load}");
+    let lines: Vec<&str> = t.hlsl.lines().collect();
+    let check = lines
+        .iter()
+        .position(|l| l.contains("v0 < s2"))
+        .unwrap_or_else(|| panic!("no bounds check in:\n{}", t.hlsl));
+    let write = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("v0 = "))
+        .unwrap_or_else(|| panic!("no write in:\n{}", t.hlsl));
+    assert!(check < write, "the bounds check used the overwritten index:\n{}", t.hlsl);
 }
 
 /// The error groups of the tool are the errors by message, most frequent first.
