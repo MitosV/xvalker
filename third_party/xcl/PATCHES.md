@@ -171,10 +171,6 @@ must not clobber a file that appeared meanwhile. Linux has `renameat2` with
 
 ## `src/util.rs`
 
----
-
-## `src/util.rs`
-
 `util.rs` uses `windows_sys` in three places. The Windows code is kept behind
 `#[cfg(windows)]`; on Linux the ANSI conversion falls back to the bytes as they are
 (there is no code page).
