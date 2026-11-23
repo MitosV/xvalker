@@ -48,6 +48,8 @@ pub const XCL_FLAG_NONE: u32 = 0;
 pub const XCL_FLAG_FORCE_WAVE64: u32 = 1 << 0;
 /// Force wave32 semantics even when the program looks like a wave64 program.
 pub const XCL_FLAG_FORCE_WAVE32: u32 = 1 << 1;
+/// The host GPU runs 32-lane waves only (see the header).
+pub const XCL_FLAG_HOST_WAVE32: u32 = 1 << 2;
 
 /// The result of a translation. Every pointer is owned by the result and released by
 /// [`xcl_free`].
@@ -117,7 +119,18 @@ pub unsafe extern "C" fn xcl_translate(container: *const u8, size: usize, flags:
             } else {
                 gpu::recomp::detect_wave64(code)
             };
-            let opt = gpu::recomp::Options { mode: mode.clone(), wave64, ..Default::default() };
+            // a 32-lane host runs a wave64 program as two native wave32 halves (as xcl-corpus
+            // --host-wave 32 does)
+            let host_wave = if flags & XCL_FLAG_HOST_WAVE32 != 0 { 32 } else { 0 };
+            let opt = gpu::recomp::Options {
+                mode: mode.clone(),
+                wave64,
+                hw_wave: host_wave,
+                geometry_wave32: host_wave == 32 && matches!(mode, gpu::recomp::Mode::Geometry(_)),
+                mesh_wave32: host_wave == 32 && matches!(mode, gpu::recomp::Mode::Mesh(_)),
+                host_wave,
+                ..Default::default()
+            };
             match gpu::recomp::translate(code, &opt) {
                 Ok(t) => {
                     let profiles = match &mode {

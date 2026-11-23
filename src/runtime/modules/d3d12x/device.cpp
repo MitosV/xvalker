@@ -4483,6 +4483,7 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
         create ? create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host)) : E_NOTIMPL;
     if (SUCCEEDED(result)) {
         d3d12_device = host;
+        xcl::note_device(host);
         graphics::drawing_with("Direct3D 12");
         // The unified memory of the console, opened as a heap on the host: the shaders of the
         // XCL backend reach it through the ABI's memory windows.

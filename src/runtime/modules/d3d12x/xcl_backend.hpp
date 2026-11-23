@@ -17,6 +17,8 @@ struct Shader {
 };
 // Whether the recompiler library is there. Nothing of this backend is used without it.
 bool available();
+// The host device's widest wave: a GPU of 32-lane waves gets wave64 programs as two halves.
+void note_device(ID3D12Device *device);
 // Translate and compile one console shader. Empty DXIL and `why` say what stopped it.
 const Shader *shader(modules::ShaderStage stage, std::span<const std::uint8_t> container,
                      std::string *why);
