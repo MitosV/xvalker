@@ -21,9 +21,10 @@
 
 // DirectStorage as the Series console has it (dstorage_xs.dll, and XCRDAPI.dll for the
 // factory): queues of read requests, with marks in between that set a status or signal a
-// fence once everything before them is done. Here a queue does its work when it is
-// submitted, on the thread that submits it, in order. Reads may be inflated (zlib) and
-// decoded (BCPack, through bcpack.dll); the console's physical pages are not known here,
+// fence once everything before them are done. Here a queue does its work when it is
+// submitted, on the thread that submits it, in order. Reads may come from a file, from
+// memory or from the title's physical pages, and may be inflated (zlib) and decoded
+// (BCPack, through bcpack.dll); the console's hardware texture swizzle is not known here,
 // and such a request fails.
 namespace xv::runtime::modules {
 namespace {
