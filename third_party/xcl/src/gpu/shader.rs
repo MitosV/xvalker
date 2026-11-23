@@ -6,8 +6,12 @@
 //! disassembly is written next to the blob. This is how we learn, per title, whether
 //! shaders still carry DXIL/DXBC or only console GPU microcode.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+#[cfg(xcl_runtime)]
+use std::collections::HashSet;
+#[cfg(xcl_runtime)]
 use std::path::PathBuf;
+#[cfg(xcl_runtime)]
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -189,20 +193,24 @@ pub struct ShaderStats {
     pub recomp_dxc_failed: usize,
 }
 
+#[cfg(xcl_runtime)]
 struct State {
     seen: HashSet<u64>,
     stats: ShaderStats,
     insts: xbox::InstStats,
 }
 
+#[cfg(xcl_runtime)]
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+#[cfg(xcl_runtime)]
 fn dump_dir() -> PathBuf {
     crate::state::data_dir().join("shaders")
 }
 
 /// Is `[p, p+len)` committed, readable memory? (Game-provided pointers may be garbage
 /// when our guess of a console struct layout is wrong.)
+#[cfg(xcl_runtime)]
 pub fn readable(p: usize, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
     if p == 0 || len == 0 || len > 256 << 20 {
@@ -225,6 +233,7 @@ pub fn readable(p: usize, len: usize) -> bool {
 }
 
 /// Record a shader blob submitted by the title. Safe on garbage pointers.
+#[cfg(xcl_runtime)]
 pub fn capture(stage: &str, ptr: usize, len: usize) {
     if ptr == 0 && len == 0 {
         return; // unused stage
@@ -282,12 +291,14 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
 /// more for that: the report's `recomp_*` counts come from it). Off by default: a retail game's
 /// ~17 000 dumps took 4.8 GB, and translating each again took its loading threads ~0.1 s a
 /// program at every start.
+#[cfg(xcl_runtime)]
 fn dumps_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_DUMP_SHADERS").is_ok_and(|v| v == "1"))
 }
 
 /// Console container without dumps: its FSSM variants and instructions accounted.
+#[cfg(xcl_runtime)]
 fn account_xbox(blob: &[u8], h: u64) {
     let Some(sh) = xbox::parse(blob) else { return };
     let mut insts = xbox::InstStats::default();
@@ -307,6 +318,7 @@ fn account_xbox(blob: &[u8], h: u64) {
 
 /// Console container: account its FSSM variants and instructions, write the
 /// decompressed FSSMs and the disassembly next to the blob.
+#[cfg(xcl_runtime)]
 fn capture_xbox(blob: &[u8], base: &std::path::Path, h: u64) {
     let Some(sh) = xbox::parse(blob) else { return };
     let mut insts = xbox::InstStats::default();
@@ -339,6 +351,7 @@ fn capture_xbox(blob: &[u8], base: &std::path::Path, h: u64) {
 
 /// Translate every program of a captured console shader (mode from its interface) and
 /// write the HLSL next to the dumps; with `XCL_RECOMP_DXC=1` also compile it (cached).
+#[cfg(xcl_runtime)]
 fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
     use crate::gpu::recomp;
     let dxc = std::env::var("XCL_RECOMP_DXC").is_ok_and(|v| v == "1");
@@ -357,7 +370,7 @@ fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
             let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), ..Default::default() };
             let Ok(t) = recomp::translate(code, &opt) else { continue };
             let _ = std::fs::write(base.with_extension(format!("fssm{i}.p{j}.hlsl")), &t.hlsl);
-            let built = if dxc && t.complete() { Some(recomp::dxc::compile_cached(&t.hlsl, "main", profile)) } else { None };
+            let built = if dxc && t.complete() { Some(crate::dxc::compile_cached(&t.hlsl, "main", profile)) } else { None };
             if let Some(Err(e)) = &built {
                 crate::xlog_warn!("[SHADER] DXC rejected the translation {}: {}", base.display(), e.lines().next().unwrap_or(""));
             }
@@ -380,6 +393,7 @@ fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
     }
 }
 
+#[cfg(xcl_runtime)]
 pub fn stats() -> ShaderStats {
     let g = STATE.lock().ok();
     let mut s = g.as_ref().and_then(|g| g.as_ref().map(|st| st.stats.clone())).unwrap_or_default();
@@ -392,7 +406,7 @@ pub fn stats() -> ShaderStats {
     s
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "xcl_vendored_tests"))]
 mod tests {
     use super::*;
 

@@ -110,22 +110,28 @@ fn the_stage_of_a_mode_is_the_one_of_the_program() {
     assert!(matches!(mode, Mode::Kernel));
 }
 
-/// `v_readlane_b32 s14, v6, 32; s_endpgm` (gfx1010), assembled with llvm-mc.
+/// `v_readlane_b32 s14, v6, 32; s_endpgm` (gfx1010), assembled with llvm-mc: a read of a
+/// lane of the upper half of a wave64. XCL's `upper_lanes` analysis follows it (the lane was
+/// never written), so the 32-lane form does not refuse it.
 #[test]
-fn a_32_lane_host_exchanges_a_read_of_the_upper_half_only_with_a_workgroup() {
+fn a_32_lane_host_resolves_a_read_of_the_upper_half() {
     let code = [0x0e, 0x00, 0x60, 0xd7, 0x06, 0x41, 0x01, 0x02, 0x00, 0x00, 0x81, 0xbf];
-    let hazard = "v_readlane/writelane: lane ≥ 32";
+    let (hazards, resolved) = xcl_recomp::gpu::recomp::wave_lane_reads(&code);
+    assert!(hazards.is_empty(), "{hazards:?}");
+    assert!(resolved.contains("lanes ≥ 32 never written (or inactive)"), "{resolved:?}");
+    // a compute program runs as two halves that exchange their masks and lanes
     let kernel = xcl_recomp::gpu::recomp::Mode::Kernel;
-    assert!(xcl_recomp::gpu::recomp::wave_hazards(&code).contains(hazard));
-    // Compute has a workgroup: the read is served from groupshared memory.
-    assert!(xcl_recomp::gpu::recomp::host_hazards(&code, &kernel, 32).is_empty());
-    let opt = xcl_recomp::gpu::recomp::Options { mode: kernel, wave64: true, host_wave: 32, ..Default::default() };
-    assert!(xcl_recomp::gpu::recomp::translate(&code, &opt).is_ok());
-    // A pixel shader runs one invocation per fragment: no workgroup to exchange through.
+    let opt = xcl_recomp::gpu::recomp::Options { mode: kernel.clone(), wave64: true, split_wave64: true, ..Default::default() };
+    let split = xcl_recomp::gpu::recomp::translate(&code, &opt).unwrap();
+    assert!(split.hlsl.contains("[WaveSize(32)]"), "{}", split.hlsl);
+    // a pixel shader runs one invocation per fragment: it gets the 32-lane form too
     let pixel = xcl_recomp::gpu::recomp::Mode::Pixel(Default::default());
-    assert!(xcl_recomp::gpu::recomp::host_hazards(&code, &pixel, 32).contains(hazard));
-    let opt = xcl_recomp::gpu::recomp::Options { mode: pixel, wave64: true, host_wave: 32, ..Default::default() };
-    assert!(xcl_recomp::gpu::recomp::translate(&code, &opt).is_err());
+    let opt = xcl_recomp::gpu::recomp::Options { mode: pixel, wave64: true, split_wave64: true, ..Default::default() };
+    assert!(xcl_recomp::gpu::recomp::translate(&code, &opt).is_ok());
+    // the native form (a GPU with 64-lane waves) is unchanged
+    let opt = xcl_recomp::gpu::recomp::Options { mode: kernel, wave64: true, ..Default::default() };
+    let native = xcl_recomp::gpu::recomp::translate(&code, &opt).unwrap();
+    assert!(native.hlsl.contains("[WaveSize(64)]"), "{}", native.hlsl);
 }
 
 /// DXC rounds the mesh pass-through's vertex stride up to a power of two of 16-byte

@@ -738,12 +738,15 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // the compiles run on the DXC pool; these threads translate and keep it fed
-    let threads = recomp::dxc::compile_threads() + 2;
-    let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
+    let threads = crate::dxc::compile_threads() + 2;
+    // the split wave64 form needs the adapter's wave width: XCL asks its own D3D12 device
+    // (`pso::split_wave64_forced`, `runner::wave64_supported`), which is not vendored here, so
+    // the caller decides (`--split`).
+    let split = split.unwrap_or(false);
     println!(
         "precompiling {n} shaders into {} ({} compile threads; {windows} memory windows{})",
-        recomp::dxc::cache_dir().display(),
-        recomp::dxc::compile_threads(),
+        crate::dxc::cache_dir().display(),
+        crate::dxc::compile_threads(),
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
     std::thread::scope(|s| {
@@ -761,24 +764,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     continue;
                 }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
-                // into the translation cache too, so the title does not translate it again
-                if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
-                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
-                        Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
-                        Err(e) => {
-                            let mut g = errors.lock().unwrap();
-                            if g.len() < 10 {
-                                g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
-                            }
-                            failed.fetch_add(1, Ordering::Relaxed)
-                        }
-                    };
-                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if d % 200 == 0 {
-                        eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
-                    }
-                    continue;
-                }
+                // into the translation cache too, so the title does not translate it again.
+                // `pso` is XCL's D3D12 module and is not vendored: outside XCL the generic loop
+                // below translates the compute programs with the same options (`windows`, `split`).
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
@@ -801,7 +789,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             continue;
                         }
                         for (profile, src) in &jobs {
-                            match recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile) {
+                            match crate::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile) {
                                 Ok((_, true)) => cached.fetch_add(1, Ordering::Relaxed),
                                 Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
                                 Err(e) => {
@@ -851,7 +839,7 @@ fn compile_samples(samples: &[(String, String, &'static str)]) -> (usize, Vec<St
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some((name, hlsl, profile)) = samples.get(i) else { break };
                         let t0 = std::time::Instant::now();
-                        match recomp::dxc::compile(hlsl, "main", profile, &[]) {
+                        match crate::dxc::compile(hlsl, "main", profile, &[]) {
                             Ok(_) => ok += 1,
                             Err(e) => bad.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.as_str()))),
                         }
@@ -1102,7 +1090,7 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
         if let Some((x, hlsl, profile)) = &rc.example {
             println!("example:
 {x}");
-            match recomp::dxc::compile(hlsl, "main", profile, &[]) {
+            match crate::dxc::compile(hlsl, "main", profile, &[]) {
                 Ok(b) => println!("DXC ({profile}): OK, {} B DXIL", b.len()),
                 Err(e) => println!("DXC ({profile}): {}", e.split("--- HLSL ---").next().unwrap_or("").trim()),
             }

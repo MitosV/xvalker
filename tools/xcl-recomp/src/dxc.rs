@@ -19,6 +19,17 @@ pub fn dxc_path() -> PathBuf {
     PathBuf::from("dxc")
 }
 
+/// The number of threads that may compile at the same time: the cores of the machine
+/// (one less), or `XCL_DXC_THREADS`. XCL's own `dxc.rs` has the same rule (its workers
+/// are the DXC COM calls).
+pub fn compile_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        std::env::var("XCL_DXC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores.saturating_sub(1)).clamp(1, 64)
+    })
+}
+
 /// The DXIL cache directory: `XCL_DXIL_CACHE` when set, else
 /// `~/.cache/xvalker/dxil-cache`.
 pub fn cache_dir() -> PathBuf {

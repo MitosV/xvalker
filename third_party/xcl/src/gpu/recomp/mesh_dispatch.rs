@@ -225,7 +225,7 @@ void main(uint gi : SV_GroupIndex) {{
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "xcl_vendored_tests"))]
 mod tests {
     use super::*;
 
