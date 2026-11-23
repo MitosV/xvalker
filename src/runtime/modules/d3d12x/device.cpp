@@ -5,6 +5,7 @@
 #include "runtime/modules/d3d12x/internal.hpp"
 #include "runtime/modules/d3d12x/title_textures.hpp"
 #include "runtime/modules/d3d12x/uma.hpp"
+#include "runtime/modules/d3d12x/console_heap.hpp"
 #include "runtime/modules/d3d12x/xcl_backend.hpp"
 #include "runtime/modules/placement.hpp"
 #include <algorithm>
@@ -698,6 +699,8 @@ D3D12_CPU_DESCRIPTOR_HANDLE host_slot(const ShadowHeap &heap, std::uintptr_t at)
 // that copies descriptors itself (the device's inline CopyDescriptorsSimple) carries both
 // along, which tells where the host's descriptor of the copy is to come from.
 void set_mark(const ShadowHeap &heap, std::uintptr_t at) {
+    if (xcl_backend())
+        return; // XCL slots hold shader-readable words, not host-side marks
     at = heap.base + (at - heap.base) / heap.stride * heap.stride;
     const std::uint64_t words[2]{host_mark, host_slot(heap, at).ptr};
     std::memcpy(reinterpret_cast<void *>(at), words, sizeof words);
@@ -706,6 +709,16 @@ void mark_host(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
     const std::lock_guard lock(shadow_mutex);
     if (const auto *heap = shadow_heap(handle.ptr))
         set_mark(*heap, handle.ptr);
+}
+// What to do after a descriptor was made at a console handle: XCL puts shader-readable words
+// there; the ordinary backend leaves a mark saying the host's descriptor is the one to use.
+void note_host_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource *resource = nullptr,
+                          const void *desc = nullptr,
+                          D3D12_DESCRIPTOR_RANGE_TYPE type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV) {
+    if (xcl_backend())
+        console_heap::made_from_host(handle.ptr, resource, desc, type);
+    else
+        mark_host(handle);
 }
 // whether a host handle is a slot of a heap the title still has
 bool live_slot(D3D12_DESCRIPTOR_HEAP_TYPE type, std::uint64_t handle) {
@@ -720,6 +733,8 @@ bool live_slot(D3D12_DESCRIPTOR_HEAP_TYPE type, std::uint64_t handle) {
 // A marked descriptor that names another slot is a copy the title made itself: the host's
 // descriptor follows it
 void resolve(const ShadowHeap &heap, std::uintptr_t at) {
+    if (xcl_backend())
+        return;
     at = heap.base + (at - heap.base) / heap.stride * heap.stride;
     std::uint64_t words[2];
     std::memcpy(words, reinterpret_cast<const void *>(at), sizeof words);
@@ -754,6 +769,8 @@ bool null_buffer(const std::uint32_t *words) { return words[2] == 1 && words[3] 
 // Buffers (V#: 48-bit address, stride in bits 48-61, record count in the third dword) become
 // constant buffer views.
 void decode_written(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    if (xcl_backend())
+        return;
     ShadowHeap found{};
     {
         const std::lock_guard lock(shadow_mutex);
@@ -788,9 +805,29 @@ void decode_written(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
                                              D3D12_CPU_DESCRIPTOR_HANDLE);
     original<Create>(heap->device, 17)(heap->device, &view, host_handle(handle));
 }
-void register_shadow(ID3D12Device *device, void *heap, const D3D12_DESCRIPTOR_HEAP_DESC &desc,
-                     D3D12_CPU_DESCRIPTOR_HANDLE host, std::uint64_t gpu) {
+void register_shadow(ID3D12Device *device, void *heap, ID3D12DescriptorHeap *pc_heap,
+                     const D3D12_DESCRIPTOR_HEAP_DESC &desc, D3D12_CPU_DESCRIPTOR_HANDLE host,
+                     std::uint64_t gpu) {
     const UINT stride = console_stride(desc.Type);
+    // XCL: the console's descriptor slots live in UMA window 0, and a view heap's PC
+    // descriptors are copied into one shared shader-visible heap that translated draws bind.
+    if (xcl_backend()) {
+        std::uint64_t pc_host = host.ptr, pc_gpu = gpu;
+        UINT pc_stride = device->GetDescriptorHandleIncrementSize(desc.Type);
+        const auto base = console_heap::register_heap(host_device(), heap, pc_heap, desc.Type,
+                                                      desc.NumDescriptors, pc_host, pc_gpu,
+                                                      pc_stride, &pc_host, &pc_gpu, &pc_stride);
+        if (base) {
+            const std::lock_guard lock(shadow_mutex);
+            shadow_heaps[base] = {base, base + std::uint64_t{desc.NumDescriptors} * stride,
+                                  D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<std::size_t>(pc_host)},
+                                  stride, desc.Type, device,
+                                  (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0,
+                                  pc_gpu, pc_stride, heap};
+            shadow_of[heap] = base;
+            return;
+        }
+    }
     auto *const memory = low_memory(std::size_t{desc.NumDescriptors} * stride);
     if (!memory) {
         std::fprintf(stderr, "[Runtime] no memory below 4 GiB for a descriptor heap\n");
@@ -813,6 +850,8 @@ void register_shadow(ID3D12Device *device, void *heap, const D3D12_DESCRIPTOR_HE
 // Before the GPU runs: what the title wrote straight into a shader-visible heap since last
 // time, read from the pages written to
 void decode_written_heaps() {
+    if (xcl_backend())
+        return;
     std::vector<ShadowHeap> heaps;
     {
         const std::lock_guard lock(shadow_mutex);
@@ -904,10 +943,13 @@ ULONG STDMETHODCALLTYPE heap_release(void *self) {
             heap_proxies.erase(proxy);
         }
         // its shadow goes with it: the host's descriptors it stood for are no more
+        if (xcl_backend())
+            console_heap::unregister(proxy);
         {
             const std::lock_guard lock(shadow_mutex);
             if (const auto found = shadow_of.find(proxy); found != shadow_of.end()) {
-                VirtualFree(reinterpret_cast<void *>(found->second), 0, MEM_RELEASE);
+                if (!xcl_backend())
+                    VirtualFree(reinterpret_cast<void *>(found->second), 0, MEM_RELEASE);
                 shadow_heaps.erase(found->second);
                 shadow_of.erase(found);
                 ++shadows_released;
@@ -1013,6 +1055,46 @@ bool buffer_at(std::uint64_t address, ID3D12Resource *&resource, std::uint64_t &
     size = found->second.end - address;
     return true;
 }
+// Textures the title placed in its own memory: a console T# names that address, so the XCL
+// descriptor model has to find the host's texture behind it.
+std::mutex texture_mutex;
+std::map<std::uint64_t, BufferRange> textures_at;
+void track_texture(ID3D12Resource *resource, std::uint64_t address) {
+    const auto desc = resource->GetDesc();
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        return;
+    const auto bytes = std::uint64_t{desc.Width} * std::max<UINT>(1, desc.Height) *
+                       std::max<UINT>(1, desc.DepthOrArraySize) * 8;
+    const std::lock_guard lock(texture_mutex);
+    textures_at[address] = {address + bytes, resource};
+}
+bool texture_at(std::uint64_t address, ID3D12Resource *&resource, std::uint64_t &offset,
+                std::uint64_t &size) {
+    const std::lock_guard lock(texture_mutex);
+    auto found = textures_at.upper_bound(address);
+    if (found == textures_at.begin())
+        return false;
+    --found;
+    if (address >= found->second.end)
+        return false;
+    resource = found->second.resource;
+    offset = address - found->first;
+    size = found->second.end - address;
+    return true;
+}
+bool lookup_console_resource(std::uint64_t address, ID3D12Resource **resource,
+                             std::uint64_t *offset, std::uint64_t *size) {
+    if (buffer_at(address, *resource, *offset, *size))
+        return true;
+    return texture_at(address, *resource, *offset, *size);
+}
+bool console_address(ID3D12Resource *resource, std::uint64_t *address) {
+    return mapped_address(resource, *address);
+}
+[[maybe_unused]] const bool console_lookups = [] {
+    console_heap::set_lookups(lookup_console_resource, console_address);
+    return true;
+}();
 
 // An address the title gives for a vertex or index buffer that no buffer here answers for:
 // worth a line, since the host's GPU faults on it
@@ -1087,6 +1169,8 @@ void read_root_signature(const void *signature, const void *blob, SIZE_T size) {
 // count in its third dword.
 std::atomic<std::uint64_t> decoded[4];
 void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE_TYPE type) {
+    if (xcl_backend())
+        return;
     std::uint32_t words[4];
     std::memcpy(words, reinterpret_cast<const void *>(at), sizeof words);
     std::uint64_t first;
@@ -1261,7 +1345,10 @@ void decode_table(const void *signature, UINT parameter, std::uint64_t gpu) {
             const auto at = table + std::uintptr_t{range.offset + i} * heap.stride;
             if (at + heap.stride > heap.end)
                 break;
-            decode_as(heap, at, range.type);
+            if (xcl_backend())
+                console_heap::decode(at, range.type);
+            else
+                decode_as(heap, at, range.type);
         }
 }
 
@@ -1286,7 +1373,7 @@ void STDMETHODCALLTYPE create_cbv(ID3D12Device *self, const D3D12_CONSTANT_BUFFE
     }
     original<void(STDMETHODCALLTYPE *)(void *, const void *, Handle)>(self, 17)(
         self, desc ? &host : nullptr, host_handle(handle));
-    mark_host(handle);
+    note_host_descriptor(handle, nullptr, desc, D3D12_DESCRIPTOR_RANGE_TYPE_CBV);
 }
 // What a view without a format reads a typeless texture as: the console takes the number
 // format from elsewhere, the host wants it in the view. `srgb` picks the gamma twin.
@@ -1366,13 +1453,14 @@ void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, 
     }
     original<void(STDMETHODCALLTYPE *)(void *, void *, const void *, Handle)>(self, 18)(
         self, resource, desc, host_handle(handle));
-    mark_host(handle);
+    note_host_descriptor(handle, resource, desc ? &view : nullptr,
+                         D3D12_DESCRIPTOR_RANGE_TYPE_SRV);
 }
 void STDMETHODCALLTYPE create_uav(ID3D12Device *self, ID3D12Resource *resource,
                                   ID3D12Resource *counter, const void *desc, Handle handle) {
     original<void(STDMETHODCALLTYPE *)(void *, void *, void *, const void *, Handle)>(self, 19)(
         self, resource, counter, desc, host_handle(handle));
-    mark_host(handle);
+    note_host_descriptor(handle, resource, desc, D3D12_DESCRIPTOR_RANGE_TYPE_UAV);
 }
 // Xbox One's CreatePlacedShaderResourceViewX (46) and CreatePlacedUnorderedAccessViewX (47):
 // the console's descriptions begin as the host's do and go on with where the memory is and
@@ -1456,7 +1544,7 @@ void STDMETHODCALLTYPE create_sampler(ID3D12Device *self, const D3D12_SAMPLER_DE
                                       Handle handle) {
     original<void(STDMETHODCALLTYPE *)(void *, const void *, Handle)>(self, 22)(
         self, desc, host_handle(handle));
-    mark_host(handle);
+    note_host_descriptor(handle, nullptr, nullptr, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER);
 }
 // CreateSamplerX (61): a sampler as the console's GPU has it, with each filter on its own.
 // What the host has no word for (the filter along Z, the second bias, the anisotropy bias
@@ -1502,11 +1590,20 @@ void STDMETHODCALLTYPE create_sampler_x(ID3D12Device *self, const ConsoleSampler
     host.MaxLOD = desc->filter_mip ? desc->max_lod : desc->min_lod;
     original<void(STDMETHODCALLTYPE *)(void *, const void *, Handle)>(self, 22)(
         self, &host, host_handle(handle));
-    mark_host(handle);
+    note_host_descriptor(handle, nullptr, nullptr, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER);
 }
 // A copied descriptor: the host's goes along with the host's copy; one the title wrote goes
 // along as the title wrote it, read where it is bound
 void carry(Handle destination, Handle source, UINT stride) {
+    if (xcl_backend()) {
+        const auto *const heap = [&] {
+            const std::lock_guard lock(shadow_mutex);
+            return shadow_heap(destination.ptr);
+        }();
+        if (heap)
+            console_heap::copy(host_device(), destination.ptr, source.ptr, 1, heap->type);
+        return;
+    }
     host_view(source);
     const std::lock_guard lock(shadow_mutex);
     const auto *const heap = shadow_heap(destination.ptr);
@@ -1605,7 +1702,7 @@ HRESULT STDMETHODCALLTYPE create_descriptor_heap(ID3D12Device *self,
         heap_proxies.insert(proxy);
     }
     *heap = proxy;
-    register_shadow(self, proxy, *desc, host, gpu);
+    register_shadow(self, proxy, host_heap_object, *desc, host, gpu);
     return result;
 }
 HRESULT STDMETHODCALLTYPE create_committed_resource(ID3D12Device *, const D3D12_HEAP_PROPERTIES *,
@@ -3042,10 +3139,33 @@ void STDMETHODCALLTYPE set_descriptor_heaps(void *self, UINT count,
     ID3D12DescriptorHeap *host[2]{};
     list->heaps[0] = list->heaps[1] = nullptr;
     for (UINT i = 0; i < count && i < 2; ++i) {
-        host[i] = host_heap(heaps[i]);
-        list->heaps[host[i]->GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER] = host[i];
+        const bool sampler = heaps[i] && host_heap(heaps[i]) &&
+                             host_heap(heaps[i])->GetDesc().Type ==
+                                 D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        if (xcl_backend()) {
+            // a console view heap is a CPU-only mirror: translated shaders index the shared
+            // shader-visible heap, whatever the title bound.
+            auto *const bound = sampler ? host_heap(heaps[i])
+                                        : console_heap::view_heap();
+            if (!bound)
+                continue;
+            host[i] = bound;
+            list->heaps[sampler] = bound;
+        } else {
+            host[i] = host_heap(heaps[i]);
+            if (host[i])
+                list->heaps[host[i]->GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER] =
+                    host[i];
+        }
     }
-    host_of(self)->SetDescriptorHeaps(std::min(count, 2u), host);
+    ID3D12DescriptorHeap *bound[2]{};
+    UINT number = 0;
+    for (auto *heap : host)
+        if (heap)
+            bound[number++] = heap;
+    host_of(self)->SetDescriptorHeaps(number, bound);
+    if (xcl_backend())
+        console_heap::forget(host_of(self));
 }
 // A console GPU handle is the descriptor's address, good whatever heaps are set, and titles
 // use tables of heaps they never set. The host reads a table from the heap that is bound,
@@ -3063,7 +3183,14 @@ void bind_heap_of(void *self, std::uint64_t handle) {
         samplers = heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
     }
     auto *const list = static_cast<ListProxy *>(self);
-    auto *const host = host_heap(owner);
+    auto *const host = xcl_backend() ? console_heap::host_heap(handle) : host_heap(owner);
+    if (!host)
+        return;
+    if (xcl_backend()) {
+        list->heaps[samplers] = host;
+        console_heap::bind(host_of(self), list->heaps[1]);
+        return;
+    }
     if (list->heaps[samplers] == host)
         return;
     list->heaps[samplers] = host;
@@ -3081,6 +3208,8 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
     list->heaps[0] = list->heaps[1] = nullptr;
     list->topology = 0;
     list->indices = {};
+    if (xcl_backend())
+        console_heap::forget(host_of(self));
     xcl::clear_list(self);
     return host_of(self)->Reset(allocator, state);
 }
@@ -3180,9 +3309,14 @@ D3D12_INDEX_BUFFER_VIEW quad_indices(UINT quads) {
 // A quad list is drawn with indices of ours over the title's vertices. A rectangle list
 // gives three corners of each rectangle and the GPU makes the fourth: here the pipeline's
 // geometry shader does (see rectangle_pipeline).
+void bind_console_for_draw(void *self) {
+    if (xcl_backend())
+        console_heap::bind(host_of(self), static_cast<ListProxy *>(self)->heaps[1]);
+}
 void STDMETHODCALLTYPE draw_instanced(void *self, UINT vertices, UINT instances, UINT first,
                                       UINT first_instance) {
     count_draw(self);
+    bind_console_for_draw(self);
     xcl::before_draw(self, host_of(self));
     auto *const list = static_cast<ListProxy *>(self);
     if (list->topology == quad_list) {
@@ -3200,6 +3334,7 @@ void STDMETHODCALLTYPE draw_instanced(void *self, UINT vertices, UINT instances,
 void STDMETHODCALLTYPE draw_indexed_instanced(void *self, UINT indices, UINT instances, UINT first,
                                               INT base, UINT first_instance) {
     count_draw(self);
+    bind_console_for_draw(self);
     xcl::before_draw(self, host_of(self));
     if (static std::atomic<bool> shown{false};
         static_cast<ListProxy *>(self)->topology == quad_list && !shown.exchange(true)) {
