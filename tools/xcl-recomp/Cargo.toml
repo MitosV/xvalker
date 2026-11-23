@@ -1,0 +1,30 @@
+[package]
+name = "xcl-recomp"
+description = "XCL's console shader recompiler (RDNA2 -> HLSL) as a library and a corpus tool"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+
+[lib]
+name = "xcl_recomp"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "xcl-corpus"
+path = "src/bin/xcl-corpus.rs"
+
+[dependencies]
+miniz_oxide = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(windows))'.dependencies]
+# renameat2(RENAME_NOREPLACE): the extraction must not replace a file that appeared
+# meanwhile, as on Windows.
+libc = "0.2"
+
+[features]
+# The test modules of the vendored files that need XCL's Windows-only modules
+# (`gpu::recomp::dxc`, `gpu::recomp::runner`) or its Windows-only memory probe.
+xcl_vendored_tests = []
