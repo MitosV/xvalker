@@ -206,3 +206,10 @@ must not clobber a file that appeared meanwhile. Linux has `renameat2` with
 +        #[cfg(windows)]
 +        windows_sys::Win32::Foundation::SetLastError(122);
 ```
+
+## xvalker build of the DLL (orchestrator)
+
+`src/gpu/shader.rs`: the 11 `#[cfg(windows)]` gates added above are `#[cfg(xcl_runtime)]`
+(a cfg that is never set), so the Windows DLL does not build XCL's runtime capture code.
+`src/rpf.rs` is unchanged; its Windows branch uses `windows-sys`, a Windows-only dependency of
+`tools/xcl-recomp`.

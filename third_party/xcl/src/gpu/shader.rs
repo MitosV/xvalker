@@ -7,11 +7,11 @@
 //! shaders still carry DXIL/DXBC or only console GPU microcode.
 
 use std::collections::BTreeMap;
-#[cfg(windows)]
+#[cfg(xcl_runtime)]
 use std::collections::HashSet;
-#[cfg(windows)]
+#[cfg(xcl_runtime)]
 use std::path::PathBuf;
-#[cfg(windows)]
+#[cfg(xcl_runtime)]
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -193,24 +193,24 @@ pub struct ShaderStats {
     pub recomp_dxc_failed: usize,
 }
 
-#[cfg(windows)]
+#[cfg(xcl_runtime)]
 struct State {
     seen: HashSet<u64>,
     stats: ShaderStats,
     insts: xbox::InstStats,
 }
 
-#[cfg(windows)]
+#[cfg(xcl_runtime)]
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-#[cfg(windows)]
+#[cfg(xcl_runtime)]
 fn dump_dir() -> PathBuf {
     crate::state::data_dir().join("shaders")
 }
 
 /// Is `[p, p+len)` committed, readable memory? (Game-provided pointers may be garbage
 /// when our guess of a console struct layout is wrong.)
-#[cfg(windows)]
+#[cfg(xcl_runtime)]
 pub fn readable(p: usize, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
     if p == 0 || len == 0 || len > 256 << 20 {
@@ -233,7 +233,7 @@ pub fn readable(p: usize, len: usize) -> bool {
 }
 
 /// Record a shader blob submitted by the title. Safe on garbage pointers.
-#[cfg(windows)]
+#[cfg(xcl_runtime)]
 pub fn capture(stage: &str, ptr: usize, len: usize) {
     if ptr == 0 && len == 0 {
         return; // unused stage
@@ -280,7 +280,7 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
 
 /// Console container: account its FSSM variants and instructions, write the
 /// decompressed FSSMs and the disassembly next to the blob.
-#[cfg(windows)]
+#[cfg(xcl_runtime)]
 fn capture_xbox(blob: &[u8], base: &std::path::Path, h: u64) {
     let Some(sh) = xbox::parse(blob) else { return };
     let mut insts = xbox::InstStats::default();
@@ -313,7 +313,7 @@ fn capture_xbox(blob: &[u8], base: &std::path::Path, h: u64) {
 
 /// Translate every program of a captured console shader (mode from its interface) and
 /// write the HLSL next to the dumps; with `XCL_RECOMP_DXC=1` also compile it (cached).
-#[cfg(windows)]
+#[cfg(xcl_runtime)]
 fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
     use crate::gpu::recomp;
     let dxc = std::env::var("XCL_RECOMP_DXC").is_ok_and(|v| v == "1");
@@ -355,7 +355,7 @@ fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(xcl_runtime)]
 pub fn stats() -> ShaderStats {
     let g = STATE.lock().ok();
     let mut s = g.as_ref().and_then(|g| g.as_ref().map(|st| st.stats.clone())).unwrap_or_default();
