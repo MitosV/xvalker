@@ -1,10 +1,50 @@
 # Edits to the vendored XCL files
 
-Every edit of the vendored files of XCL `dd713e3` is listed here. The goal of the
+Every edit of the vendored files of XCL `db5dc26` is listed here. The goal of the
 edits is one thing only: **let the files build outside XCL, on Linux**, without
-changing what the recompiler does.
+changing what the recompiler does. The edits that changed what the recompiler
+does are the two the upstream did not take (the mesh pass-through's vertex
+stride) and the ones upstream took over (the wave64 form on a 32-lane host).
 
 The files not listed here are byte-identical to their originals.
+
+---
+
+## What upstream took over
+
+Upstream `db5dc26` has the work xvalker had done for the wave64 programs on a
+32-lane host, and more:
+
+* `gpu/recomp/x64_masks.rs` (new): which masks are read whole (so the two
+  halves must exchange them) and which are only read lane by lane (so they stay
+  in the half). `gpu/recomp/upper_lanes.rs` (new): what the lanes 32..63 of a
+  wave64 VS / PS hold, so the 32-lane form can give the program their values.
+* `Options::split_wave64` replaces xvalker's `host_wave` / `geometry_wave32` /
+  `mesh_wave32`: a wave64 compute / mesh / geometry program runs as two native
+  wave32 halves that exchange their masks and lane values through groupshared
+  memory (`docs/wave64-on-wave32.md` of XCL), and a wave64 VS / PS gets the
+  values of the lanes >= 32 it reads.
+* Upstream no longer refuses a program for the host's wave width: the split
+  form has no rejection list. On the corpus, the 364 pixel programs xvalker had
+  to refuse are translated now.
+
+So xvalker's own wave64 form (`gpu/recomp/wave64_host.rs` and the emitter
+changes that went with it: the idempotent reductions, the uniform readlane, the
+groupshared exchange, the full wave64 masks) is **dropped**: upstream's form
+covers all of it, and it is upstream's own code (the audited one). The file
+`gpu/recomp/wave64_host.rs` is gone.
+
+What upstream does **not** cover, and xvalker keeps:
+
+* the mesh pass-through's vertex stride (below): upstream's `passthrough_split`
+  still budgets the per-vertex output as `16 * (1 + elements)`, but DXC's mesh
+  validator rounds the stride up to a power of two of 16-byte elements.
+
+Upstream also fixed the MUBUF index bug xvalker had patched (a `MUBUF` load
+whose `VDATA` overlaps the index `VADDR`): upstream's load is branch-free now
+and computes every bounds check of the instruction in one statement, before it
+writes the loaded components into `VDATA`. The xvalker patch (a snapshot of the
+index in a local) is therefore **dropped**.
 
 ---
 
@@ -26,8 +66,9 @@ Removed (5 lines):
 only. `dxc` has a Linux counterpart in `tools/xcl-recomp/src/dxc.rs` (the `dxc` CLI);
 `pso` and `runner` are the runtime's job, not the translator's.
 
-The remaining children (`emit`, `mesh_dispatch`, `mesh_wave`) are unchanged and are
-found next to `mod.rs` in `third_party/xcl/src/gpu/recomp/`.
+The remaining children (`emit`, `mesh_dispatch`, `mesh_wave`, `x64_masks`,
+`upper_lanes`) are unchanged and are found next to `mod.rs` in
+`third_party/xcl/src/gpu/recomp/`.
 
 ---
 
@@ -45,26 +86,45 @@ crate's own `dxc` module, so the path changed (4 call sites + 1 comment):
 +crate::dxc::compile(   (2 sites)
 ```
 
+The `--precompile` path had two parts that need XCL's D3D12 modules, which are
+not vendored:
+
+* the split wave64 form's default: the adapter's wave width, which XCL asks its
+  own device (`pso::split_wave64_forced`, `runner::wave64_supported`). The
+  caller decides now (`--split`); the default is off.
+
+```
+-let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
++let split = split.unwrap_or(false);
+```
+
+* the compute programs as a title's pipeline translates them
+  (`pso::console_to_dxil_in`). The generic loop below translates them with the
+  same options (`windows`, `split`) and compiles them into the same cache, so
+  the block is out.
+
 ---
 
 ## `src/gpu/shader.rs`
 
 The runtime capture part of the module (the D3D12 hooks that dump the shaders a
-title submits) is Windows only. It is now behind `#[cfg(windows)]`, so the file
+title submits) is Windows only. It is now behind `#[cfg(xcl_runtime)]`, so the file
 builds on Linux; the parts the recompiler needs (`container_parts`, `classify`,
 `Kind`, `fnv64`, `rdna2_listing`) are untouched.
 
-Added `#[cfg(windows)]` (10 lines):
+Added `#[cfg(xcl_runtime)]` (12 lines):
 
 ```
- struct State {                    ->  #[cfg(windows)]
- static STATE: Mutex<Option<State>>  ->  #[cfg(windows)]
- fn dump_dir() -> PathBuf {       ->  #[cfg(windows)]
- pub fn readable(p: usize, ...)   ->  #[cfg(windows)]
- pub fn capture(stage: &str, ...) ->  #[cfg(windows)]
- fn capture_xbox(blob: &[u8], ..) ->  #[cfg(windows)]
- fn recompile(blob: &[u8], ...)   ->  #[cfg(windows)]
- pub fn stats() -> ShaderStats    ->  #[cfg(windows)]
+ struct State {                    ->  #[cfg(xcl_runtime)]
+ static STATE: Mutex<Option<State>>  ->  #[cfg(xcl_runtime)]
+ fn dump_dir() -> PathBuf {       ->  #[cfg(xcl_runtime)]
+ pub fn readable(p: usize, ...)   ->  #[cfg(xcl_runtime)]
+ pub fn capture(stage: &str, ...) ->  #[cfg(xcl_runtime)]
+ fn dumps_enabled() -> bool {     ->  #[cfg(xcl_runtime)]
+ fn account_xbox(blob: &[u8], ..) ->  #[cfg(xcl_runtime)]
+ fn capture_xbox(blob: &[u8], ..) ->  #[cfg(xcl_runtime)]
+ fn recompile(blob: &[u8], ...)   ->  #[cfg(xcl_runtime)]
+ pub fn stats() -> ShaderStats    ->  #[cfg(xcl_runtime)]
 ```
 
 The imports that only the Windows part uses are now conditional (3 lines):
@@ -74,16 +134,16 @@ The imports that only the Windows part uses are now conditional (3 lines):
 -use std::path::PathBuf;
 -use std::sync::Mutex;
 +use std::collections::BTreeMap;
-+#[cfg(windows)]
++#[cfg(xcl_runtime)]
 +use std::collections::HashSet;
-+#[cfg(windows)]
++#[cfg(xcl_runtime)]
 +use std::path::PathBuf;
-+#[cfg(windows)]
++#[cfg(xcl_runtime)]
 +use std::sync::Mutex;
 ```
 
-The test module of the file needs `readable`, which is Windows only, so it is behind
-the `xcl_vendored_tests` feature of the crate (1 line):
+The test module of the file needs `readable`, which is Windows only, so it is behind the
+`xcl_vendored_tests` feature of the crate (1 line):
 
 ```
 -#[cfg(test)]
@@ -97,6 +157,13 @@ One call site changed, like in `shaders.rs` (1 line):
 -            let built = if dxc && t.complete() { Some(recomp::dxc::compile_cached(&t.hlsl, "main", profile)) } else { None };
 +            let built = if dxc && t.complete() { Some(crate::dxc::compile_cached(&t.hlsl, "main", profile)) } else { None };
 ```
+
+## xvalker build of the DLL (orchestrator)
+
+`src/gpu/shader.rs`: the `#[cfg(xcl_runtime)]` gates added above are a cfg that is
+never set, so the Windows DLL does not build XCL's runtime capture code.
+`src/rpf.rs` keeps its Windows branch; it uses `windows-sys`, a Windows-only
+dependency of `tools/xcl-recomp`.
 
 ---
 
@@ -171,123 +238,28 @@ must not clobber a file that appeared meanwhile. Linux has `renameat2` with
 
 ## `src/util.rs`
 
-`util.rs` uses `windows_sys` in three places. The Windows code is kept behind
-`#[cfg(windows)]`; on Linux the ANSI conversion falls back to the bytes as they are
-(there is no code page).
+Not edited any more: the file is XCL's Windows helper module (`HRESULT`s, the ANSI
+string helpers), and no crate of XValkyrie builds it — `tools/xcl-tiling` has its
+own small `util` module (the `HRESULT` terms the vendored files use). Upstream's
+`db5dc26` file is vendored byte-identical.
 
-`from_ansi_ptr` (the body is now platform specific, 17 lines):
-
-```
--pub unsafe fn from_ansi_ptr(p: *const u8) -> Option<String> {
--    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
--    ...
-+pub unsafe fn from_ansi_ptr(p: *const u8) -> Option<String> {
-+    #[cfg(windows)]
-+    {
-+        use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
-+        ...
-+    }
-+    #[cfg(not(windows))]
-+    {
-+        from_cstr_ptr(p)
-+    }
-```
-
-`SetLastError` after a truncated copy (2 lines):
-
-```
--        windows_sys::Win32::Foundation::SetLastError(122); // ERROR_INSUFFICIENT_BUFFER
-+        #[cfg(windows)]
-+        windows_sys::Win32::Foundation::SetLastError(122); // ERROR_INSUFFICIENT_BUFFER
-```
-
-```
--        windows_sys::Win32::Foundation::SetLastError(122);
-+        #[cfg(windows)]
-+        windows_sys::Win32::Foundation::SetLastError(122);
-```
-
-## `src/gpu/recomp/mod.rs` (wave64 on a 32-lane host)
-
-The corpus tool models an NVIDIA GPU (host subgroup 32), so wave64 programs must say
-which cross-half operations their host cannot perform. Added to the vendored emitter:
-
-- `Options.host_wave: u32` (0 = native wave64, as before; 32 = two native wave32 halves).
-- `host_hazards(code, mode, host_wave)`: `geometry_wave32_hazards` for mesh/geometry (the split
-  forms also carry a mask), `wave_hazards` for the other stages.
-- `translate` refuses a wave64 program when `host_hazards` is not empty, before emitting HLSL.
-- `translate_geometry` / `translate_mesh` pass `host_wave = 32` when they split the wave.
-
-No other vendored file is changed by these edits.
-
-## xvalker build of the DLL (orchestrator)
-
-`src/gpu/shader.rs`: the 11 `#[cfg(windows)]` gates added above are `#[cfg(xcl_runtime)]`
-(a cfg that is never set), so the Windows DLL does not build XCL's runtime capture code.
-`src/rpf.rs` is unchanged; its Windows branch uses `windows-sys`, a Windows-only dependency of
-`tools/xcl-recomp`.
-## `src/gpu/recomp/wave64_host.rs` and emit/hazard changes (idempotent reductions)
-
-A 32-lane host cannot read a wave64's lane `32+k`. A VGPR whose value is a min/max/and/or
-reduction over DPP/permlanex16 is reduced in each half separately; `v_readlane_b32 ..., 32+k`
-is emitted as `WaveReadLaneAt(v, k & 31)` (`rla_local`). The hazard detectors skip those
-reads and the recognized DPP/permlane chain. `add`/`xor` are not classified as idempotent.
-
-## Uniform readlane on a 32-lane host
-
-A `v_readlane_b32` whose source VGPR is proven uniform over the wave (SGPR broadcast or
-folded reduction) is emitted as the invoking lane's own value. SGPRs are seeded as uniform
-except saved-EXEC registers. The corresponding readlane is no longer refused.
-
-## Groupshared cross-half exchange on a 32-lane host
-
-Compute/mesh/geometry run one logical wave64 as two 32-lane subgroups in one workgroup.
-`ds_bpermute`, `v_readlane` and `v_writelane` of the other half publish values in
-`groupshared uint xcl_xchg[64]` and exchange them with two group barriers. VS/PS have no
-workgroup and still refuse these reads (one invocation per fragment/vertex).
+---
 
 ## `src/gpu/recomp/emit.rs` (mesh pass-through vertex stride)
 
-`passthrough_split` budgeted the per-vertex output as `16 * (1 + elements)`, but DXC's
-mesh validator pads the stride to a power of two of 16-byte elements (SV_Position
-included): 21 outputs cost 32 slots = 512 bytes per vertex. With 78 vertices that
-exceeded the 32 KB group limit and DXC reported "vertex plus primitive output size is
-greater than 32768" (19 MS programs). Round the stride the same way before deciding
-how many groups a mesh record needs.
+`passthrough_split` budgeted the per-vertex output as `16 * (1 + elements)`, but
+DXC's mesh validator pads the stride to a power of two of 16-byte elements
+(SV_Position included): 21 outputs cost 32 slots = 512 bytes per vertex. With 78
+vertices that exceeded the 32 KB group limit and DXC reported "vertex plus
+primitive output size is greater than 32768" (19 MS programs). Round the stride
+the same way before deciding how many groups a mesh record needs.
 
-## `src/gpu/recomp/emit.rs` (full wave64 masks on a 32-lane host)
-
-A split logical wave64 runs its two halves in separate native wave32 subgroups, so a
-`v_cmp` ballot only sees 32 lanes. Each half now publishes its ballot word to two
-groupshared slots per logical wave, barrier, and both halves read the combined 64-bit
-mask. SGPRs derived from a mask (EXEC/VCC, `v_cmp`, `s_and/or/xor_b64`) are therefore
-identical in both halves, as are the `scc`, `execz`/`vccz` branch decisions and
-`s_bcnt1`/`s_ff1` reductions computed from them. The exchange array reserves 66 dwords
-per logical wave (64 lane slots + 2 ballot words).
-
-## `src/gpu/recomp/wave32_host.rs` and `mod.rs` (full-mask SGPR reads on a 32-lane host)
-
-With masks identical in both halves, `v_readfirstlane` publishes its source VGPR through
-`xcl_xchg_rla` and reads the first active lane of the full mask; a `v_readlane` with an
-SGPR-selected lane does the same. `ds_swizzle_b32` and `v_permlane16/x16_b32` preserve
-bit 5 of the logical lane, so they stay within one half and are no longer refused. Mask
-branches, mask-derived SCC branches, and `s_bcnt*`/`s_ff1` reductions now decide on the
-full value and are also no longer refused. Lane reads through DPP that are not part of a
-recognized reduction remain refused.
-
-## `src/gpu/recomp/emit.rs` (groupshared budget with cross-half exchange)
-
-The groupshared exchange added 64–1024 dwords on top of the emitter's full 32 KB
-`xcl_lds`, so DXC rejected 100 compute programs with "Total Thread Group Shared Memory
-used ... is 33024, exceeding maximum: 32768". Reserve 64 dwords per logical wave64 in
-the workgroup for `xcl_xchg`, size `xcl_lds` from the same 8192-dword budget, and use
-the matching index mask for both. This also keeps multi-wave workgroups from indexing
-past the exchange array.
-
-## `src/gpu/recomp/emit.rs` (MUBUF vector access with an overlapping index)
-
-`MUBUF` loads/stores with `IDXEN` emit one bounds check per component. When `VDATA`
-overlaps `VADDR` (e.g. `buffer_load_dwordx3 v[0:2], v[0:1], ... idxen`), the first
-component's write replaced the index VGPR, so the remaining checks used loaded data
-instead of the index and zeroed those components. Snapshot `VADDR` into a local at
-the start of the instruction and use it for the address and every bounds check.
+```
+-    let vbytes = 16 * (1 + elements as u32);
++    // DXC's mesh validator rounds the per-vertex stride up to a power of two of
++    // 16-byte output elements (SV_Position included): 17 elements cost 32 slots,
++    // not 17. Check the same 32 KB budget it checks, otherwise the pass-through
++    // fails with "vertex plus primitive output size is greater than 32768".
++    let slots = (1 + elements as u32).next_power_of_two();
++    let vbytes = 16 * slots;
+```

@@ -30,7 +30,7 @@ All files are copies of `crates/xcl/src/<path>` of the commit above. The ones ma
 | `src/gpu/dxbc.rs` | `crates/xcl/src/gpu/dxbc.rs` | no |
 | `src/gpu/pack.rs` | `crates/xcl/src/gpu/pack.rs` | no |
 | `src/gpu/recomp/mod.rs` | `crates/xcl/src/gpu/recomp/mod.rs` | yes |
-| `src/gpu/recomp/emit.rs` | `crates/xcl/src/gpu/recomp/emit.rs` | no |
+| `src/gpu/recomp/emit.rs` | `crates/xcl/src/gpu/recomp/emit.rs` | yes |
 | `src/gpu/recomp/mesh_wave.rs` | `crates/xcl/src/gpu/recomp/mesh_wave.rs` | no |
 | `src/gpu/recomp/mesh_dispatch.rs` | `crates/xcl/src/gpu/recomp/mesh_dispatch.rs` | yes |
 | `src/gpu/recomp/upper_lanes.rs` | `crates/xcl/src/gpu/recomp/upper_lanes.rs` | no |
@@ -38,7 +38,7 @@ All files are copies of `crates/xcl/src/<path>` of the commit above. The ones ma
 | `src/shaders.rs` | `crates/xcl/src/shaders.rs` | yes |
 | `src/rpf.rs` | `crates/xcl/src/rpf.rs` | yes |
 | `src/rpf_probe.rs` | `crates/xcl/src/rpf_probe.rs` | no |
-| `src/util.rs` | `crates/xcl/src/util.rs` | yes |
+| `src/util.rs` | `crates/xcl/src/util.rs` | no |
 
 Not vendored: `gpu/recomp/dxc.rs` (the Windows `dxcompiler.dll` COM interface),
 `gpu/recomp/runner.rs` (the D3D12 GPU runner), `gpu/recomp/pso.rs` (the D3D12 PSO
