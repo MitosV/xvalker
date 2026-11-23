@@ -1233,9 +1233,19 @@ impl Em {
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
         self.window(&d1);
-        let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
-        let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
+        // VDATA may overlap VADDR. The component loads/stores below overwrite the
+        // index VGPR before the remaining bounds checks are evaluated, so keep the
+        // index in a temporary for the whole instruction.
+        let index = if idxen {
+            let i = format!("{t}_index");
+            let v = self.vreg(vaddr);
+            self.line(&format!("uint {i} = {v};"));
+            i
+        } else {
+            "0u".into()
+        };
+        let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
         self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
         self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));

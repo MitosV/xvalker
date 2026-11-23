@@ -159,6 +159,50 @@ fn the_mesh_passthrough_accounts_for_dxc_s_padded_vertex_stride() {
     assert!(split.contains("verts[39]") && split.contains("tris[13]"));
 }
 
+/// `v_fmac_f32 v1, 0x3d93a92a, v2` (shader 23465 at +0x54). RDNA2 defines it as
+/// VDST = SRC0 * VSRC1 + VDST with a single fused rounding, so the emitter must
+/// keep the old VDST as the third operand of HLSL `mad`.
+#[test]
+fn v_fmac_f32_is_a_fused_read_modify_write() {
+    use xcl_recomp::gpu::recomp;
+    let code = [
+        0xff, 0x04, 0x02, 0x56, 0x2a, 0xa9, 0x93, 0x3d, // v_fmac_f32 v1, lit, v2
+        0x00, 0x00, 0x81, 0xbf, // s_endpgm
+    ];
+    let opt = recomp::Options { mode: recomp::Mode::Kernel, wave64: false, ..Default::default() };
+    let t = recomp::translate(&code, &opt).unwrap();
+    assert!(
+        t.hlsl.contains("mad(asfloat(0x3D93A92Au), asfloat(v2), asfloat(v1))"),
+        "unexpected emission:\n{}",
+        t.hlsl
+    );
+}
+
+/// `buffer_load_dwordx3 v[0:2], v[0:1], s[0:3], 0 idxen` (shader 23465 at +0x28).
+/// VDATA overlaps the index VADDR, so writing the first component would corrupt the
+/// bounds check of the second and third components unless the index is snapshotted.
+#[test]
+fn mubuf_vector_load_snapshots_an_overlapping_index() {
+    use xcl_recomp::gpu::recomp;
+    let code = [
+        0x00, 0x20, 0x3c, 0xe0, 0x00, 0x00, 0x00, 0x80, // buffer_load_dwordx3
+        0x00, 0x00, 0x81, 0xbf, // s_endpgm
+    ];
+    let opt = recomp::Options { mode: recomp::Mode::Kernel, wave64: false, ..Default::default() };
+    let t = recomp::translate(&code, &opt).unwrap();
+    let index = t.hlsl.lines().find_map(|l| {
+        let l = l.trim();
+        l.strip_prefix("uint ").and_then(|l| l.strip_suffix(" = v0;")).filter(|n| n.ends_with("_index"))
+    });
+    let index = match index {
+        Some(i) => i.to_string(),
+        None => panic!("no index snapshot in:\n{}", t.hlsl),
+    };
+    let load = t.hlsl.lines().find(|l| l.contains("v1 = select(")).unwrap();
+    assert!(load.contains(&format!("{index} < s2")), "bounds check used the overwritten index: {load}");
+    assert!(!load.contains("v0 < s2"), "bounds check used the overwritten index: {load}");
+}
+
 /// The error groups of the tool are the errors by message, most frequent first.
 #[test]
 fn the_error_groups_are_sorted_by_count() {

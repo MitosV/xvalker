@@ -263,3 +263,11 @@ used ... is 33024, exceeding maximum: 32768". Reserve 64 dwords per logical wave
 the workgroup for `xcl_xchg`, size `xcl_lds` from the same 8192-dword budget, and use
 the matching index mask for both. This also keeps multi-wave workgroups from indexing
 past the exchange array.
+
+## `src/gpu/recomp/emit.rs` (MUBUF vector access with an overlapping index)
+
+`MUBUF` loads/stores with `IDXEN` emit one bounds check per component. When `VDATA`
+overlaps `VADDR` (e.g. `buffer_load_dwordx3 v[0:2], v[0:1], ... idxen`), the first
+component's write replaced the index VGPR, so the remaining checks used loaded data
+instead of the index and zeroed those components. Snapshot `VADDR` into a local at
+the start of the instruction and use it for the address and every bounds check.
