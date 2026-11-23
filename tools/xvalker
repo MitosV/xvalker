@@ -20,6 +20,7 @@
 #               (default: ~/.cache/xvalker/prefix)
 #   XV_CACHE    the cache folder for the shader caches
 #               (default: ~/.cache/xvalker/cache)
+#   XV_RENDERDOC  0 starts without RenderDoc's layer (default: loaded, no overlay, no capture)
 #   XV_STATE    the folder that holds the logs and the saves, outside the prefix
 #               (default: ~/.local/share/xvalker)
 #
@@ -140,9 +141,31 @@ wine_env() {
     export WINEDEBUG=${WINEDEBUG:--all}
     export WINEESYNC=1 WINEFSYNC=1
     export WINE_LARGE_ADDRESS_AWARE=1
-    export VKD3D_SHADER_CACHE_PATH=$cache/vkd3d-shader
-    export DXVK_STATE_CACHE_PATH=$cache/dxvk-state
-    mkdir -p "$VKD3D_SHADER_CACHE_PATH" "$DXVK_STATE_CACHE_PATH"
+    # a value already set wins (0 turns the cache off)
+    export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$cache/vkd3d-shader}
+    export DXVK_STATE_CACHE_PATH=${DXVK_STATE_CACHE_PATH:-$cache/dxvk-state}
+    local dir
+    for dir in "$VKD3D_SHADER_CACHE_PATH" "$DXVK_STATE_CACHE_PATH"; do
+        [ "$dir" = 0 ] || mkdir -p "$dir"
+    done
+}
+
+# RenderDoc's layer always loaded, never capturing and with no overlay: the title runs in the
+# timing it has under RenderDoc. XV_RENDERDOC=0 starts without it. Sets $renderdoc_preload
+# to the library that hides the overlay, and is empty when RenderDoc is not there.
+renderdoc_preload=
+renderdoc_setup() {
+    [ "${XV_RENDERDOC:-1}" = 0 ] && return 0
+    local layer=/etc/vulkan/implicit_layer.d/renderdoc_capture.json
+    [ -f "$layer" ] || { note "no RenderDoc layer ($layer): starting without it"; return 0; }
+    local source=$here/tools/renderdoc_quiet.c quiet=$cache/renderdoc_quiet.so
+    if [ ! -f "$quiet" ] || [ "$source" -nt "$quiet" ]; then
+        mkdir -p "$cache"
+        cc -shared -fPIC -O2 -o "$quiet" "$source" -pthread -ldl >/dev/null 2>&1 ||
+            { note "renderdoc_quiet.so did not build: starting without RenderDoc"; return 0; }
+    fi
+    export ENABLE_VULKAN_RENDERDOC_CAPTURE=1
+    renderdoc_preload=$quiet
 }
 
 # a path of the host the wine side can use
@@ -184,6 +207,7 @@ run_program() {
     shift 2
     ensure_prefix "$proton"
     wine_env
+    renderdoc_setup
     local args=() arg
     for arg in "$@"; do
         if [[ $arg == /* && -e $arg ]]; then
@@ -198,7 +222,9 @@ run_program() {
     cd "$bin" || die "no $bin"
     # when the run is cut short, the wineserver of our prefix goes with it
     trap 'kill_server "$proton"; picture; exit 143' TERM INT
-    "$proton/files/bin/wine" "./$program.exe" "${args[@]}" 2>&1 | tee "$log"
+    # only wine gets the library, not the tools around it; a LD_PRELOAD already set stays
+    env ${renderdoc_preload:+LD_PRELOAD="$renderdoc_preload${LD_PRELOAD:+:$LD_PRELOAD}"} \
+        "$proton/files/bin/wine" "./$program.exe" "${args[@]}" 2>&1 | tee "$log"
     local status=${PIPESTATUS[0]}
     trap - TERM INT
     finish "$proton" "$status"

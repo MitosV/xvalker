@@ -133,6 +133,9 @@ ours and presents it, with one display refresh per 16.7 ms of the title's frame 
 `WaitFrameEventX` only waits when the title did not present since the last wait. The
 title's own window is created but never shown.
 
+On Linux, under Proton, a UI that flickers by layers is gone with RenderDoc's layer loaded:
+see `linux-renderdoc-flicker.md`.
+
 ### Shaders
 
 The sample's shaders, from the kit's compiler, are DXIL containers with the desktop's
