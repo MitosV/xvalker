@@ -1087,8 +1087,9 @@ fn wave_hazards_with(code: &[u8], map: &HostWaveMap, allow_exchange: bool) -> BT
 }
 
 /// Operations that cannot be split into two independent native wave32 halves while
-/// preserving one logical wave64. Split geometry and split mesh translation reject these
-/// rather than silently changing cross-half lane or mask semantics.
+/// preserving one logical wave64. Masks, scalar branches, reductions and the first-lane
+/// read are made uniform through the groupshared mask exchange; remaining cross-half
+/// lane reads and prefix counts are refused rather than silently changing semantics.
 pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
     geometry_wave32_hazards_with(code, &HostWaveMap::default())
 }
@@ -1096,7 +1097,6 @@ pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
 fn geometry_wave32_hazards_with(code: &[u8], map: &HostWaveMap) -> BTreeSet<&'static str> {
     let mut out = BTreeSet::new();
     let mut mask_regs = BTreeSet::from([106u64, 107, 126, 127]); // VCC and EXEC
-    let mut mask_scc = false;
     let mut off = 0;
     while off + 4 <= code.len() {
         let Ok(d) = rdna2::decode(&code[off..], off as u64) else { break };
@@ -1108,67 +1108,29 @@ fn geometry_wave32_hazards_with(code: &[u8], map: &HostWaveMap) -> BTreeSet<&'st
         if (reads_mask && n.ends_with("_B64")) || n.starts_with("V_CMP") {
             mask_regs.extend(writes.iter().copied());
         }
-        if (n.starts_with("S_CMP") || n.starts_with("S_CMPK")) && !reads_mask {
-            mask_scc = false;
-        }
-        if reads_mask
-            && matches!(
-                n,
-                "S_AND_B64"
-                    | "S_OR_B64"
-                    | "S_XOR_B64"
-                    | "S_ANDN2_B64"
-                    | "S_ORN2_B64"
-                    | "S_NAND_B64"
-                    | "S_NOR_B64"
-                    | "S_XNOR_B64"
-            )
-        {
-            mask_scc = true;
-        }
-        if mask_scc && matches!(n, "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1") {
-            out.insert("branch on a half-local scalar condition");
-        }
+        // Masks are now combined from both halves before they reach any SGPR, so
+        // `scc`, `execz`/`vccz` branches and `s_bcnt*`/`s_ff1` reductions see the
+        // full wave64 value and are uniform. `v_readfirstlane` reads the first lane
+        // of that full mask through the groupshared exchange. `ds_swizzle` and
+        // `v_permlane*` preserve bit 5 of the logical lane, so they stay within one
+        // half; only lane reads that need the other half remain to be checked.
         let rewritten = map.is_rewritten(d.pc) || map.reduction_chain.contains(&d.pc);
-        if (matches!(
-            n,
-            "V_READLANE_B32"
-                | "V_WRITELANE_B32"
-                | "V_READFIRSTLANE_B32"
-                | "V_PERMLANE16_B32"
-                | "V_PERMLANEX16_B32"
-                | "DS_BPERMUTE_B32"
-                | "DS_PERMUTE_B32"
-                | "DS_SWIZZLE_B32"
-        ) || d.enc.name.contains("DPP"))
+        if matches!(n, "V_READLANE_B32" | "V_WRITELANE_B32" | "DS_BPERMUTE_B32" | "DS_PERMUTE_B32")
             && !rewritten
             && !map.exchange.contains(&d.pc)
         {
             out.insert("cross-half lane exchange");
         }
-        if matches!(n, "S_CBRANCH_VCCZ" | "S_CBRANCH_VCCNZ" | "S_CBRANCH_EXECZ" | "S_CBRANCH_EXECNZ") {
-            out.insert("branch on a whole-wave mask");
-        }
-        if matches!(n, "S_BCNT0_I32_B64" | "S_BCNT1_I32_B64" | "S_FF1_I32_B64" | "S_FLBIT_I32_B64" | "S_FLBIT_I32_I64") {
-            out.insert("whole-wave mask reduction");
-        }
-        // one 32-bit word of a mask: a half sees its own lanes in its own word only
-        if reads_mask && matches!(n, "S_BCNT0_I32_B32" | "S_BCNT1_I32_B32" | "S_FF1_I32_B32" | "S_FLBIT_I32_B32") {
-            out.insert("whole-wave mask reduction");
+        if d.enc.name.contains("DPP") && !map.reduction_chain.contains(&d.pc) {
+            out.insert("cross-half lane exchange");
         }
         // v_mbcnt over a mask: lanes 32..63 also count the active lanes of 0..31, which the
         // high half does not have (the lane-index idiom, a constant SRC0, is fine)
         if n.starts_with("V_MBCNT") && !matches!(rdna2::field_value(d.enc, &d.words, "SRC0"), Some(128..=208 | 240..=248 | 255)) {
             out.insert("prefix count over a whole-wave mask");
         }
-        if matches!(n, "S_CMP_EQ_U64" | "S_CMP_LG_U64" | "S_BITCMP0_B64" | "S_BITCMP1_B64") {
-            out.insert("scalar condition from a whole-wave mask");
-        }
     }
     let report = mesh_wave::analyze(code);
-    if !report.mask_scc_branches.is_empty() {
-        out.insert("branch on a half-local scalar condition");
-    }
     if report.undecoded_at.is_some() {
         out.insert("incomplete geometry program decode");
     }
@@ -1514,5 +1476,37 @@ mod attribute_tests {
         assert_eq!(vs_output_table(&f), Some(vec![0, 1, 2]));
         f[0x1D4 + 8] = 7;
         assert_eq!(vs_output_table(&f), None);
+    }
+}
+
+#[cfg(test)]
+mod wave32_host_tests {
+    use super::*;
+    use crate::gpu::rdna2::encode;
+
+    /// A mesh wave64 whose mask branch, mask reduction and first-lane read used to be
+    /// refused now runs as two halves with the full mask published through groupshared.
+    #[test]
+    fn split_mesh_accepts_synchronized_masks_and_first_lane_reads() {
+        let mut code = encode("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 168), ("SRC1", 256)], None).unwrap();
+        code.extend(encode("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
+        code.extend(encode("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)], None).unwrap());
+        code.extend(encode("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 256)], None).unwrap());
+        code.extend(encode("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
+        let hazards = host_hazards(&code, &Mode::Mesh(MsInterface::default()), 32);
+        assert!(hazards.is_empty(), "{hazards:?}");
+        assert!(translate_mesh(&code, MsInterface::default(), true, true).is_ok());
+    }
+
+    /// A readlane with the lane number in an SGPR is served from the same exchange as
+    /// a constant cross-half lane: the SGPR is uniform once masks are synchronized.
+    #[test]
+    fn split_mesh_accepts_a_readlane_with_an_sgpr_lane() {
+        let mut code = encode("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 168), ("SRC1", 256)], None).unwrap();
+        code.extend(encode("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256), ("SRC1", 8)], None).unwrap());
+        code.extend(encode("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
+        let hazards = host_hazards(&code, &Mode::Mesh(MsInterface::default()), 32);
+        assert!(hazards.is_empty(), "{hazards:?}");
+        assert!(translate_mesh(&code, MsInterface::default(), true, true).is_ok());
     }
 }

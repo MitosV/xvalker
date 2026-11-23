@@ -107,12 +107,14 @@ pub fn analyze(code: &[u8]) -> HostWaveMap {
                     Val::HalfReduce(_) if known_lane => {
                         map.idempotent.insert(d.pc);
                     }
-                    _ if !(128..=159).contains(&lane) => {
+                    _ => {
                         // Any other cross-half read can be exchanged through groupshared
                         // memory in a stage with a workgroup (compute / mesh / geometry).
+                        // An SGPR lane is fine too: a mask-derived lane is the full
+                        // wave64 value after the ballot synchronization, so both halves
+                        // request the same lane.
                         map.exchange.insert(d.pc);
                     }
-                    _ => {}
                 }
                 sres = sw.first().copied().map(|r| (r, Val::Uniform));
             }
@@ -122,10 +124,7 @@ pub fn analyze(code: &[u8]) -> HostWaveMap {
             }
             "V_WRITELANE_B32" => {
                 res = kind_v(vr.first().copied().unwrap_or(0));
-                let lane = rdna2::field_value(d.enc, &d.words, "SRC1").unwrap_or(0);
-                if !(128..=159).contains(&lane) {
-                    map.exchange.insert(d.pc);
-                }
+                map.exchange.insert(d.pc);
             }
             "V_MOV_B32" | "V_MOVDX_B32" => {
                 if let Some(&r) = vr.first() {
