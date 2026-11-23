@@ -114,7 +114,10 @@ bool map(Physical &state, Reservation &reservation, std::uintptr_t address, ULON
     if ((protect & protections) != PAGE_READWRITE)
         VirtualProtect(at, page, protect & protections, &previous);
     reservation.views[address] = {number, owned};
-    state.mapped[number] = address;
+    // the first view of a page is the one that is remembered: a page can be
+    // mapped in more than one reservation
+    if (!state.mapped.contains(number))
+        state.mapped[number] = address;
     return true;
 }
 // A reservation of placeholders, one every 64 KiB. The caller holds the lock.
