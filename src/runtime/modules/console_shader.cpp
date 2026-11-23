@@ -4,6 +4,7 @@
 #include "runtime/modules/console_shader_rdna.hpp"
 #include "runtime/modules/inflate.hpp"
 #include "runtime/modules/system.hpp"
+#include "runtime/modules/xbox_dxil.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -37,7 +38,7 @@
 namespace xv::runtime::modules {
 namespace {
 // Bumped whenever what is made for a shader changes: the cache keeps one file per version.
-constexpr int translator_version = 17;
+constexpr int translator_version = 18;
 
 using Bytes = std::span<const std::uint8_t>;
 std::uint32_t word(Bytes bytes, std::size_t at) {
@@ -679,6 +680,32 @@ std::atomic<unsigned> translated{0}, stood_in{0};
 } // namespace
 
 bool inflate_zlib(Bytes stream, std::vector<std::uint8_t> &out) { return Inflate(stream).run(out); }
+
+// A shader that carries the console's DXIL is not translated from machine code: its DXIL
+// calls the console's own intrinsics, which the host's compiler does not know. Lower them and
+// sign the result once per shader; titles make the same pipelines on many threads.
+std::span<const std::uint8_t> lower_console_dxil(std::span<const std::uint8_t> container) {
+    static std::mutex mutex;
+    static std::map<std::string, std::vector<std::uint8_t>> kept;
+    const auto key = hash_name(container);
+    {
+        const std::lock_guard lock(mutex);
+        if (const auto found = kept.find(key); found != kept.end())
+            return found->second;
+    }
+    std::string why;
+    auto lowered = lower_xbox_dxil(container, &why);
+    std::vector<std::uint8_t> bytes;
+    if (lowered) {
+        bytes = std::move(lowered->dxil);
+    } else {
+        static std::atomic<int> shown{0};
+        if (shown++ < 4)
+            std::fprintf(stderr, "[Runtime] console DXIL could not be lowered: %s\n", why.c_str());
+    }
+    const std::lock_guard lock(mutex);
+    return kept.emplace(key, std::move(bytes)).first->second;
+}
 
 bool console_only_shader(Bytes container);
 std::span<const std::uint8_t> rectangle_shader(Bytes vertex) {
