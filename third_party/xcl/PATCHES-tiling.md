@@ -1,6 +1,6 @@
 # Patches to the vendored XCL tiling files
 
-The files under `src/` are byte-identical with XCL commit `dd713e3` (see README-tiling.md);
+The files under `src/` are byte-identical with XCL commit `db5dc26` (see README-tiling.md);
 none of them is edited. What the runtime builds differs from them as recorded here.
 
 ## tools/xcl-tiling (the crate, `xcl_tiling.dll`)
@@ -20,11 +20,19 @@ them are kept verbatim. New code, not from XCL: `src/abi.rs` (the C ABI of
 `src/runtime/modules/xcl_tiling.h`), `src/gpu/mod.rs`, `src/hle/mod.rs`, `build.sh`,
 `Cargo.toml`, `gen_d3d12.py`.
 
+Upstream's `xg.rs` models the 3D textures now (their depth slices) and the 1D layouts.
+The C ABI still covers the 2D textures (an array's slices): `xcl_tiling_create` refuses a
+3D texture with `E_INVALIDARG` (before, the library itself refused it with `E_NOTIMPL`), so
+the ABI's shape — one subresource per array slice and mip level — does not change.
+
 ### gpu/desc.rs — the two `windows` imports become the local terms
 
+Upstream's `image_d3d12` now always declares a cube array (a cube T# says nothing at
+compile time about how many cubes it has), so the copy does too.
+
 ```diff
---- third_party/xcl/src/gpu/desc.rs	2026-11-23 04:12:52.597912049 -0600
-+++ tools/xcl-tiling/src/gpu/desc.rs	2026-11-23 04:31:31.078224449 -0600
+--- third_party/xcl/src/gpu/desc.rs
++++ tools/xcl-tiling/src/gpu/desc.rs
 @@ -4,8 +4,7 @@
  //! a cache keyed by the raw words …) can use them. Field positions as in AMD's GFX10
  //! register docs, cross-checked with AnyPS5 (GPL-2.0); format numbers = GFX10 IMG_FORMAT.
@@ -50,18 +58,20 @@ read-back test go with the upload paths). Dropped: `uma_bytes` (XCL's UMA), `err
 `Ttpf` — everything that needs a D3D12 device or XCL's UMA / sample archives.
 
 ```diff
---- third_party/xcl/src/gpu/texture.rs	2026-11-23 04:12:52.596912064 -0600
-+++ tools/xcl-tiling/src/gpu/texture.rs	2026-11-23 04:39:09.650423985 -0600
-@@ -12,7 +12,7 @@
+--- third_party/xcl/src/gpu/texture.rs
++++ tools/xcl-tiling/src/gpu/texture.rs
+@@ -11,9 +11,8 @@
+ //! the title rewrote one) – that comes with the game executable.
  
  use super::desc::{self, Image, ImageType};
+-use super::fence;
  use super::tiling::{self, Chain, PipeConfig};
 -use windows::Win32::Graphics::Direct3D12::*;
 +use crate::d3d12::*;
  
  /// Pipes / packers of the console's GB_ADDR_CONFIG – only the XOR (_X) modes depend on it.
  /// From the console's own layout library: every texel of every mode matches with 32 pipes /
-@@ -110,6 +110,7 @@
+@@ -111,6 +110,7 @@
  }
  
  /// The console memory a T#'s texture occupies, when it lies in the unified memory (UMA).
@@ -69,7 +79,7 @@ read-back test go with the upload paths). Dropped: `uma_bytes` (XCL's UMA), `err
  fn checked_span(start: u64, bytes: usize) -> Result<(usize, usize), String> {
      if bytes == 0 {
          return Err("empty texture memory span".into());
-@@ -118,38 +119,7 @@
+@@ -119,38 +119,7 @@
      let end = start.checked_add(bytes).ok_or("texture memory span overflows the host address space")?;
      Ok((start, end))
  }
@@ -109,7 +119,7 @@ read-back test go with the upload paths). Dropped: `uma_bytes` (XCL's UMA), `err
  fn validate_subresources(subs: &[Subresource]) -> Result<(), String> {
      if subs.is_empty() {
          return Err("texture upload without subresources".into());
-@@ -170,6 +140,7 @@
+@@ -171,6 +140,7 @@
      Ok(())
  }
  
@@ -117,7 +127,7 @@ read-back test go with the upload paths). Dropped: `uma_bytes` (XCL's UMA), `err
  fn validate_subresource_count(rd: &D3D12_RESOURCE_DESC, count: usize) -> Result<(), String> {
      let arrays = match rd.Dimension {
          D3D12_RESOURCE_DIMENSION_TEXTURE1D | D3D12_RESOURCE_DIMENSION_TEXTURE2D => rd.DepthOrArraySize as usize,
-@@ -186,148 +157,9 @@
+@@ -187,143 +157,9 @@
      }
      Ok(())
  }
@@ -214,16 +224,11 @@ read-back test go with the upload paths). Dropped: `uma_bytes` (XCL's UMA), `err
 -
 -/// Wait until `queue` has run everything submitted so far.
 -pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(), String> {
--    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
--    queue.Signal(&fence, 1).map_err(err)?;
--    let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(err)?;
--    fence.SetEventOnCompletion(1, ev).map_err(err)?;
--    windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
--    let _ = windows::Win32::Foundation::CloseHandle(ev);
--    if fence.GetCompletedValue() < 1 {
--        return Err(format!("GPU did not finish the texture copy within 10 s ({:?})", dev.GetDeviceRemovedReason()));
--    }
--    Ok(())
+-    let copy_error = |e| format!("texture copy: {e}");
+-    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+-        .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
+-    queue.Signal(&fence, 1).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+-    fence::wait(&fence, 1, dev, None, 10_000).map_err(copy_error)
 -}
 -
 -unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String> {
@@ -266,7 +271,7 @@ read-back test go with the upload paths). Dropped: `uma_bytes` (XCL's UMA), `err
  
      fn image(format: u32, ty: ImageType, w: u32, h: u32, slices: u32, mips: u32, mode: u32, address: u64) -> Image {
          Image {
-@@ -434,11 +266,9 @@
+@@ -430,11 +266,9 @@
          assert_eq!(subresources(&t, &mem, CONSOLE_PIPES).unwrap(), want);
          assert!(subresources(&t, &mem[..mem.len() - 1], CONSOLE_PIPES).is_err());
      }
@@ -278,7 +283,7 @@ read-back test go with the upload paths). Dropped: `uma_bytes` (XCL's UMA), `err
          for mode in [0, 1] {
              let t = image(rgba8, ImageType::D1Array, 33, 37, 2, 3, mode, 0x36_0000);
              let mut normalized = t;
-@@ -447,34 +277,19 @@
+@@ -443,34 +277,19 @@
              let (want, mem) = console_texture(&t);
              assert!(want.iter().all(|s| s.rows == 1));
              assert_eq!(subresources(&t, &mem, CONSOLE_PIPES).unwrap(), want);
@@ -313,16 +318,14 @@ read-back test go with the upload paths). Dropped: `uma_bytes` (XCL's UMA), `err
      #[test]
      fn invalid_cube_face_ranges_are_rejected_before_placement() {
          let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
-@@ -511,353 +326,4 @@
+@@ -507,351 +326,4 @@
          assert!(placement(&t, CONSOLE_PIPES).err().unwrap().contains("invalid"));
          assert!(desc::image_d3d12(&t).is_none());
      }
 -
 -    fn device() -> Option<(ID3D12Device, ID3D12CommandQueue)> {
 -        unsafe {
--            let mut dev: Option<ID3D12Device> = None;
--            windows::Win32::Graphics::Direct3D12::D3D12CreateDevice(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0, &mut dev).ok()?;
--            let dev = dev?;
+-            let dev = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0).ok()?;
 -            let queue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).ok()?;
 -            Some((dev, queue))
 -        }

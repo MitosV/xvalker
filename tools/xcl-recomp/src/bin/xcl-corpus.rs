@@ -393,20 +393,26 @@ fn process(name: &str, blob: &[u8], record: usize, compile: bool, host_wave: u32
                 stats.wave32 += 1;
                 totals.wave32 += 1;
             }
-            let hazards = if host_wave == 32 { recomp::host_hazards(code, &mode, host_wave) } else { recomp::wave_hazards(code) };
+            // The cross-lane reads of a wave64 program that a 32-lane wave cannot do: for a
+            // VS / PS the reads of lanes >= 32 that XCL's `upper_lanes` analysis cannot follow
+            // (the 32-lane form needs their value); the other stages run a logical wave64 as
+            // two halves that exchange their masks and lanes through groupshared memory
+            // (XCL's split wave64 form), so they have no such hazard.
+            let (hazards, _resolved) = match &mode {
+                recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_) => recomp::wave_lane_reads(code),
+                _ => (Default::default(), Default::default()),
+            };
             if !hazards.is_empty() {
                 stats.wave_hazards += 1;
                 totals.wave_hazards += 1;
             }
 
-            // A 32-lane host runs a wave64 program in two native wave32 halves.
+            // A 32-lane host runs a wave64 program as two native wave32 halves: XCL's split
+            // wave64 form (the masks and the lanes are exchanged through groupshared memory).
             let opt = recomp::Options {
                 mode: mode.clone(),
                 wave64,
-                hw_wave: host_wave,
-                geometry_wave32: host_wave == 32 && matches!(mode, recomp::Mode::Geometry(_)),
-                mesh_wave32: host_wave == 32 && matches!(mode, recomp::Mode::Mesh(_)),
-                host_wave,
+                split_wave64: host_wave == 32,
                 ..Default::default()
             };
             let translation = match recomp::translate(code, &opt) {
@@ -507,7 +513,7 @@ fn process_gs_pairs(input: &Input, compile: bool, host_wave: u32, totals: &mut T
                     continue;
                 }
             };
-            let translation = match recomp::translate_geometry(&code, interface.clone(), host_wave == 32) {
+            let translation = match recomp::translate_geometry(&code, interface.clone(), host_wave == 32, 1) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("xcl-corpus: GS {name}: {e}");
@@ -543,8 +549,9 @@ fn usage() -> ! {
          With --compile the HLSL is compiled with the Linux dxc CLI (XCL's arguments).\n\
          With --dump-hlsl the first N translated programs of --stage are written as\n\
          .hlsl files to DIR (limit counts records in the other modes).\n\
-         --host-wave 32 models a GPU with 32-lane subgroups: wave64 mesh/geometry programs\n\
-         run as two halves and wave64 programs with cross-half hazards are refused.\n\
+         --host-wave 32 models a GPU with 32-lane subgroups: XCL's split wave64 form runs\n\
+         every wave64 program as two native wave32 halves (the masks and the lanes are\n\
+         exchanged through groupshared memory).\n\
          \n\
          Environment:\n\
          \x20 XCL_DXC        the dxc executable (default: dxc on the PATH)\n\

@@ -354,9 +354,9 @@ impl Chain {
     }
 
     /// element (x, y, z) of level `l` from the start of the texture (all its slices)
-    fn element_at_z(&self, l: &MipLevel, x: usize, y: usize, z: usize) -> usize {
+    pub fn element_at_z(&self, l: &MipLevel, x: usize, y: usize, z: usize) -> usize {
         let bd = self.layout.block_d;
-        (z / bd) * self.slice_bytes + l.offset + self.layout.offset_z(x + l.origin.0, y + l.origin.1, z % bd, l.pitch)
+        (z / bd) * self.slice_bytes + l.offset + self.layout.offset_z(x + l.origin.0, y + l.origin.1, z, l.pitch)
     }
 
     /// level `i` of a 3D texture (`mem` = all its slices) → its depth slices of linear rows;

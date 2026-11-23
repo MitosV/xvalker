@@ -137,8 +137,8 @@ fn cmp_load_scenario(id: &str) -> Result<CmpScenario, String> {
 
 fn run_one_cmp(id: &str) -> Result<serde_json::Value, String> {
     let sc = cmp_load_scenario(id)?;
-    let opt = super::Options { mode: super::Mode::Kernel, wave64: false, hw_wave: 0,
-        geometry_wave32: false, mesh_wave32: false, static_sampler_base: 0, mem_windows: 1, structured: true };
+    let opt = super::Options { mode: super::Mode::Kernel, wave64: false, hw_wave: 0, split_wave64: false,
+        static_sampler_base: 0, mem_windows: 1, structured: true };
     let t = super::translate(&sc.code, &opt).map_err(|e| format!("translate: {e}"))?;
     if let Ok(dir) = std::env::var("XCL_CMP_HLSL_DIR") {
         let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{id}.hlsl")), &t.hlsl);

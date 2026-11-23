@@ -296,6 +296,11 @@ mod tests {
 
     #[test]
     fn gpu_dispatch_matches_native_wave64_reference() {
+        if let Err(reason) = super::super::runner::adapter() {
+            println!("GPU unavailable – skipping ({reason})");
+            super::super::runner::skip_test("no GPU");
+            return;
+        }
         if super::super::dxc::location().is_err() {
             super::super::runner::skip_test("no DXC");
             return;

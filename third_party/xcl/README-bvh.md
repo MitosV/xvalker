@@ -7,8 +7,8 @@ the RDNA2 node format (the ones `image_bvh(64)_intersect_ray` traverses). It is 
 | | |
 |---|---|
 | Source | `~/dev/projects/xcl`, `crates/xcl/src/gpu/bvh.rs` |
-| Commit | `dd713e3` ("Merge pull request #52 from gefydev/xml-attr-entities") |
-| SHA-256 | `e79f0a79a929b165229f2e7d46fab01e5de9a4a18f0b6335862c13303d9f44d5` |
+| Commit | `db5dc26` ("Shader loading: dumps on request, translations kept on disk, precompile of compute") |
+| SHA-256 | `9efa6e2afe1b26b5a35cca68663dd1c5f52eecb985e39c0af0f3392f42076e7c` |
 
 The edits to it, if any, are listed in `PATCHES-bvh.md` (there are none).
 

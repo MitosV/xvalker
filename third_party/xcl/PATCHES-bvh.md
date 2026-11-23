@@ -3,11 +3,11 @@
 `src/gpu/bvh.rs` is vendored **byte for byte**: no line of it was changed, so there is nothing to
 apply and nothing to keep in step.
 
-The SHA-256 of the file as it is here and as it is in XCL (`dd713e3`,
+The SHA-256 of the file as it is here and as it is in XCL (`db5dc26`,
 `crates/xcl/src/gpu/bvh.rs`):
 
 ```
-e79f0a79a929b165229f2e7d46fab01e5de9a4a18f0b6335862c13303d9f44d5
+9efa6e2afe1b26b5a35cca68663dd1c5f52eecb985e39c0af0f3392f42076e7c
 ```
 
 Check it with:

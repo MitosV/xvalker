@@ -259,14 +259,12 @@ pub fn image_d3d12(t: &Image) -> Option<(D3D12_RESOURCE_DESC, D3D12_SHADER_RESOU
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
             v.Anonymous.Texture3D = D3D12_TEX3D_SRV { MostDetailedMip: t.base_level, MipLevels: levels, ResourceMinLODClamp: lod };
         }
-        ImageType::Cube if depth > 6 => {
+        // always a cube array (of one cube, too): translated shaders declare TextureCubeArray,
+        // as a cube T# says nothing at compile time about how many cubes it has
+        ImageType::Cube => {
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
             v.Anonymous.TextureCubeArray =
                 D3D12_TEXCUBE_ARRAY_SRV { MostDetailedMip: t.base_level, MipLevels: levels, First2DArrayFace: t.base_array, NumCubes: slices / 6, ResourceMinLODClamp: lod };
-        }
-        ImageType::Cube => {
-            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-            v.Anonymous.TextureCube = D3D12_TEXCUBE_SRV { MostDetailedMip: t.base_level, MipLevels: levels, ResourceMinLODClamp: lod };
         }
         ImageType::D2Msaa => v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS,
         ImageType::D2MsaaArray => {

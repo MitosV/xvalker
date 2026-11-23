@@ -121,14 +121,10 @@ pub unsafe extern "C" fn xcl_translate(container: *const u8, size: usize, flags:
             };
             // a 32-lane host runs a wave64 program as two native wave32 halves (as xcl-corpus
             // --host-wave 32 does)
-            let host_wave = if flags & XCL_FLAG_HOST_WAVE32 != 0 { 32 } else { 0 };
             let opt = gpu::recomp::Options {
                 mode: mode.clone(),
                 wave64,
-                hw_wave: host_wave,
-                geometry_wave32: host_wave == 32 && matches!(mode, gpu::recomp::Mode::Geometry(_)),
-                mesh_wave32: host_wave == 32 && matches!(mode, gpu::recomp::Mode::Mesh(_)),
-                host_wave,
+                split_wave64: flags & XCL_FLAG_HOST_WAVE32 != 0,
                 ..Default::default()
             };
             match gpu::recomp::translate(code, &opt) {

@@ -42,7 +42,7 @@ const PLANE_BYTES: usize = MIP + 15 * MIP_BYTES;
 const MAX_MIPS: usize = 15;
 
 pub fn exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![XGCreateTextureComputer]
+    crate::hle_exports![XGCreateTextureComputer, XGSuggestSwizzleMode]
 }
 
 /// The swizzle mode the console's library picks for a 2D texture with `Layout` 0 / 2: 64KB_D
@@ -75,6 +75,8 @@ pub struct Surface {
     pub width: u32,
     pub height: u32,
     pub array: u32,
+    /// depth slices of a 3D texture, 0: a 2D one
+    pub depth: u32,
     pub first_tail: usize,
 }
 
@@ -103,6 +105,8 @@ pub struct Texture {
     pub mips: u32,
     /// a depth buffer in a color format: the library reports a size of 0
     pub empty: bool,
+    /// D3D12_RESOURCE_DIMENSION
+    dimension: u32,
 }
 
 /// (log2 bytes per element, pixels per element side) of a DXGI format; None for the 96-bit
@@ -137,9 +141,16 @@ impl Texture {
         let w16 = |o: usize| u16::from_le_bytes(d[o..o + 2].try_into().unwrap()) as u32;
         let (dim, width, height, array, mips, format, samples, layout, flags) =
             (u(0), u64::from_le_bytes(d[0x10..0x18].try_into().unwrap()), u(0x18), w16(0x1C), w16(0x1E), u(0x20), u(0x24), u(0x2C), u(0x30));
-        // 1D / 3D / buffers and MSAA are not modelled
-        if dim != 3 || samples > 1 {
+        // buffers and MSAA are not modelled
+        if dim == 4 && samples <= 1 {
+            return Self::volume(width, height, array, mips, format, layout, flags, pipes);
+        }
+        if !matches!(dim, 2 | 3) || samples > 1 {
             return Err(E_NOTIMPL);
+        }
+        let line = dim == 2;
+        if line && (height != 1 || flags & 3 != 0 || !matches!(layout, 0 | 1 | 0x100 | 0x11B)) {
+            return Err(E_INVALIDARG);
         }
         if width == 0 || width > 16384 || height == 0 || height > 16384 || array == 0 {
             return Err(E_INVALIDARG);
@@ -149,6 +160,7 @@ impl Texture {
         let (e, side) = if planar { (2, 1) } else { element(format).ok_or(E_INVALIDARG)? };
         let mode = match layout {
             1 => 0,
+            0 if line => 0, // a 1D texture is linear
             0x100..=0x11F => layout & 0x1F,
             // the choice goes by the whole format's size (D32_S8X24: 64 bits a pixel)
             0 | 2 => optimal_mode(layout, flags, if matches!(format, 19..=22) { 64 } else { (8u64 << e) / (side * side) as u64 }, width, height),
@@ -210,7 +222,40 @@ impl Texture {
                 Plane { usage, offset: at, kind }
             })
             .collect();
-        Ok(Texture { planes, main: main_at, mips, empty })
+        Ok(Texture { planes, main: main_at, mips, empty, dimension: dim })
+    }
+
+    /// A 3D texture: one plane of texels, 4KB_S unless the layout names a mode or it is a UAV
+    /// (Fortnite's newer library: 4KB_S for UAVs too, in 2D as well).
+    #[allow(clippy::too_many_arguments)]
+    fn volume(width: u64, height: u32, depth: u32, mips: u32, format: u32, layout: u32, flags: u32, pipes: crate::gpu::tiling::PipeConfig) -> Result<Texture, HRESULT> {
+        if width == 0 || width > 2048 || height == 0 || height > 2048 || depth == 0 || depth > 2048 {
+            return Err(E_INVALIDARG);
+        }
+        // render targets / depth: their planes are not modelled
+        if flags & 3 != 0 {
+            return Err(E_NOTIMPL);
+        }
+        let (e, side) = element(format).ok_or(E_INVALIDARG)?;
+        let mode = match layout {
+            1 => 0,
+            0x100..=0x11F => layout & 0x1F,
+            // UAVs: the 2D choice, by the texels of all the depth slices
+            0 if flags & 4 != 0 => optimal_mode(0, flags, (8u64 << e) / (side * side) as u64 * depth as u64, width, height),
+            0 => 5,
+            2 => return Err(E_NOTIMPL),
+            _ => return Err(E_INVALIDARG),
+        };
+        let full = 32 - (width as u32).max(height).max(depth).leading_zeros();
+        let mips = if mips == 0 { full } else { mips };
+        if mips as usize > MAX_MIPS {
+            return Err(E_INVALIDARG);
+        }
+        let l = Layout::new_3d(mode, e, pipes).ok_or(E_INVALIDARG)?;
+        let chain = Chain::new_3d(l, width as u32, height, depth, side, mips);
+        let first_tail = chain.levels.iter().position(|m| m.tail.is_some()).unwrap_or(chain.levels.len());
+        let s = Surface { chain, mode, bpe: 1 << e, side, width: width as u32, height, array: 1, depth, first_tail };
+        Ok(Texture { planes: vec![Plane { usage: 1, offset: 0, kind: PlaneKind::Surface(s) }], main: 0, mips, empty: false, dimension: 4 })
     }
 
     pub fn size(&self) -> u64 {
@@ -257,7 +302,7 @@ impl Texture {
         q(b, 8, self.alignment());
         w(b, 0x10, self.mips);
         w(b, 0x14, self.planes.len() as u32);
-        w(b, 0x1B38, 3);
+        w(b, 0x1B38, self.dimension);
         for (k, p) in self.planes.iter().enumerate() {
             let pb = PLANE + k * PLANE_BYTES;
             w(b, pb, p.usage);
@@ -310,11 +355,28 @@ impl Surface {
         let l = Layout::new(mode, e, pipes).ok_or(E_INVALIDARG)?;
         let chain = Chain::new(l, width, height, side, mips);
         let first_tail = chain.levels.iter().position(|m| m.tail.is_some()).unwrap_or(chain.levels.len());
-        Ok(Surface { chain, mode, bpe: 1 << e, side, width, height, array, first_tail })
+        Ok(Surface { chain, mode, bpe: 1 << e, side, width, height, array, depth: 0, first_tail })
     }
 
     pub fn size(&self) -> u64 {
-        (self.chain.slice_bytes * self.array as usize) as u64
+        let slices = if self.depth > 0 { self.chain.layers() } else { self.array as usize };
+        (self.chain.slice_bytes * slices) as u64
+    }
+
+    /// depth slices of level `i` (an array's slices) and the same padded to whole blocks
+    fn slices(&self, i: usize) -> (u32, u32) {
+        if self.depth == 0 {
+            return (self.array, self.array);
+        }
+        let d = (self.depth >> i).max(1);
+        if self.mode == 0 {
+            return (d, self.depth); // (what the library writes for every linear level)
+        }
+        if self.chain.layout.block_d == 1 && self.chain.levels.len() > 1 {
+            return (d, 1); // thin with mips: the library's sizes are per slice
+        }
+        // what a level is padded from halves rounding up, as its width and height do
+        (d, self.depth.div_ceil(1 << i).next_multiple_of(self.chain.layout.block_d as u32))
     }
 
     pub fn alignment(&self) -> u64 {
@@ -344,6 +406,9 @@ impl Surface {
     /// patterns (the XOR modes take pipe bits from it)
     pub fn element_offset(&self, i: usize, x: usize, y: usize, slice: usize) -> u64 {
         let m = &self.chain.levels[i];
+        if self.chain.layout.block_d > 1 {
+            return self.chain.element_at_z(m, x, y, slice) as u64;
+        }
         (slice * self.chain.slice_bytes + m.offset + self.chain.layout.offset_z(x + m.origin.0, y + m.origin.1, slice, m.pitch)) as u64
     }
 
@@ -364,21 +429,21 @@ impl Surface {
             let tail = i >= self.first_tail;
             let (pw, ph) = self.padded(i);
             let bytes = (pw * ph) as u64 * self.bpe as u64;
-            let size = bytes;
-            q(b, r, size);
+            let (slices, padded_slices) = self.slices(i);
+            q(b, r, if self.depth > 0 { bytes * padded_slices as u64 } else { bytes });
             q(b, r + 8, self.mip_offset(i));
-            q(b, r + 0x10, size);
+            q(b, r + 0x10, bytes);
             w(b, r + 0x18, pw as u32 * self.side);
             w(b, r + 0x1C, pw as u32 * self.bpe);
             w(b, r + 0x20, if tail { 0x100 } else { self.alignment() as u32 });
             w(b, r + 0x24, pw as u32);
             w(b, r + 0x28, ph as u32);
-            w(b, r + 0x2C, self.array);
+            w(b, r + 0x2C, padded_slices);
             w(b, r + 0x30, m.width as u32);
             w(b, r + 0x34, m.height as u32);
             w(b, r + 0x38, (self.width >> i).max(1));
             w(b, r + 0x3C, (self.height >> i).max(1));
-            w(b, r + 0x40, self.array);
+            w(b, r + 0x40, slices);
             w(b, r + 0x44, 1);
             // the tail is in 256-byte tiles of the same kind (S 1, D 2, R 3; Z keeps its mode)
             w(b, r + 0x48, if tail && !self.mode.is_multiple_of(4) { self.mode % 4 } else { self.mode });
@@ -386,7 +451,9 @@ impl Surface {
                 w(b, r + 0x50, 0x8000);
                 w(b, r + 0x58, 0x8000);
             }
-            w(b, r + 0x60, 1);
+            w(b, r + 0x60, self.chain.layout.block_d as u32);
+            // a volume's tail levels: what the library writes at +8, +0x28, +0x2C and +0x68 is not
+            // modelled (their texels are: `element_offset`)
             w(b, r + 0x64, tail as u32);
         }
     }
@@ -431,6 +498,34 @@ unsafe fn tex<'a>(p: *mut c_void) -> &'a Texture {
 }
 
 /// `HRESULT XGCreateTextureComputer(const D3D12_RESOURCE_DESC*, XGTextureAddressComputer**)`
+/// `HRESULT XGSuggestSwizzleMode(const D3D12_RESOURCE_DESC*, UINT, D3D12_TEXTURE_LAYOUT* out)`
+/// (a newer library's; a retail game passes 0 and its desc's own layout field as `out`): the explicit
+/// layout (0x100 | mode) the library takes for `Layout` 0. The choice itself is checked against
+/// the console's library (`optimal_mode`), this function is not – none at hand exports it.
+pub unsafe extern "system" fn XGSuggestSwizzleMode(desc: *const u8, _what: u32, out: *mut u32) -> HRESULT {
+    if desc.is_null() || out.is_null() {
+        return E_POINTER;
+    }
+    let mut d: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    d[0x2C..0x30].fill(0);
+    if d[0] == 2 {
+        *out = 0x100; // a 1D texture: linear
+        return S_OK;
+    }
+    let r = Texture::new(&d).and_then(|t| t.texels().map(|s| s.mode).ok_or(E_NOTIMPL));
+    let mode = match r {
+        Ok(m) => m,
+        // not modelled (MSAA, 3D render targets): the usual choice by use
+        Err(_) => {
+            let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+            let bits = element(u(0x20)).map_or(32, |(e, _)| 8u64 << e);
+            optimal_mode(0, u(0x30), bits, u64::from_le_bytes(d[0x10..0x18].try_into().unwrap()), u(0x18))
+        }
+    };
+    *out = 0x100 | mode;
+    S_OK
+}
+
 pub unsafe extern "system" fn XGCreateTextureComputer(desc: *const u8, out: *mut *mut c_void) -> HRESULT {
     if desc.is_null() || out.is_null() {
         return E_POINTER;
@@ -492,7 +587,7 @@ unsafe extern "system" fn get_texel_offset(p: *mut c_void, plane: u32, mip: u32,
         *bit = 0;
     }
     match tex(p).plane_surface(plane) {
-        Some((s, at)) if (mip as usize) < s.chain.levels.len() && slice < s.array => at + s.element_offset(mip as usize, x as usize, y as usize, slice as usize),
+        Some((s, at)) if (mip as usize) < s.chain.levels.len() && slice < s.slices(mip as usize).0 => at + s.element_offset(mip as usize, x as usize, y as usize, slice as usize),
         _ => 0,
     }
 }
@@ -510,10 +605,19 @@ fn subresource(t: &Texture, plane: u32, sub: u32) -> Option<(&Surface, u64, usiz
 }
 
 /// rows of `src` (`row_pitch` apart) → the level's place in `dst` (the whole resource)
-unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, _slice_pitch: u32) -> HRESULT {
+unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
+    if t.depth > 0 {
+        let mut linear = vec![0u8; row * m.height * m.depth];
+        for (n, to) in linear.chunks_exact_mut(row).enumerate() {
+            let from = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
+            to.copy_from_slice(std::slice::from_raw_parts(src.add(from), row));
+        }
+        t.chain.tile_volume(std::slice::from_raw_parts_mut(dst.add(at as usize), t.size() as usize), i, &linear);
+        return S_OK;
+    }
     let mut linear = vec![0u8; row * m.height];
     for y in 0..m.height {
         linear[y * row..(y + 1) * row].copy_from_slice(std::slice::from_raw_parts(src.add(y * row_pitch as usize), row));
@@ -524,10 +628,18 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
 }
 
 /// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart)
-unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, _slice_pitch: u32) -> HRESULT {
+unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
+    if t.depth > 0 {
+        let linear = t.chain.detile_volume(std::slice::from_raw_parts(src.add(at as usize), t.size() as usize), i);
+        for (n, from) in linear.chunks_exact(row).enumerate() {
+            let to = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
+            std::ptr::copy_nonoverlapping(from.as_ptr(), dst.add(to), row);
+        }
+        return S_OK;
+    }
     let slice = std::slice::from_raw_parts(src.add(at as usize + k * t.chain.slice_bytes), t.chain.slice_bytes);
     let linear = t.chain.detile_level(slice, i, k);
     for y in 0..m.height {

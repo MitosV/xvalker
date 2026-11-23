@@ -110,22 +110,28 @@ fn the_stage_of_a_mode_is_the_one_of_the_program() {
     assert!(matches!(mode, Mode::Kernel));
 }
 
-/// `v_readlane_b32 s14, v6, 32; s_endpgm` (gfx1010), assembled with llvm-mc.
+/// `v_readlane_b32 s14, v6, 32; s_endpgm` (gfx1010), assembled with llvm-mc: a read of a
+/// lane of the upper half of a wave64. XCL's `upper_lanes` analysis follows it (the lane was
+/// never written), so the 32-lane form does not refuse it.
 #[test]
-fn a_32_lane_host_exchanges_a_read_of_the_upper_half_only_with_a_workgroup() {
+fn a_32_lane_host_resolves_a_read_of_the_upper_half() {
     let code = [0x0e, 0x00, 0x60, 0xd7, 0x06, 0x41, 0x01, 0x02, 0x00, 0x00, 0x81, 0xbf];
-    let hazard = "v_readlane/writelane: lane ≥ 32";
+    let (hazards, resolved) = xcl_recomp::gpu::recomp::wave_lane_reads(&code);
+    assert!(hazards.is_empty(), "{hazards:?}");
+    assert!(resolved.contains("lanes ≥ 32 never written (or inactive)"), "{resolved:?}");
+    // a compute program runs as two halves that exchange their masks and lanes
     let kernel = xcl_recomp::gpu::recomp::Mode::Kernel;
-    assert!(xcl_recomp::gpu::recomp::wave_hazards(&code).contains(hazard));
-    // Compute has a workgroup: the read is served from groupshared memory.
-    assert!(xcl_recomp::gpu::recomp::host_hazards(&code, &kernel, 32).is_empty());
-    let opt = xcl_recomp::gpu::recomp::Options { mode: kernel, wave64: true, host_wave: 32, ..Default::default() };
-    assert!(xcl_recomp::gpu::recomp::translate(&code, &opt).is_ok());
-    // A pixel shader runs one invocation per fragment: no workgroup to exchange through.
+    let opt = xcl_recomp::gpu::recomp::Options { mode: kernel.clone(), wave64: true, split_wave64: true, ..Default::default() };
+    let split = xcl_recomp::gpu::recomp::translate(&code, &opt).unwrap();
+    assert!(split.hlsl.contains("[WaveSize(32)]"), "{}", split.hlsl);
+    // a pixel shader runs one invocation per fragment: it gets the 32-lane form too
     let pixel = xcl_recomp::gpu::recomp::Mode::Pixel(Default::default());
-    assert!(xcl_recomp::gpu::recomp::host_hazards(&code, &pixel, 32).contains(hazard));
-    let opt = xcl_recomp::gpu::recomp::Options { mode: pixel, wave64: true, host_wave: 32, ..Default::default() };
-    assert!(xcl_recomp::gpu::recomp::translate(&code, &opt).is_err());
+    let opt = xcl_recomp::gpu::recomp::Options { mode: pixel, wave64: true, split_wave64: true, ..Default::default() };
+    assert!(xcl_recomp::gpu::recomp::translate(&code, &opt).is_ok());
+    // the native form (a GPU with 64-lane waves) is unchanged
+    let opt = xcl_recomp::gpu::recomp::Options { mode: kernel, wave64: true, ..Default::default() };
+    let native = xcl_recomp::gpu::recomp::translate(&code, &opt).unwrap();
+    assert!(native.hlsl.contains("[WaveSize(64)]"), "{}", native.hlsl);
 }
 
 /// DXC rounds the mesh pass-through's vertex stride up to a power of two of 16-byte
@@ -179,10 +185,10 @@ fn v_fmac_f32_is_a_fused_read_modify_write() {
 }
 
 /// `buffer_load_dwordx3 v[0:2], v[0:1], s[0:3], 0 idxen` (shader 23465 at +0x28).
-/// VDATA overlaps the index VADDR, so writing the first component would corrupt the
-/// bounds check of the second and third components unless the index is snapshotted.
+/// VDATA overlaps the index VADDR: the bounds check must use the index the
+/// instruction had, not the value the first component loaded.
 #[test]
-fn mubuf_vector_load_snapshots_an_overlapping_index() {
+fn mubuf_vector_load_bounds_checks_the_index_before_it_is_overwritten() {
     use xcl_recomp::gpu::recomp;
     let code = [
         0x00, 0x20, 0x3c, 0xe0, 0x00, 0x00, 0x00, 0x80, // buffer_load_dwordx3
@@ -190,17 +196,16 @@ fn mubuf_vector_load_snapshots_an_overlapping_index() {
     ];
     let opt = recomp::Options { mode: recomp::Mode::Kernel, wave64: false, ..Default::default() };
     let t = recomp::translate(&code, &opt).unwrap();
-    let index = t.hlsl.lines().find_map(|l| {
-        let l = l.trim();
-        l.strip_prefix("uint ").and_then(|l| l.strip_suffix(" = v0;")).filter(|n| n.ends_with("_index"))
-    });
-    let index = match index {
-        Some(i) => i.to_string(),
-        None => panic!("no index snapshot in:\n{}", t.hlsl),
-    };
-    let load = t.hlsl.lines().find(|l| l.contains("v1 = select(")).unwrap();
-    assert!(load.contains(&format!("{index} < s2")), "bounds check used the overwritten index: {load}");
-    assert!(!load.contains("v0 < s2"), "bounds check used the overwritten index: {load}");
+    let lines: Vec<&str> = t.hlsl.lines().collect();
+    let check = lines
+        .iter()
+        .position(|l| l.contains("v0 < s2"))
+        .unwrap_or_else(|| panic!("no bounds check in:\n{}", t.hlsl));
+    let write = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("v0 = "))
+        .unwrap_or_else(|| panic!("no write in:\n{}", t.hlsl));
+    assert!(check < write, "the bounds check used the overwritten index:\n{}", t.hlsl);
 }
 
 /// The error groups of the tool are the errors by message, most frequent first.

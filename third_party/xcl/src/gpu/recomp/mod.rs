@@ -54,9 +54,9 @@
 pub(crate) mod emit;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
-pub mod wave64_host;
+pub mod x64_masks;
 pub use emit::mesh_passthrough;
-pub use wave64_host::HostWaveMap;
+pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -71,7 +71,11 @@ pub const KERNEL_LANES: usize = 64;
 pub const KERNEL_SCC_SLOT: usize = 125;
 /// first dword of the export area in `res`: 64 targets × 64 lanes × 4 components
 pub const KERNEL_EXPORTS: usize = KERNEL_SGPRS + KERNEL_LANES * KERNEL_VGPRS;
-pub const KERNEL_RES_DWORDS: usize = KERNEL_EXPORTS + 64 * KERNEL_LANES * 4;
+/// split wave64 (`Options::split_wave64`): the upper half's SGPRs (+ SCC slot), then
+/// `KERNEL_SPLIT_MAGIC` – the runner checks both halves ended with the same scalar state
+pub const KERNEL_SPLIT_SGPRS: usize = KERNEL_EXPORTS + 64 * KERNEL_LANES * 4;
+pub const KERNEL_SPLIT_MAGIC: u32 = 0x5741_5645;
+pub const KERNEL_RES_DWORDS: usize = KERNEL_SPLIT_SGPRS + KERNEL_SGPRS + 1;
 
 /// Vertex shader interface.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -462,15 +466,13 @@ pub struct Options {
     /// kernel mode only: 64 forces `[WaveSize(64)]` for a wave32 program, which then runs as
     /// two independent halves – the wave-size independent form VS/PS always get (tests)
     pub hw_wave: u32,
-    /// geometry mode: emulate one logical wave64 with two native wave32 phases
-    pub geometry_wave32: bool,
-    /// mesh mode: run a logical wave64 mesh program as two native wave32 halves
-    pub mesh_wave32: bool,
-    /// host subgroup size: 32 runs a logical wave64 in two native wave32 halves (0: native wave64)
-    pub host_wave: u32,
-    /// per-instruction rewrites for a 32-lane host (idempotent reduction / uniform read /
-    /// groupshared exchange), filled by `translate` when `host_wave == 32`
-    pub host_map: HostWaveMap,
+    /// the GPU runs only 32-lane waves (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMax`
+    /// < 64, e.g. NVIDIA): each console wave of a wave64 kernel / compute / mesh / geometry
+    /// program runs as two hardware wave32 halves that exchange masks and lane values through
+    /// groupshared memory (`docs/wave64-on-wave32.md`). A wave64 VS / PS (wave size picked by
+    /// the driver) gets the values of lanes 32..63 it reads where a 32-lane wave lacks them
+    /// (`upper_lanes`). No effect on wave32 programs.
+    pub split_wave64: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
     pub static_sampler_base: u32,
@@ -485,7 +487,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, mesh_wave32: false, host_wave: 0, host_map: HostWaveMap::default(), static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, structured: true }
     }
 }
 
@@ -575,6 +577,40 @@ type MemoKey = (u64, u64, Option<u64>, usize, Option<u64>, Vec<u64>);
 /// even be terminated). Once the budget is spent every loop
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
+
+/// The loops the translator emits: ranges spanned by backward jumps (far jumps included),
+/// partly overlapping ones merged until they nest, sorted. `x64_masks` uses them for the
+/// exits through `LOOP_GUARD`.
+pub(super) fn loop_ranges(insts: &[Decoded]) -> Vec<(u64, u64)> {
+    let mut loops: Vec<(u64, u64)> = Vec::new();
+    for d in insts {
+        if let Some(t) = rdna2::branch_target(d) {
+            if t <= d.pc {
+                loops.push((t, d.pc + d.len as u64));
+            }
+        }
+    }
+    loop {
+        let mut merged = false;
+        'scan: for i in 0..loops.len() {
+            for j in 0..loops.len() {
+                let (a, b) = (loops[i], loops[j]);
+                if i != j && a.0 < b.0 && b.0 < a.1 && a.1 < b.1 {
+                    loops[i] = (a.0, b.1);
+                    loops.remove(j);
+                    merged = true;
+                    break 'scan;
+                }
+            }
+        }
+        if !merged {
+            break;
+        }
+    }
+    loops.sort();
+    loops.dedup();
+    loops
+}
 
 /// Target of an s_endpgm before the end of the program: "skip to the end".
 const END: u64 = u64::MAX;
@@ -1043,60 +1079,37 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
     }
 }
 
-/// Instructions of a wave64 program that break when the GPU runs it in waves of 32 lanes
-/// (VS / PS: the driver picks the wave size): reads of a lane ≥ 32 or of a lane chosen at run
-/// time. A wave32 program in 64-lane waves is handled (the halves act as separate waves).
+/// Cross-lane reads of a wave64 program that are still wrong when the GPU runs it in waves of
+/// 32 lanes (VS / PS: the driver picks the wave size), by kind: reads of a lane ≥ 32 – or of a
+/// lane chosen at run time – whose value `upper_lanes` cannot follow. The form for 32-lane
+/// GPUs (`Options::split_wave64`) resolves the others. A wave32 program in 64-lane waves is
+/// handled (the halves act as separate waves).
 pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
-    wave_hazards_with(code, &HostWaveMap::default(), false)
+    wave_lane_reads(code).0
 }
 
-fn wave_hazards_with(code: &[u8], map: &HostWaveMap, allow_exchange: bool) -> BTreeSet<&'static str> {
-    let mut out = BTreeSet::new();
+/// `wave_hazards` and the kinds of reads `upper_lanes` resolves.
+pub fn wave_lane_reads(code: &[u8]) -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
+    let mut insts = Vec::new();
     let mut off = 0;
     while off + 4 <= code.len() {
         let Ok(d) = rdna2::decode(&code[off..], off as u64) else { break };
         off += d.len;
-        match d.inst.name {
-            "V_READLANE_B32" | "V_WRITELANE_B32" => {
-                if map.is_rewritten(d.pc) || (allow_exchange && map.exchange.contains(&d.pc)) {
-                    continue;
-                }
-                let lane = rdna2::field_value(d.enc, &d.words, "SRC1").unwrap_or(0);
-                match lane {
-                    0..=105 => {
-                        out.insert("v_readlane/writelane: lane number from an SGPR");
-                    }
-                    160..=192 => {
-                        out.insert("v_readlane/writelane: lane ≥ 32");
-                    }
-                    255 if d.literal.is_some_and(|l| l & 63 >= 32) => {
-                        out.insert("v_readlane/writelane: lane ≥ 32");
-                    }
-                    _ => {}
-                }
-            }
-            "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" => {
-                if !map.exchange.contains(&d.pc) {
-                    out.insert("ds_(b)permute: arbitrary lane");
-                }
-            }
-            _ => {}
-        }
+        insts.push(d);
     }
-    out
+    rdna2::resolve_far_jumps(&mut insts);
+    let a = upper_lanes::analyze(&insts);
+    (a.hazards(&insts), a.resolved())
 }
 
 /// Operations that cannot be split into two independent native wave32 halves while
-/// preserving one logical wave64. Masks, scalar branches, reductions and the first-lane
-/// read are made uniform through the groupshared mask exchange; remaining cross-half
-/// lane reads and prefix counts are refused rather than silently changing semantics.
+/// preserving one logical wave64. The split form (`Options::split_wave64`) exchanges masks
+/// and lane values between the halves and needs no such list; a program without any of these
+/// could run as two independent halves without exchanges (a possible fast path).
 pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
-    geometry_wave32_hazards_with(code, &HostWaveMap::default())
-}
-
-fn geometry_wave32_hazards_with(code: &[u8], map: &HostWaveMap) -> BTreeSet<&'static str> {
     let mut out = BTreeSet::new();
     let mut mask_regs = BTreeSet::from([106u64, 107, 126, 127]); // VCC and EXEC
+    let mut mask_scc = false;
     let mut off = 0;
     while off + 4 <= code.len() {
         let Ok(d) = rdna2::decode(&code[off..], off as u64) else { break };
@@ -1108,29 +1121,64 @@ fn geometry_wave32_hazards_with(code: &[u8], map: &HostWaveMap) -> BTreeSet<&'st
         if (reads_mask && n.ends_with("_B64")) || n.starts_with("V_CMP") {
             mask_regs.extend(writes.iter().copied());
         }
-        // Masks are now combined from both halves before they reach any SGPR, so
-        // `scc`, `execz`/`vccz` branches and `s_bcnt*`/`s_ff1` reductions see the
-        // full wave64 value and are uniform. `v_readfirstlane` reads the first lane
-        // of that full mask through the groupshared exchange. `ds_swizzle` and
-        // `v_permlane*` preserve bit 5 of the logical lane, so they stay within one
-        // half; only lane reads that need the other half remain to be checked.
-        let rewritten = map.is_rewritten(d.pc) || map.reduction_chain.contains(&d.pc);
-        if matches!(n, "V_READLANE_B32" | "V_WRITELANE_B32" | "DS_BPERMUTE_B32" | "DS_PERMUTE_B32")
-            && !rewritten
-            && !map.exchange.contains(&d.pc)
+        if (n.starts_with("S_CMP") || n.starts_with("S_CMPK")) && !reads_mask {
+            mask_scc = false;
+        }
+        if reads_mask
+            && matches!(
+                n,
+                "S_AND_B64"
+                    | "S_OR_B64"
+                    | "S_XOR_B64"
+                    | "S_ANDN2_B64"
+                    | "S_ORN2_B64"
+                    | "S_NAND_B64"
+                    | "S_NOR_B64"
+                    | "S_XNOR_B64"
+            )
+        {
+            mask_scc = true;
+        }
+        if mask_scc && matches!(n, "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1") {
+            out.insert("branch on a half-local scalar condition");
+        }
+        if matches!(
+            n,
+            "V_READLANE_B32"
+                | "V_WRITELANE_B32"
+                | "V_READFIRSTLANE_B32"
+                | "V_PERMLANE16_B32"
+                | "V_PERMLANEX16_B32"
+                | "DS_BPERMUTE_B32"
+                | "DS_PERMUTE_B32"
+                | "DS_SWIZZLE_B32"
+        ) || d.enc.name.contains("DPP")
         {
             out.insert("cross-half lane exchange");
         }
-        if d.enc.name.contains("DPP") && !map.reduction_chain.contains(&d.pc) {
-            out.insert("cross-half lane exchange");
+        if matches!(n, "S_CBRANCH_VCCZ" | "S_CBRANCH_VCCNZ" | "S_CBRANCH_EXECZ" | "S_CBRANCH_EXECNZ") {
+            out.insert("branch on a whole-wave mask");
+        }
+        if matches!(n, "S_BCNT0_I32_B64" | "S_BCNT1_I32_B64" | "S_FF1_I32_B64" | "S_FLBIT_I32_B64" | "S_FLBIT_I32_I64") {
+            out.insert("whole-wave mask reduction");
+        }
+        // one 32-bit word of a mask: a half sees its own lanes in its own word only
+        if reads_mask && matches!(n, "S_BCNT0_I32_B32" | "S_BCNT1_I32_B32" | "S_FF1_I32_B32" | "S_FLBIT_I32_B32") {
+            out.insert("whole-wave mask reduction");
         }
         // v_mbcnt over a mask: lanes 32..63 also count the active lanes of 0..31, which the
         // high half does not have (the lane-index idiom, a constant SRC0, is fine)
         if n.starts_with("V_MBCNT") && !matches!(rdna2::field_value(d.enc, &d.words, "SRC0"), Some(128..=208 | 240..=248 | 255)) {
             out.insert("prefix count over a whole-wave mask");
         }
+        if matches!(n, "S_CMP_EQ_U64" | "S_CMP_LG_U64" | "S_BITCMP0_B64" | "S_BITCMP1_B64") {
+            out.insert("scalar condition from a whole-wave mask");
+        }
     }
     let report = mesh_wave::analyze(code);
+    if !report.mask_scc_branches.is_empty() {
+        out.insert("branch on a half-local scalar condition");
+    }
     if report.undecoded_at.is_some() {
         out.insert("incomplete geometry program decode");
     }
@@ -1140,50 +1188,17 @@ fn geometry_wave32_hazards_with(code: &[u8], map: &HostWaveMap) -> BTreeSet<&'st
     out
 }
 
-/// Cross-lane operations of a wave64 program that a `host_wave` of 32 lanes cannot run.
-///
-/// Mesh and geometry already carry a whole-wave mask in each half, so their split form must
-/// also preserve mask semantics; VS, PS and CS have one invocation per lane and only need
-/// the lane exchanges to be representable in a half.
-pub fn host_hazards(code: &[u8], mode: &Mode, host_wave: u32) -> BTreeSet<&'static str> {
-    host_hazards_with(code, mode, host_wave, &wave64_host::analyze(code))
+/// Translate a complete ES+GS program; `split_wave64`: for a GPU with 32-lane waves only.
+/// `mem_windows`: the title's memory windows (`pso::mem_windows`), as for VS / PS / CS.
+pub fn translate_geometry(code: &[u8], interface: GsInterface, split_wave64: bool, mem_windows: u32) -> Result<Translation, String> {
+    translate(code, &Options { mode: Mode::Geometry(interface), wave64: true, split_wave64, mem_windows, ..Default::default() })
 }
 
-fn host_hazards_with(code: &[u8], mode: &Mode, host_wave: u32, map: &HostWaveMap) -> BTreeSet<&'static str> {
-    if host_wave != 32 {
-        return BTreeSet::new();
-    }
-    match mode {
-        Mode::Mesh(_) | Mode::Geometry(_) => geometry_wave32_hazards_with(code, map),
-        Mode::Kernel | Mode::Compute(_) => wave_hazards_with(code, map, true),
-        Mode::Vertex(_) | Mode::Pixel(_) => wave_hazards_with(code, map, false),
-    }
-}
-
-/// Translate a complete ES+GS program for the adapter-selected geometry path.
-pub fn translate_geometry(code: &[u8], interface: GsInterface, geometry_wave32: bool) -> Result<Translation, String> {
-    if geometry_wave32 {
-        let hazards = host_hazards(code, &Mode::Geometry(interface.clone()), 32);
-        if !hazards.is_empty() {
-            return Err(format!("geometry program requires unsupported cross-half wave64 semantics: {hazards:?}"));
-        }
-    }
-    translate(
-        code,
-        &Options { mode: Mode::Geometry(interface), wave64: true, geometry_wave32, host_wave: if geometry_wave32 { 32 } else { 0 }, ..Default::default() },
-    )
-}
-
-/// Translate an NGG mesh program; a wave64 program split into wave32 halves is refused
-/// when it needs cross-half semantics, as for split geometry.
-pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, mesh_wave32: bool) -> Result<Translation, String> {
-    if wave64 && mesh_wave32 {
-        let hazards = host_hazards(code, &Mode::Mesh(ms.clone()), 32);
-        if !hazards.is_empty() {
-            return Err(format!("mesh program requires unsupported cross-half wave64 semantics: {hazards:?}"));
-        }
-    }
-    translate(code, &Options { mode: Mode::Mesh(ms), wave64, mesh_wave32, host_wave: if wave64 && mesh_wave32 { 32 } else { 0 }, ..Default::default() })
+/// Translate an NGG mesh program; `split_wave64`: for a GPU with 32-lane waves only;
+/// `mem_windows`: the title's memory windows (`pso::mem_windows`), as for VS / PS / CS – with
+/// one, a program reading title memory above the first window read the wrong memory.
+pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, split_wave64: bool, mem_windows: u32) -> Result<Translation, String> {
+    translate(code, &Options { mode: Mode::Mesh(ms), wave64, split_wave64, mem_windows, ..Default::default() })
 }
 
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.
@@ -1269,15 +1284,6 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
-    let host_map = if opt.host_wave == 32 { wave64_host::analyze(code) } else { HostWaveMap::default() };
-    if opt.wave64 {
-        let hazards = host_hazards_with(code, &opt.mode, opt.host_wave, &host_map);
-        if !hazards.is_empty() {
-            return Err(format!("wave64 program needs unsupported cross-half semantics on a {}-lane host: {hazards:?}", opt.host_wave));
-        }
-    }
-    let mut opt = opt.clone();
-    opt.host_map = host_map;
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
@@ -1316,7 +1322,22 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let mut em = emit::Em::new(opt.clone());
+    em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
+    // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
+    // continues from the ES into the GS through s_setpc: left as it is)
+    if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
+        em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+    }
+    // a wave64 VS / PS on a GPU with 32-lane waves only: what lanes 32..63 hold where the
+    // program reads them (the driver may still pick 64 lanes: decided at run time); only a
+    // program with a read to change gets the form
+    if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
+        let a = upper_lanes::analyze(&insts);
+        if a.reads.values().any(|r| matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow)) {
+            em.upper = Some(a);
+        }
+    }
     em.max_vgpr = insts
         .iter()
         .flat_map(|d| {
@@ -1348,33 +1369,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         // dispatcher loop over all blocks, but DXC sees an acyclic graph almost everywhere
         // (optimising one big dispatcher loop took minutes on large retail programs).
         let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
-        let mut loops: Vec<(u64, u64)> = Vec::new();
-        for d in &insts {
-            if let Some(t) = rdna2::branch_target(d) {
-                if t <= d.pc {
-                    loops.push((t, d.pc + d.len as u64));
-                }
-            }
-        }
-        loop {
-            let mut merged = false;
-            'scan: for i in 0..loops.len() {
-                for j in 0..loops.len() {
-                    let (a, b) = (loops[i], loops[j]);
-                    if i != j && a.0 < b.0 && b.0 < a.1 && a.1 < b.1 {
-                        loops[i] = (a.0, b.1);
-                        loops.remove(j);
-                        merged = true;
-                        break 'scan;
-                    }
-                }
-            }
-            if !merged {
-                break;
-            }
-        }
-        loops.sort();
-        loops.dedup();
+        let loops = loop_ranges(&insts);
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
         let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
         let mut flags = BTreeSet::new();
@@ -1384,7 +1379,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             // smaller for DXC and the driver on big programs)
             emit_structured(&ctx, &mut em, &mut code, 0, u64::MAX, None, 0, None, &BTreeSet::new(), 1, &mut blocks, &mut flags);
         } else {
-            if gs_jump.is_some() && opt.geometry_wave32 {
+            if gs_jump.is_some() && opt.split_wave64 && opt.wave64 {
                 code.push_str("    uint pc = xcl_entry_pc;\n");
             } else {
                 code.push_str("    uint pc = 0;\n");
@@ -1476,37 +1471,5 @@ mod attribute_tests {
         assert_eq!(vs_output_table(&f), Some(vec![0, 1, 2]));
         f[0x1D4 + 8] = 7;
         assert_eq!(vs_output_table(&f), None);
-    }
-}
-
-#[cfg(test)]
-mod wave32_host_tests {
-    use super::*;
-    use crate::gpu::rdna2::encode;
-
-    /// A mesh wave64 whose mask branch, mask reduction and first-lane read used to be
-    /// refused now runs as two halves with the full mask published through groupshared.
-    #[test]
-    fn split_mesh_accepts_synchronized_masks_and_first_lane_reads() {
-        let mut code = encode("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 168), ("SRC1", 256)], None).unwrap();
-        code.extend(encode("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
-        code.extend(encode("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)], None).unwrap());
-        code.extend(encode("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 256)], None).unwrap());
-        code.extend(encode("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
-        let hazards = host_hazards(&code, &Mode::Mesh(MsInterface::default()), 32);
-        assert!(hazards.is_empty(), "{hazards:?}");
-        assert!(translate_mesh(&code, MsInterface::default(), true, true).is_ok());
-    }
-
-    /// A readlane with the lane number in an SGPR is served from the same exchange as
-    /// a constant cross-half lane: the SGPR is uniform once masks are synchronized.
-    #[test]
-    fn split_mesh_accepts_a_readlane_with_an_sgpr_lane() {
-        let mut code = encode("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 168), ("SRC1", 256)], None).unwrap();
-        code.extend(encode("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256), ("SRC1", 8)], None).unwrap());
-        code.extend(encode("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
-        let hazards = host_hazards(&code, &Mode::Mesh(MsInterface::default()), 32);
-        assert!(hazards.is_empty(), "{hazards:?}");
-        assert!(translate_mesh(&code, MsInterface::default(), true, true).is_ok());
     }
 }

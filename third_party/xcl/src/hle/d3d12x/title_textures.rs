@@ -26,12 +26,11 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::gpu::texture::{self, Subresource};
 use crate::hle::xg;
 
-/// GetWriteWatch / ResetWriteWatch
+/// GetWriteWatch with atomic reset of the reported writes.
 const WRITE_WATCH_FLAG_RESET: u32 = 1;
 #[link(name = "kernel32")]
 extern "system" {
     fn GetWriteWatch(flags: u32, base: *const c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
-    fn ResetWriteWatch(base: *const c_void, size: usize) -> u32;
 }
 
 /// (device, address, layout, state) of an upload
@@ -58,6 +57,9 @@ unsafe impl Send for Entry {}
 
 /// PC texture → its place in the title's memory
 static TEXTURES: Mutex<BTreeMap<usize, Entry>> = Mutex::new(BTreeMap::new());
+// The dirty-page scan consumes write-watch state for every submission thread.
+// Keep the scan, pending-list update and GPU uploads together.
+static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
@@ -78,14 +80,10 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     if tex.planes.len() != 1 || tex.texels().is_none() {
         return Err("a render target / depth buffer".into());
     }
-    let bytes = tex.size() as usize;
     if ID3D12Resource::from_raw_borrowed(&res).is_none() {
         return Err("no resource".into());
     }
     let e = Entry { device: device as usize, va, tex: Arc::new(tex), state, pending: true, gpu_written: false };
-    if crate::gpu::uma::get().is_some_and(|u| u.contains(va)) || crate::hle::kernelx::in_graphics_reservation(va) {
-        ResetWriteWatch(va as *const c_void, bytes);
-    }
     {
         let mut t = TEXTURES.lock().unwrap();
         if let Some(old) = t.insert(res as usize, e) {
@@ -94,9 +92,9 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
             }
         }
         TEXTURES_LEN.store(t.len(), Ordering::Relaxed);
+        PENDING.fetch_add(1, Ordering::Relaxed);
     }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
-    PENDING.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -198,6 +196,7 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     if BUSY.with(|b| b.get()) {
         return;
     }
+    let _refresh = REFRESH.lock().unwrap();
     own_work(|| refresh_once(queue));
 }
 
@@ -527,6 +526,10 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     let Some(tex) = tex.texels() else { return Vec::new() };
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
+    if tex.depth > 0 {
+        let mem = read_committed(va, tex.size() as usize);
+        return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
+    }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
     for s in 0..tex.array as usize {
         let slice = read_committed(va + s * c.slice_bytes, c.slice_bytes);

@@ -3,7 +3,10 @@
 //! checked against the console's own library) and the detiling of console memory into linear
 //! rows per subresource. All functions return 0 (S_OK) or an HRESULT; handles are opaque.
 //!
-//! Only 2D textures (arrays, cubes) with one sample and a texel plane: what `xg.rs` models.
+//! Only 2D textures (arrays, cubes) with one sample and a texel plane: the shape this ABI
+//! describes. XCL's library models the 3D textures too (their depth slices), but a volume's
+//! subresource is a level's depth slices, not an array's slices: `xcl_tiling_create`
+//! refuses them.
 //! The caller guarantees `mem` is readable for `mem_bytes`; bytes of a slice past `mem_bytes`
 //! read as zero (a streaming pool has only some of its pages mapped).
 
@@ -41,6 +44,12 @@ pub unsafe extern "C" fn xcl_tiling_create(desc: *const u8, series_s: u32,
             // no texel plane (a depth buffer in a color format, a BCn render target's texels):
             // nothing to detile
             if tex.texels().is_none() {
+                return E_INVALIDARG;
+            }
+            // a 3D texture: XCL's library models it (its depth slices), but this ABI covers
+            // the 2D ones (an array's slices): the shape of a volume's subresource is
+            // different (its slices are the depth slices of a level)
+            if tex.texels().is_some_and(|s| s.depth > 0) {
                 return E_INVALIDARG;
             }
             *out = Box::into_raw(Box::new(XclTiling { tex }));
@@ -244,8 +253,9 @@ mod tests {
         }
     }
 
-    /// What the library does not model is refused, not guessed: 3D, MSAA, a depth buffer in
-    /// a color format (no texel plane), an unknown format.
+    /// What the library does not model is refused, not guessed: MSAA, a depth buffer in
+    /// a color format (no texel plane), an unknown format. A 3D texture is modelled by the
+    /// library now, but this ABI covers the 2D ones, so it refuses it too.
     #[test]
     fn abi_refuses_what_xg_does_not_model() {
         unsafe {

@@ -252,7 +252,11 @@ pub fn triangle_hit(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> 
     let sv = sub(o, v[0]);
     let q = cross(sv, e1);
     let (i, j, t) = (dot(sv, p), dot(d, q), dot(e2, q));
-    let hit = det != 0.0 && i * det >= 0.0 && j * det >= 0.0 && (i + j) * det <= det * det;
+    let hit = if det > 0.0 {
+        i >= 0.0 && j >= 0.0 && i + j <= det
+    } else {
+        det < 0.0 && i <= 0.0 && j <= 0.0 && i + j >= det
+    };
     hit.then_some([t, det, i, j])
 }
 
@@ -604,5 +608,24 @@ pub(crate) mod tests {
         let inv = [f32::INFINITY, f32::INFINITY, 1.0];
         let got = intersect_node(&data, BOX32, 100.0, o, d, inv, true);
         assert_eq!(got, [c0, INVALID, INVALID, INVALID]);
+    }
+
+    #[test]
+    fn triangle_hit_small_and_large_det_avoids_underflow_and_overflow() {
+        let d = [0.0, 0.0, 1.0];
+        // Tiny triangles where det * det underflows to subnormal (1e-40) or 0.0 (1e-48)
+        for s in [1e-10f32, 1e-12f32] {
+            let tri = [[0.0, 0.0, 0.0], [s, 0.0, 0.0], [0.0, s, 0.0]];
+            assert!(triangle_hit(&tri, [2.0 * s, 2.0 * s, -1.0], d).is_none(), "s={s}: outside ray must miss");
+            assert!(triangle_hit(&tri, [0.2 * s, 0.2 * s, -1.0], d).is_some(), "s={s}: inside ray must hit");
+            // Opposite winding (det > 0)
+            let rev = [[0.0, 0.0, 0.0], [0.0, s, 0.0], [s, 0.0, 0.0]];
+            assert!(triangle_hit(&rev, [2.0 * s, 2.0 * s, -1.0], d).is_none(), "s={s} rev: outside ray must miss");
+            assert!(triangle_hit(&rev, [0.2 * s, 0.2 * s, -1.0], d).is_some(), "s={s} rev: inside ray must hit");
+        }
+        // Huge triangle where det * det overflows to +inf
+        let big = [[0.0, 0.0, 0.0], [1e10, 0.0, 0.0], [0.0, 1e10, 0.0]];
+        assert!(triangle_hit(&big, [2e10, 2e10, -1.0], d).is_none());
+        assert!(triangle_hit(&big, [2e9, 2e9, -1.0], d).is_some());
     }
 }
