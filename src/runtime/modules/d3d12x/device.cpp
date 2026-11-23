@@ -1329,6 +1329,31 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
     }
     set_mark(heap, at);
 }
+// XV_XCL_TRACE: what the shaders of a draw read: the descriptor a root table names, the
+// words there, and whether the table is in one of the console's descriptor heaps.
+bool xcl_trace() {
+    static const bool on = std::getenv("XV_XCL_TRACE") != nullptr;
+    return on;
+}
+void trace_table(const char *what, UINT parameter, std::uint64_t address) {
+    bool in_heap = false;
+    {
+        const std::lock_guard lock(shadow_mutex);
+        in_heap = shadow_heap(address) != nullptr;
+    }
+    std::uint32_t words[8]{};
+    const bool inside = console_heap::words_at(address, words, 8);
+    std::fprintf(stderr, "[Runtime] %s root table %u at %llx: %s%s",
+                 what, parameter, static_cast<unsigned long long>(address),
+                 in_heap ? "in a console heap" : "in no console heap",
+                 inside ? "" : " (not in the unified memory)");
+    if (inside)
+        std::fprintf(stderr, ", words %08x %08x %08x %08x %08x %08x %08x %08x", words[0],
+                     words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+
 // A table bound at a GPU handle: what the title wrote in it, by the root signature's ranges
 void decode_table(const void *signature, UINT parameter, std::uint64_t gpu) {
     std::vector<TableRange> ranges;
@@ -1711,6 +1736,21 @@ HRESULT STDMETHODCALLTYPE create_descriptor_heap(ID3D12Device *self,
     }
     *heap = proxy;
     register_shadow(self, proxy, host_heap_object, *desc, host, gpu);
+    if (xcl_trace()) {
+        std::uintptr_t base = 0;
+        {
+            const std::lock_guard lock(shadow_mutex);
+            const auto found = shadow_of.find(proxy);
+            if (found != shadow_of.end())
+                base = found->second;
+        }
+        std::fprintf(stderr,
+                     "[Runtime] descriptor heap: type %d, %u descriptors, flags 0x%x, console "
+                     "address %llx\n",
+                     desc->Type, desc->NumDescriptors, desc->Flags,
+                     static_cast<unsigned long long>(base));
+        std::fflush(stderr);
+    }
     return result;
 }
 HRESULT STDMETHODCALLTYPE create_committed_resource(ID3D12Device *, const D3D12_HEAP_PROPERTIES *,
@@ -3254,6 +3294,8 @@ void STDMETHODCALLTYPE set_graphics_root_signature(void *self, ID3D12RootSignatu
 }
 void STDMETHODCALLTYPE set_compute_root_table(void *self, UINT parameter,
                                               D3D12_GPU_DESCRIPTOR_HANDLE table) {
+    if (xcl_trace())
+        trace_table("compute", parameter, table.ptr);
     decode_table(static_cast<ListProxy *>(self)->compute_root, parameter, table.ptr);
     xcl::write_table(self, parameter, table.ptr, false);
     bind_heap_of(self, table.ptr);
@@ -3261,6 +3303,8 @@ void STDMETHODCALLTYPE set_compute_root_table(void *self, UINT parameter,
 }
 void STDMETHODCALLTYPE set_graphics_root_table(void *self, UINT parameter,
                                                D3D12_GPU_DESCRIPTOR_HANDLE table) {
+    if (xcl_trace())
+        trace_table("graphics", parameter, table.ptr);
     decode_table(static_cast<ListProxy *>(self)->graphics_root, parameter, table.ptr);
     xcl::write_table(self, parameter, table.ptr, true);
     bind_heap_of(self, table.ptr);
@@ -3333,11 +3377,24 @@ void bind_console_for_draw(void *self) {
     if (xcl_backend())
         console_heap::bind(host_of(self), static_cast<ListProxy *>(self)->heaps[1]);
 }
+// XCL returns from its Dispatch/DrawInstanced wrappers without recording when a translated
+// pipeline's ABI cannot be bound: the title's root arguments, laid out for its own signature,
+// would be read against the ABI signature and the shader would index arbitrary memory.
+bool skip_unbound(void *list) {
+    if (xcl::before_draw(list, host_of(list)) != xcl::Binding::skipped)
+        return false;
+    static std::atomic<int> shown{0};
+    if (shown++ < 4)
+        std::fprintf(stderr, "[Runtime] XCL: draw with a translated pipeline skipped (no room "
+                             "for its arguments)\n");
+    return true;
+}
 void STDMETHODCALLTYPE draw_instanced(void *self, UINT vertices, UINT instances, UINT first,
                                       UINT first_instance) {
     count_draw(self);
     bind_console_for_draw(self);
-    xcl::before_draw(self, host_of(self));
+    if (skip_unbound(self))
+        return;
     auto *const list = static_cast<ListProxy *>(self);
     if (list->topology == quad_list) {
         const auto view = quad_indices(vertices / 4);
@@ -3355,7 +3412,8 @@ void STDMETHODCALLTYPE draw_indexed_instanced(void *self, UINT indices, UINT ins
                                               INT base, UINT first_instance) {
     count_draw(self);
     bind_console_for_draw(self);
-    xcl::before_draw(self, host_of(self));
+    if (skip_unbound(self))
+        return;
     if (static std::atomic<bool> shown{false};
         static_cast<ListProxy *>(self)->topology == quad_list && !shown.exchange(true)) {
         std::fprintf(stderr, "[Runtime] an indexed quad list is drawn as a triangle list, which "
@@ -3542,7 +3600,8 @@ void STDMETHODCALLTYPE set_pipeline_state(void *self, ID3D12PipelineState *pipel
     host_of(self)->SetPipelineState(pipeline);
 }
 void STDMETHODCALLTYPE dispatch_x(void *self, UINT groups_x, UINT groups_y, UINT groups_z) {
-    xcl::before_draw(self, host_of(self));
+    if (skip_unbound(self))
+        return;
     host_of(self)->Dispatch(groups_x, groups_y, groups_z);
 }
 void STDMETHODCALLTYPE so_set_targets(void *self, UINT start, UINT count,

@@ -35,6 +35,11 @@ bool contains(std::uintptr_t address);
 ID3D12DescriptorHeap *host_heap(std::uintptr_t address);
 // The shared shader-visible view heap, if one was made.
 ID3D12DescriptorHeap *view_heap();
+// The number of descriptors the shared shader-visible view heap holds (0: there is none).
+UINT shared_size();
+// The console's descriptor words at a console address, as the shaders read them (the first
+// eight). False when the address is not in the unified memory.
+bool words_at(std::uintptr_t address, std::uint32_t *out, UINT count);
 // Windows 0 can name the shared heap at draw time even when the title did not bind it.
 void bind(ID3D12GraphicsCommandList *list, ID3D12DescriptorHeap *samplers);
 // The title bound heaps itself: do not assume our last binding is still in force.

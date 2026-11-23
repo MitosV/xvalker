@@ -295,6 +295,18 @@ ID3D12DescriptorHeap *view_heap() {
     const std::lock_guard lock(shared_mutex);
     return shared.heap;
 }
+UINT shared_size() {
+    const std::lock_guard lock(shared_mutex);
+    return shared.cap;
+}
+bool words_at(std::uintptr_t address, std::uint32_t *out, UINT count) {
+    const auto *const memory = static_cast<const std::uint32_t *>(
+        uma_console_pointer(address));
+    if (!memory)
+        return false;
+    std::memcpy(out, memory, std::size_t{count} * sizeof(std::uint32_t));
+    return true;
+}
 ID3D12DescriptorHeap *host_heap(std::uintptr_t address) {
     auto *const found = heap_of(address);
     if (!found)

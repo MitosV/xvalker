@@ -2,6 +2,7 @@
 #include "host/files.hpp"
 #include "runtime/common/runtime.hpp"
 #include "runtime/modules/console_shader.hpp"
+#include "runtime/modules/d3d12x/console_heap.hpp"
 #include "runtime/modules/d3d12x/uma.hpp"
 #include "runtime/modules/system.hpp"
 #include "runtime/modules/xcl_recomp.h"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -30,7 +32,7 @@ namespace {
 using Bytes = std::span<const std::uint8_t>;
 constexpr int shader_version = 3;
 constexpr std::size_t kernel_sgprs = 128;
-constexpr std::size_t argument_ring = 64 << 20;
+constexpr std::size_t console_grain = 0x10000;
 
 struct Library {
     HMODULE module = nullptr;
@@ -144,6 +146,53 @@ std::vector<std::uint8_t> compile(modules::ShaderStage stage, const std::string 
 std::mutex shaders_mutex;
 std::map<std::string, Shader> shaders; // by stage and the hash of the console container
 
+// XV_XCL_DUMP_HLSL=DIR: the translation of every shader, for the diagnostics of a bad draw.
+void dump_hlsl(modules::ShaderStage stage, const std::string &key, const std::string &hlsl) {
+    static const auto folder = [] {
+        const char *where = std::getenv("XV_XCL_DUMP_HLSL");
+        return where ? std::filesystem::path{where} : std::filesystem::path{};
+    }();
+    if (folder.empty())
+        return;
+    const char *stage_name[] = {"v", "p", "c"};
+    const auto path = folder / (std::string{stage_name[static_cast<int>(stage)]} + "-" + key +
+                               ".hlsl");
+    std::error_code error;
+    std::filesystem::create_directories(folder, error);
+    std::ofstream file(path);
+    if (file)
+        file << hlsl;
+}
+
+// XV_XCL_TRACE: what the shaders of a draw read: the root arguments in the user SGPRs and
+// the descriptors they name.
+bool trace_draws() {
+    static const bool on = std::getenv("XV_XCL_TRACE") != nullptr;
+    return on;
+}
+void trace_arguments(const std::vector<std::uint8_t> &args, std::size_t bytes) {
+    const auto words = bytes / 4;
+    std::fprintf(stderr, "[Runtime] XCL draw: %zu root argument words:", words);
+    for (std::size_t k = 0; k < words && k < 32; ++k) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, args.data() + k * 4, 4);
+        std::fprintf(stderr, " %08x", word);
+    }
+    std::fprintf(stderr, "\n");
+    for (std::size_t k = 0; k < words && k < 32; ++k) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, args.data() + k * 4, 4);
+        std::uint32_t descriptor[8]{};
+        if (!console_heap::words_at(word, descriptor, 8))
+            continue;
+        std::fprintf(stderr, "[Runtime]   argument %zu at %08x: %08x %08x %08x %08x %08x %08x "
+                             "%08x %08x\n",
+                     k, word, descriptor[0], descriptor[1], descriptor[2], descriptor[3],
+                     descriptor[4], descriptor[5], descriptor[6], descriptor[7]);
+    }
+    std::fflush(stderr);
+}
+
 ID3D12RootSignature *make_abi(ID3D12Device *device, bool graphics, UINT sampler_count) {
     D3D12_ROOT_PARAMETER1 parameters[6]{};
     for (UINT k = 0; k < 6; ++k) {
@@ -242,33 +291,49 @@ ListState &state_of(void *list) {
 }
 
 // The bytes a list's draws read stay put until the list is reset: the title can reset a list
-// only once the GPU is done with the one it recorded before.
-struct Arena {
+// only once the GPU is done with the one it recorded before. The blocks are in window 0, the
+// one the console's 32-bit addresses name, and are given back when the list is reset.
+// XCL's ARENA_BLOCK: 4 × 64 KiB grain
+constexpr std::size_t arena_block = 4 * console_grain;
+struct Block {
     std::uint8_t *cpu = nullptr;
     std::uintptr_t console = 0;
+    std::size_t size = 0;
     std::size_t next = 0;
+};
+struct Arena {
+    std::vector<Block> blocks;
 };
 std::mutex arenas_mutex;
 std::map<void *, Arena> arenas;
 std::uint64_t place_in_ring(void *list, const void *data, std::size_t bytes) {
     const std::lock_guard lock(arenas_mutex);
     Arena &arena = arenas[list];
-    if (!arena.cpu) {
-        void *memory = uma_alloc(argument_ring, 0x10000);
-        if (!memory)
-            return 0;
-        arena.cpu = static_cast<std::uint8_t *>(memory);
-        arena.console = reinterpret_cast<std::uintptr_t>(memory);
-        if (!uma_host_address(arena.console))
-            return 0;
-    }
     const auto aligned = (bytes + 255) & ~std::size_t{255};
-    if (arena.next + aligned > argument_ring)
-        return 0;
-    std::memcpy(arena.cpu + arena.next, data, bytes);
-    const auto console = arena.console + arena.next;
-    arena.next += aligned;
+    if (arena.blocks.empty() || arena.blocks.back().next + aligned > arena.blocks.back().size) {
+        Block block;
+        block.cpu = static_cast<std::uint8_t *>(uma_alloc_in(0, arena_block, 0x10000));
+        if (!block.cpu)
+            return 0;
+        block.console = reinterpret_cast<std::uintptr_t>(block.cpu);
+        block.size = arena_block;
+        arena.blocks.push_back(block);
+    }
+    auto &block = arena.blocks.back();
+    std::memcpy(block.cpu + block.next, data, bytes);
+    const auto console = block.console + block.next;
+    block.next += aligned;
     return console;
+}
+// The list is reset: the memory its draws read is free again.
+void free_ring(void *list) {
+    const std::lock_guard lock(arenas_mutex);
+    const auto found = arenas.find(list);
+    if (found == arenas.end())
+        return;
+    for (const auto &block : found->second.blocks)
+        uma_free(block.cpu);
+    arenas.erase(found);
 }
 // the widest wave of the host's GPU, from its device (64 until one is known)
 std::atomic<UINT> host_wave_lanes{64};
@@ -312,6 +377,7 @@ const Shader *shader(modules::ShaderStage stage, Bytes container, std::string *w
     Shader made;
     if (profile && result.hlsl) {
         made.hlsl = result.hlsl;
+        dump_hlsl(stage, key, made.hlsl);
         const auto &folder = shader_cache_directory();
         const auto name = key + ".dxil";
         made.dxil = folder.empty() ? std::vector<std::uint8_t>{} : read_file(folder / name);
@@ -421,9 +487,7 @@ void clear_list(void *list) {
         const std::lock_guard lock(lists_mutex);
         lists.erase(list);
     }
-    const std::lock_guard lock(arenas_mutex);
-    if (const auto found = arenas.find(list); found != arenas.end())
-        found->second.next = 0;
+    free_ring(list);
 }
 const Layout *layout_of(void *list) {
     const auto &entry = state_of(list);
@@ -462,38 +526,40 @@ void write_table(void *list, UINT parameter, std::uint64_t address, bool graphic
     write_at(list, parameter, 0, &low, sizeof low);
 }
 
-bool before_draw(void *list, ID3D12GraphicsCommandList *host) {
+Binding before_draw(void *list, ID3D12GraphicsCommandList *host) {
     if (!host || !uma_on_gpu())
-        return false;
+        return Binding::untranslated;
     bool graphics = false;
     ID3D12RootSignature *abi = nullptr;
     ID3D12PipelineState *pipeline = nullptr;
     {
         const auto &entry = state_of(list);
         if (!entry.pipeline || !translated_pipeline(entry.pipeline, graphics))
-            return false;
+            return Binding::untranslated;
         const std::lock_guard lock(pipelines_mutex);
         const auto found = pipelines.find(entry.pipeline);
         if (found == pipelines.end())
-            return false;
+            return Binding::untranslated;
         abi = found->second.signature;
         pipeline = entry.pipeline;
     }
     if (!abi || !pipeline)
-        return false;
+        return Binding::untranslated;
     const auto layout = layout_of(list);
     const auto &args = state_of(list).args;
     const auto inline_bytes =
         layout ? std::min(graphics ? layout->graphics_inline : layout->compute_inline,
                           args.size())
                : 0;
+    if (trace_draws())
+        trace_arguments(args, args.size());
     std::vector<std::uint8_t> table(args.begin() + inline_bytes, args.end());
     if (table.size() < 16)
         table.resize(16);
     std::vector<std::uint32_t> io(kernel_sgprs);
     const auto table_console = place_in_ring(list, table.data(), table.size());
     if (!table_console)
-        return false;
+        return Binding::skipped;
     io[0] = static_cast<std::uint32_t>(table_console);
     io[1] = static_cast<std::uint32_t>(table_console >> 32);
     if (inline_bytes)
@@ -502,7 +568,7 @@ bool before_draw(void *list, ID3D12GraphicsCommandList *host) {
     static const std::uint8_t zeroes[256]{};
     const auto res_console = place_in_ring(list, zeroes, sizeof zeroes);
     if (!io_console || !res_console)
-        return false;
+        return Binding::skipped;
     const auto address_of = [](std::uintptr_t console) {
         return uma_host_address(console);
     };
@@ -519,6 +585,6 @@ bool before_draw(void *list, ID3D12GraphicsCommandList *host) {
             host->SetComputeRootUnorderedAccessView(k, views[k]);
     }
     host->SetPipelineState(pipeline);
-    return true;
+    return Binding::bound;
 }
 } // namespace xv::runtime::modules::d3d12x::xcl
