@@ -1,0 +1,12 @@
+[package]
+name = "xcl-tiling"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The console's texture layout (XCL's GFX10 tiling, vendored) behind a C ABI"
+
+[lib]
+name = "xcl_tiling"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
