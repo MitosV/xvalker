@@ -39,6 +39,9 @@ pub mod dxc;
 
 pub use gpu::recomp;
 
+#[cfg(test)]
+mod tests;
+
 /// Flags for [`xcl_translate`].
 pub const XCL_FLAG_NONE: u32 = 0;
 /// Force wave64 semantics even when the program looks like a wave32 program.
