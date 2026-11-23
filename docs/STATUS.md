@@ -177,7 +177,7 @@ everything else.
 
 <details><summary><code>xmem.dll</code>: 18 functions</summary>
 
-`XMemAlloc`, `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFree`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemGetAllocationHysteresis`, `XMemGetAllocationStatistics`, `XMemGetWin32HeapStatistics`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable`, `XMemMakeTag`, `XMemMapPhysicalPages`, `XMemPreallocateFreeSpace`, `XMemSetAllocationHooks`, `XMemSetAllocationHysteresis`, `XMemTransferMemory`, `XMemVirtualAlloc`
+`XMemAlloc`, `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFree`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemGetAllocationHysteresis`, `XMemGetAllocationStatistics`, `XMemGetWin32HeapStatistics`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable`, `XMemMakeTag`, `XMemMapPhysicalPages`, `XMemPreallocateFreeSpace`, `XMemSetAllocationHooks`, `XMemSetAllocationHysteresis`, `XMemTransferMemory`, `XMemVirtualAlloc`, `XMemVirtualQuery`
 
 </details>
 
@@ -297,7 +297,7 @@ everything else.
 
 <details><summary><code>xmem.dll</code>: 18 functions</summary>
 
-`XMemAlloc`, `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFree`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemGetAllocationHysteresis`, `XMemGetAllocationStatistics`, `XMemGetWin32HeapStatistics`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable`, `XMemMakeTag`, `XMemMapPhysicalPages`, `XMemPreallocateFreeSpace`, `XMemSetAllocationHooks`, `XMemSetAllocationHysteresis`, `XMemTransferMemory`, `XMemVirtualAlloc`
+`XMemAlloc`, `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFree`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemGetAllocationHysteresis`, `XMemGetAllocationStatistics`, `XMemGetWin32HeapStatistics`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable`, `XMemMakeTag`, `XMemMapPhysicalPages`, `XMemPreallocateFreeSpace`, `XMemSetAllocationHooks`, `XMemSetAllocationHysteresis`, `XMemTransferMemory`, `XMemVirtualAlloc`, `XMemVirtualQuery`
 
 </details>
 

@@ -360,6 +360,11 @@ HRESULT WINAPI d3d_free_graphics_memory(void *address) {
 void *WINAPI xmem_virtual_alloc(void *address, SIZE_T size, DWORD type, ULONGLONG, DWORD protect) {
     return virtual_alloc(address, size, type, protect);
 }
+// XMemVirtualQuery: VirtualQuery, the same record (MEMORY_BASIC_INFORMATION) on both
+SIZE_T WINAPI xmem_virtual_query(const void *address, MEMORY_BASIC_INFORMATION *information,
+                                 SIZE_T size) {
+    return VirtualQuery(address, information, size);
+}
 BOOL WINAPI xmem_allocate_physical_pages(ULONGLONG flags, ULONG_PTR *count, ULONG_PTR *pages) {
     const auto sizes = static_cast<DWORD>(flags) & page_sizes;
     return allocate_title_physical_pages(nullptr, sizes ? sizes : mem_large_pages, count, pages);
@@ -443,6 +448,7 @@ void install_xmem(Registry &registry) {
             registry.add("xmem.dll", name, function);
     const std::pair<const char *, void *> more[] = {
         {"XMemVirtualAlloc", erase(xmem_virtual_alloc)},
+        {"XMemVirtualQuery", erase(xmem_virtual_query)},
         {"XMemAllocatePhysicalPages", erase(xmem_allocate_physical_pages)},
         {"XMemFreePhysicalPages", erase(xmem_free_physical_pages)},
         {"XMemMapPhysicalPages", erase(xmem_map_physical_pages)},
