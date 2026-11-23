@@ -119,11 +119,28 @@ struct Request {
 };
 static_assert(offsetof(Request, destination_size) == 24 && offsetof(Request, source) == 32 &&
               offsetof(Request, source_size) == 48 && offsetof(Request, tag) == 56);
+// DSTORAGE_ERROR_RECORD: the number of failures, then the first one: its result, the
+// command that failed (a request), the request's options, its destination and size, and
+// the file it read from or the memory it read from
 struct ErrorRecord {
     UINT32 failures;
+    UINT32 reserved;
     HRESULT first;
-    std::uint8_t rest[1024];
+    UINT32 command; // 0xFFFFFFFF when there is none
+    UINT64 options;
+    UINT64 destination;
+    UINT32 destination_size;
+    WCHAR file[0x104];
+    UINT8 reserved2[0xc];
+    UINT64 memory_source;
+    UINT8 reserved3[0x50];
 };
+static_assert(sizeof(ErrorRecord) == 0x290 && offsetof(ErrorRecord, first) == 8 &&
+              offsetof(ErrorRecord, command) == 0xc && offsetof(ErrorRecord, options) == 0x10 &&
+              offsetof(ErrorRecord, destination) == 0x18 &&
+              offsetof(ErrorRecord, destination_size) == 0x20 &&
+              offsetof(ErrorRecord, file) == 0x24 &&
+              offsetof(ErrorRecord, memory_source) == 0x238);
 struct QueueInterface : IUnknown {
     virtual void EnqueueRequest(const Request *request) = 0;
     virtual void EnqueueStatus(StatusInterface *status, UINT32 index) = 0;
@@ -147,7 +164,8 @@ struct FactoryInterface : IUnknown {
 
 class File final : public Object<FileInterface> {
   public:
-    explicit File(HANDLE handle) : Object(file_iid), handle_(handle) {}
+    explicit File(HANDLE handle, std::wstring path = {})
+        : Object(file_iid), handle_(handle), path_(std::move(path)) {}
     ~File() override { Close(); }
     void Close() override {
         if (const auto handle = handle_.exchange(INVALID_HANDLE_VALUE);
@@ -155,6 +173,8 @@ class File final : public Object<FileInterface> {
             CloseHandle(handle);
     }
     HANDLE GetHandle() override { return handle_; }
+    // the path the title opened, for the error record
+    const std::wstring &path() const { return path_; }
     // whether a pointer is one of our files: the title's requests name their source
     static bool is(const void *object) {
         if (!object ||
@@ -175,6 +195,7 @@ class File final : public Object<FileInterface> {
         return vtable;
     }
     std::atomic<HANDLE> handle_;
+    std::wstring path_;
 };
 
 class Status final : public Object<StatusInterface> {
@@ -261,6 +282,7 @@ struct Work {
     File *file = nullptr; // the file it reads, when it reads one
     PageArray destination_pages;
     PageArray source_pages;
+    UINT64 sequence = 0; // the order it was enqueued in
 };
 
 // The bytes a request reads: from its file, from the title's memory or from its
@@ -411,9 +433,7 @@ class Queue final : public Object<QueueInterface> {
         if (const auto refusal = refuse(work); FAILED(refusal)) {
             {
                 const std::lock_guard lock(mutex_);
-                if (!failures_++)
-                    first_failure_ = refusal;
-                SetEvent(error_);
+                fail(refusal, work);
             }
             pending_.emplace_back(Refused{refusal});
             submit_when_full();
@@ -424,6 +444,7 @@ class Queue final : public Object<QueueInterface> {
             // the file is held until the request is done
             if (work.file)
                 work.file->AddRef();
+            work.sequence = ++sequence_;
             pending_.emplace_back(std::move(work));
         }
         submit_when_full();
@@ -460,6 +481,11 @@ class Queue final : public Object<QueueInterface> {
         HRESULT since_mark = S_OK;
         for (auto &entry : work) {
             if (auto *const request = std::get_if<Work>(&entry)) {
+                if (cancelled(request->sequence, request->request.tag)) {
+                    if (request->file)
+                        request->file->Release();
+                    continue;
+                }
                 const auto result = read(*request);
                 // XV_FILE_TRACE: the first requests, and every one that fails
                 if (static std::atomic<int> shown{0};
@@ -477,9 +503,7 @@ class Queue final : public Object<QueueInterface> {
                     if (SUCCEEDED(since_mark))
                         since_mark = result;
                     const std::lock_guard lock(mutex_);
-                    if (!failures_++)
-                        first_failure_ = result;
-                    SetEvent(error_);
+                    fail(result, *request);
                 }
             } else if (auto *const refused = std::get_if<Refused>(&entry)) {
                 if (SUCCEEDED(since_mark))
@@ -495,7 +519,8 @@ class Queue final : public Object<QueueInterface> {
         }
     }
     void CancelRequestsWithTag(UINT64 mask, UINT64 value) override {
-        const std::lock_guard lock(mutex_);
+        std::lock_guard lock(mutex_);
+        // the requests that are waiting go away
         std::erase_if(pending_, [&](Entry &entry) {
             auto *const request = std::get_if<Work>(&entry);
             if (!request || (request->request.tag & mask) != value)
@@ -504,6 +529,8 @@ class Queue final : public Object<QueueInterface> {
                 request->file->Release();
             return true;
         });
+        // and the ones that are on their way are skipped when they run
+        cancels_.push_back({mask, value, sequence_});
     }
     void Close() override { Submit(); }
     HANDLE GetErrorEvent() override { return error_; }
@@ -514,8 +541,25 @@ class Queue final : public Object<QueueInterface> {
         *record = {};
         record->failures = failures_;
         record->first = first_failure_;
+        if (first_failure_ == S_OK) {
+            record->command = 0xffffffff; // no command failed
+        } else {
+            record->command = 0; // a request
+            record->options = first_request_.options;
+            record->destination = reinterpret_cast<std::uint64_t>(first_request_.destination);
+            record->destination_size = first_request_.destination_size;
+            if (first_request_.options & option_source_memory) {
+                record->memory_source =
+                    reinterpret_cast<std::uint64_t>(first_request_.source);
+            } else if (!first_file_.empty()) {
+                const auto count = std::min<std::size_t>(first_file_.size(), 0x103);
+                std::copy_n(first_file_.begin(), count, record->file);
+            }
+        }
         failures_ = 0;
         first_failure_ = S_OK;
+        first_request_ = {};
+        first_file_.clear();
         ResetEvent(error_);
     }
     void Query(QueueInfo *info) override {
@@ -524,8 +568,9 @@ class Queue final : public Object<QueueInterface> {
         const std::lock_guard lock(mutex_);
         const auto used =
             static_cast<UINT16>(std::min<std::size_t>(pending_.size(), desc_.capacity));
+        const auto until = std::max<std::size_t>(desc_.capacity / 2, 1);
         *info = {desc_, static_cast<UINT16>(desc_.capacity - used),
-                 static_cast<UINT16>(desc_.capacity / 2 > used ? desc_.capacity / 2 - used : 0)};
+                 static_cast<UINT16>(until > used ? until - used : 1)};
     }
 
   private:
@@ -539,6 +584,10 @@ class Queue final : public Object<QueueInterface> {
     };
     struct Refused {
         HRESULT result;
+    };
+    // a request that is skipped when its tag matches a cancellation
+    struct Cancellation {
+        UINT64 mask, value, until;
     };
     using Entry = std::variant<Work, Mark, Signal, Refused>;
     // What the console refuses, the way it refuses it: a queue of files takes file
@@ -603,6 +652,25 @@ class Queue final : public Object<QueueInterface> {
         }
         return S_OK;
     }
+    // the failure and the request it happened in, for the error record
+    void fail(HRESULT result, const Work &work) {
+        if (!failures_++) {
+            first_failure_ = result;
+            first_request_ = work.request;
+            if (work.file)
+                first_file_ = work.file->path();
+        }
+        SetEvent(error_);
+    }
+    // whether a request is cancelled: the rules are the ones the title set, for the
+    // requests that were enqueued before it set them
+    bool cancelled(UINT64 sequence, UINT64 tag) {
+        const std::lock_guard lock(mutex_);
+        for (const auto &rule : cancels_)
+            if (sequence <= rule.until && (tag & rule.mask) == rule.value)
+                return true;
+        return false;
+    }
     // a queue submits itself when half of it is taken
     void submit_when_full() {
         bool full;
@@ -618,8 +686,12 @@ class Queue final : public Object<QueueInterface> {
     HANDLE error_;
     std::mutex mutex_, running_;
     std::vector<Entry> pending_;
+    std::vector<Cancellation> cancels_;
+    UINT64 sequence_ = 0;
     UINT32 failures_ = 0;
     HRESULT first_failure_ = S_OK;
+    Request first_request_{};
+    std::wstring first_file_;
 };
 
 class Factory final : public Object<FactoryInterface> {
@@ -653,7 +725,7 @@ class Factory final : public Object<FactoryInterface> {
         if (static std::atomic<int> shown{0}; std::getenv("XV_FILE_TRACE") && shown++ < 40)
             std::fprintf(stderr, "[Runtime] DirectStorage: opened %ls (%zu characters) from %s\n",
                          path, wcslen(path), detail::guest_location(_ReturnAddress()).c_str());
-        auto *const made = new File(handle);
+        auto *const made = new File(handle, path);
         const auto result = made->QueryInterface(iid, file);
         made->Release();
         return result;
