@@ -142,6 +142,14 @@ struct Totals {
     pub translate_errors: usize,
     /// programs of a mode the corpus does not compile (GS)
     pub skipped: usize,
+    /// ES+GS pairs assembled and translated through XCL's two-pass path
+    pub gs_pairs: usize,
+    /// ES+GS pairs XCL could not assemble / translate
+    pub gs_pair_errors: usize,
+    /// DXIL jobs compiled from the two-pass geometry programs
+    pub gs_pair_compiled: usize,
+    /// DXIL jobs of the two-pass geometry programs that failed
+    pub gs_pair_compile_errors: usize,
     /// wave64 programs
     pub wave64: usize,
     /// wave32 programs
@@ -169,6 +177,10 @@ impl Totals {
         self.translated += other.translated;
         self.translate_errors += other.translate_errors;
         self.skipped += other.skipped;
+        self.gs_pairs += other.gs_pairs;
+        self.gs_pair_errors += other.gs_pair_errors;
+        self.gs_pair_compiled += other.gs_pair_compiled;
+        self.gs_pair_compile_errors += other.gs_pair_compile_errors;
         self.wave64 += other.wave64;
         self.wave32 += other.wave32;
         self.wave_hazards += other.wave_hazards;
@@ -367,6 +379,72 @@ fn process(name: &str, blob: &[u8], compile: bool, host_wave: u32, totals: &mut 
     }
 }
 
+/// The ES variant of a VS and a GS record share the name's hash; the pack holds one
+/// of each per geometry program. Assemble them the way XCL's `console_geometry` does
+/// and compile the compute + mesh pass-through pair.
+fn process_gs_pairs(input: &Input, compile: bool, host_wave: u32, totals: &mut Totals) {
+    let key = |name: &str| -> String {
+        name.split_once('_').map(|(_, tail)| tail).unwrap_or(name).trim_end_matches("_Wrapped").to_string()
+    };
+    let mut es: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+    let mut gs: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+    for i in 0..input.len() {
+        let (name, blob) = input.get(i);
+        let Some(blob) = blob else { continue };
+        let Some(sh) = xbox::parse(&blob) else { continue };
+        let hw = sh.fssm.first().and_then(|f| f.stages.first()).map(|s| s.hw);
+        match (sh.stage.as_str(), hw) {
+            ("VS", Some(2)) => es.entry(key(&name)).or_default().push(blob),
+            ("GS", Some(3)) => gs.entry(key(&name)).or_default().push(blob),
+            _ => {}
+        }
+    }
+    for (name, programs) in gs {
+        let Some(es_programs) = es.remove(&name) else {
+            eprintln!("xcl-corpus: GS {name}: no ES variant in the pack");
+            totals.gs_pair_errors += programs.len();
+            continue;
+        };
+        if es_programs.len() != programs.len() {
+            eprintln!("xcl-corpus: GS {name}: {} programs but {} ES variants", programs.len(), es_programs.len());
+            totals.gs_pair_errors += programs.len().max(es_programs.len());
+            continue;
+        }
+        for (es_blob, gs_blob) in es_programs.into_iter().zip(programs) {
+            let (code, interface) = match recomp::geometry_program(&es_blob, &gs_blob) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("xcl-corpus: GS {name}: {e}");
+                    totals.gs_pair_errors += 1;
+                    continue;
+                }
+            };
+            let translation = match recomp::translate_geometry(&code, interface.clone(), host_wave == 32) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("xcl-corpus: GS {name}: {e}");
+                    totals.gs_pair_errors += 1;
+                    continue;
+                }
+            };
+            totals.gs_pairs += 1;
+            if !compile {
+                continue;
+            }
+            let passthrough = recomp::mesh_passthrough(&interface.record());
+            for (profile, source) in [("cs_6_6", translation.hlsl.as_str()), ("ms_6_6", passthrough.as_str())] {
+                match dxc::compile_cached(source, "main", profile) {
+                    Ok(_) => totals.gs_pair_compiled += 1,
+                    Err(e) => {
+                        eprintln!("xcl-corpus: GS {name} {profile}: {}", dxc_error_line(&e));
+                        totals.gs_pair_compile_errors += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn usage() -> ! {
     eprintln!(
         "xcl-corpus <shaders.rpf | folder> [--compile] [--jobs N] [--limit N] [--host-wave 32|64] [--json out.json]\n\
@@ -511,6 +589,9 @@ fn main() {
     for part in &parts {
         totals.merge(part);
     }
+    if compile {
+        process_gs_pairs(&input, compile, host_wave, &mut totals);
+    }
 
     report(&path, &totals, compile, limit, host_wave, t0.elapsed().as_secs_f64());
 
@@ -546,6 +627,10 @@ fn report(path: &Path, totals: &Totals, compile: bool, limit: usize, host_wave: 
     );
     if compile {
         println!("compiled {}, compile errors {}", totals.compiled, totals.compile_errors);
+        println!(
+            "GS two-pass: {} ES+GS pairs, {} errors, {} DXIL compiled, {} compile errors",
+            totals.gs_pairs, totals.gs_pair_errors, totals.gs_pair_compiled, totals.gs_pair_compile_errors
+        );
     } else {
         println!("not compiled (no --compile)");
     }
@@ -626,6 +711,10 @@ fn to_json(totals: &Totals, compile: bool, limit: usize, jobs: usize, host_wave:
         "incomplete": totals.incomplete,
         "translate_errors": totals.translate_errors,
         "skipped": totals.skipped,
+        "gs_pairs": totals.gs_pairs,
+        "gs_pair_errors": totals.gs_pair_errors,
+        "gs_pair_compiled": totals.gs_pair_compiled,
+        "gs_pair_compile_errors": totals.gs_pair_compile_errors,
         "wave64": totals.wave64,
         "wave32": totals.wave32,
         "wave_hazards": totals.wave_hazards,
