@@ -1,7 +1,7 @@
 //! xcl-tiling: the console's texture layout and detiling, behind a C ABI (`xcl_tiling.dll`).
 //!
 //! The layout and detiling are XCL's, vendored byte-identical under `third_party/xcl/src/`
-//! (commit dd713e3): `gpu::tiling` (+ its tables) and `hle::xg` are included from there;
+//! (commit db5dc26): `gpu::tiling` (+ its tables) and `hle::xg` are included from there;
 //! `gpu::desc` and `gpu::texture` are copies whose `windows` terms are the plain data of
 //! `d3d12` (generated from the SDK) and whose GPU upload paths are left out — the runtime
 //! does those itself. Every difference from the vendored files is in
