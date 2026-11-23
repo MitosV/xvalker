@@ -3,6 +3,7 @@
 #include "runtime/modules/console_shader.hpp"
 #include "runtime/modules/d3d12x.hpp"
 #include "runtime/modules/d3d12x/internal.hpp"
+#include "runtime/modules/d3d12x/title_textures.hpp"
 #include "runtime/modules/placement.hpp"
 #include <algorithm>
 #include <array>
@@ -455,7 +456,8 @@ void console_resource(void *resource) {
 // Map (8) of a resource the host does not map, and the address of one that has none. All of the
 // console's memory is the CPU's as well, and a title maps a texture of the default heap to fill it
 // (one clears its back buffers that way). The title gets memory of ours of the resource's size
-// instead, and what it writes there goes nowhere.
+// instead; a texture the console layout library can place there is kept in step with it
+// (title_textures), the rest keeps what it writes to itself.
 std::mutex scratch_mutex;
 struct Scratch {
     void *memory = nullptr;
@@ -467,25 +469,44 @@ void *scratch_memory(ID3D12Resource *self) {
     if (FAILED(self->GetDevice(IID_PPV_ARGS(&device))))
         return nullptr;
     const auto desc = self->GetDesc();
-    const auto size = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+    auto size = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
     device->Release();
     if (size == ~0ull)
         return nullptr;
+    // the title writes the console layout, which may take more than the host's own
+    size = std::max(size, title_textures::console_bytes(self));
     const std::lock_guard lock(scratch_mutex);
     // a resource made where a released one was finds that one's memory, which may be smaller
     auto &scratch = scratch_maps[self];
     if (scratch.size < size) {
         if (scratch.memory)
             VirtualFree(scratch.memory, 0, MEM_RELEASE);
-        scratch = {VirtualAlloc(nullptr, static_cast<SIZE_T>(size), MEM_RESERVE | MEM_COMMIT,
-                                PAGE_READWRITE),
+        // write-watched when the writes are followed: what the CPU wrote is uploaded
+        const DWORD watched = title_textures::available() ? MEM_WRITE_WATCH : 0;
+        scratch = {VirtualAlloc(nullptr, static_cast<SIZE_T>(size),
+                                MEM_RESERVE | MEM_COMMIT | watched, PAGE_READWRITE),
                    size};
-        if (static std::atomic<int> shown{0}; shown++ < 4) {
-            std::fprintf(stderr,
-                         "[Runtime] the title writes a %llux%u texture's memory, which the host "
-                         "does not give: what it writes there is lost\n",
-                         desc.Width, desc.Height);
-            std::fflush(stderr);
+        const bool tracked =
+            scratch.memory && title_textures::track_scratch(self, scratch.memory, scratch.size);
+        // When the DLL is there the scratch is write-watched anyway: warn about a console
+        // layout we cannot model only if the title really writes the memory, not when it
+        // only asks for its address. An MSAA render target/depth is defined by the GPU's
+        // rendering, so a CPU write to its scratch is not a missing texture. Without the
+        // DLL, keep the old immediate warning.
+        const bool gpu_defined =
+            desc.SampleDesc.Count > 1 &&
+            (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
+        if (!tracked && scratch.memory &&
+            !title_textures::watch_lost_writes(self, scratch.memory, scratch.size, desc,
+                                               gpu_defined)) {
+            if (static std::atomic<int> shown{0}; shown++ < 4) {
+                std::fprintf(stderr,
+                             "[Runtime] the title writes a %llux%u texture's memory, which the "
+                             "host does not give: what it writes there is lost\n",
+                             desc.Width, desc.Height);
+                std::fflush(stderr);
+            }
         }
     }
     return scratch.memory;
@@ -527,9 +548,25 @@ std::uint64_t STDMETHODCALLTYPE resource_address(ID3D12Resource *self) {
     // the host has no address for a texture; the console's is its memory
     return address ? address : reinterpret_cast<std::uint64_t>(scratch_memory(self));
 }
+// Release (2): the title's last reference lets a kept-in-step texture go (its scratch memory
+// with it); the host's runtime's own releases go to the host's method as they are
+ULONG STDMETHODCALLTYPE release_resource(ID3D12Resource *self) {
+    using Release = ULONG(STDMETHODCALLTYPE *)(void *);
+    const auto left = original<Release>(self, 2)(self);
+    if (left <= 1) {
+        title_textures::forget(self);
+        const std::lock_guard lock(scratch_mutex);
+        if (const auto it = scratch_maps.find(self); it != scratch_maps.end()) {
+            VirtualFree(it->second.memory, 0, MEM_RELEASE);
+            scratch_maps.erase(it);
+        }
+    }
+    return left;
+}
 void mappable_resource(void *resource) {
     console_vtable<Family::resource>(resource, 15, 17,
-                                     {{8, reinterpret_cast<Slot>(&map_resource)},
+                                     {{2, reinterpret_cast<Slot>(&release_resource)},
+                                      {8, reinterpret_cast<Slot>(&map_resource)},
                                       {9, reinterpret_cast<Slot>(&unmap_resource)},
                                       {11, reinterpret_cast<Slot>(&resource_address)}});
 }
@@ -1620,10 +1657,12 @@ HRESULT STDMETHODCALLTYPE create_placed_resource_x(ID3D12Device *self, std::uint
     if (SUCCEEDED(result) && resource && *resource && desc &&
         !(desc->Flags &
           (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
-        track_placement(static_cast<ID3D12Resource *>(*resource),
-                        reinterpret_cast<const void *>(address),
-                        console == Target::scarlett ? desc : nullptr);
+           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
+        auto *const made = static_cast<ID3D12Resource *>(*resource);
+        if (!title_textures::track_placed(made, address, *desc, state))
+            track_placement(made, reinterpret_cast<const void *>(address),
+                            console == Target::scarlett ? desc : nullptr);
+    }
     return result;
 }
 // The console's GPU draws rectangle lists and quad lists (topology types 19 and 32, the
@@ -2298,6 +2337,8 @@ HRESULT STDMETHODCALLTYPE create_committed_resource(
     if (SUCCEEDED(result) && resource && *resource) {
         console_resource(*resource);
         track_buffer(static_cast<ID3D12Resource *>(*resource), console == Target::scarlett);
+        if (desc)
+            title_textures::note_desc(static_cast<ID3D12Resource *>(*resource), *desc, state);
         if (console == Target::scarlett)
             mappable_resource(*resource);
     }
@@ -2664,6 +2705,9 @@ void STDMETHODCALLTYPE copy_texture_region(void *self, const D3D12_TEXTURE_COPY_
                                            const D3D12_TEXTURE_COPY_LOCATION *source,
                                            const D3D12_BOX *box) {
     auto *const host = host_of(self);
+    // a texture the GPU copies into: its CPU view is stale from then on (title_textures)
+    if (target && target->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX)
+        title_textures::note_gpu_write(target->pResource);
     if (!x && !y && !z && copy_feedback_map(host, target, source))
         return;
     ID3D12Device *device = nullptr;
@@ -3727,6 +3771,7 @@ void STDMETHODCALLTYPE execute_command_lists(ID3D12CommandQueue *self, UINT coun
     if (const auto *text = std::getenv("XV_D3D_SLOW"))
         Sleep(std::atoi(text));
     decode_written_heaps();
+    title_textures::refresh(self);
     upload_placements_d3d12(self);
     std::vector<ID3D12CommandList *> host(count);
     for (UINT i = 0; i < count; ++i)
@@ -3889,8 +3934,13 @@ HRESULT STDMETHODCALLTYPE create_committed_resource_2(
         host_rules(heap, host_desc.Flags, state);
     const auto result = original<Create>(self, 69)(self, heap, flags, desc ? &host_desc : nullptr,
                                                    state, clear, session, iid, resource);
-    if (SUCCEEDED(result) && resource && *resource)
+    if (SUCCEEDED(result) && resource && *resource) {
         console_resource(*resource);
+        if (desc)
+            title_textures::note_desc(
+                static_cast<ID3D12Resource *>(*resource),
+                *reinterpret_cast<const D3D12_RESOURCE_DESC *>(desc), state);
+    }
     if (FAILED(result) && desc) {
         std::fprintf(stderr,
                      "[Runtime] CreateCommittedResource2 dimension %d %llux%ux%u mips %u format "
