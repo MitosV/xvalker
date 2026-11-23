@@ -176,7 +176,19 @@ def build_lines(idx, bins, binds, workdir):
     return lines, info
 
 
-def build_one(idx, bins, binds):
+def xcl_program_name(manifest_name, codes):
+    """Find an xcl-corpus record name for a manifest name (one optional stage code char)."""
+    candidates = [manifest_name]
+    if manifest_name:
+        candidates.append(manifest_name[1:])
+    for key in candidates:
+        for name in codes:
+            if name == key or name.removesuffix("_Wrapped") == key:
+                return name
+    return None
+
+
+def build_one(idx, bins, binds, xcl_codes=None, manifest_name=""):
     with tempfile.TemporaryDirectory(prefix="s4sc_") as d:
         lines, info = build_lines(idx, bins, binds, d)
         s = empty_scenario(idx)
@@ -221,7 +233,14 @@ def build_one(idx, bins, binds):
             elif cmd == "timg":
                 s.timg.append((int(w[1]), int(w[2], 0), int(w[3])))
         s.data_regions = info["data"]
-        s.code = Path(os.path.join(bins, f"{idx}.bin")).read_bytes()
+        code = Path(os.path.join(bins, f"{idx}.bin")).read_bytes()
+        if xcl_codes and manifest_name:
+            rec = xcl_program_name(manifest_name, xcl_codes)
+            if rec:
+                # The carve skipped the 6-instruction (24-byte) XCL entry prologue;
+                # keep that convention and take only the program body from the record.
+                code = bytes.fromhex(xcl_codes[rec])[24:]
+        s.code = code
         return s.finish()
 
 
@@ -253,6 +272,7 @@ def main():
     ap.add_argument("--binds", default="/tmp/opencode/s4-cmp-corpus/binds_all")
     ap.add_argument("--out", required=True)
     ap.add_argument("--ids", default="")
+    ap.add_argument("--xcl-code", default="", help="JSON map of record name -> exact program code, from xcl-corpus --dump-code")
     args = ap.parse_args()
     R.ROOT = str(Path(args.bins).parent)
     R.BINS_DIR, R.BINDS_DIR, R.MANIFEST = args.bins, args.binds, args.manifest
@@ -261,9 +281,10 @@ def main():
     rows = [r for r in csv.DictReader(open(args.manifest)) if r["stage"] == "CS"]
     ids = [i for i in args.ids.split(",") if i] or [r["idx"] for r in rows]
     names = {r["idx"]: r["name"] for r in rows}
+    xcl_codes = json.loads(Path(args.xcl_code).read_text()) if args.xcl_code else None
     for i, idx in enumerate(ids, 1):
         try:
-            sc = build_one(idx, args.bins, args.binds)
+            sc = build_one(idx, args.bins, args.binds, xcl_codes, names.get(idx, ""))
         except Exception as e:
             sc = {"idx": idx, "name": names.get(idx, ""), "error": f"{type(e).__name__}: {str(e)[:200]}"}
         sc["name"] = names.get(idx, "")

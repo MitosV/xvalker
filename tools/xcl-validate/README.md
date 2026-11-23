@@ -109,3 +109,54 @@ The 23 GPU timeouts are `GPU did not finish within 10 s (device removed: Ok(()))
 from XCL's runner; they are reported as not-run, not as equal. The 8 XCL
 `cannot decode` errors and the cpu_ref unsupported cases are harness coverage
 limits, not shader result mismatches.
+
+## Exact program code (s4-r4)
+
+The carved `.bin` files append the FSSM constant data blocks after the program's
+last `s_endpgm` (44–84 bytes). XCL classifies them as `data_blocks`, not code; their
+first word after the guard `s_endpgm` is a constant such as `0x00000008`, which the
+translator reports as `cannot decode (Unknown(8))`. To use the program exactly as
+XCL parses it:
+
+```sh
+cd tools/xcl-recomp
+cargo build --release
+./target/release/xcl-corpus /mnt/games/GTA/GTA6.Xbox.v1.0.2.1/shaders.rpf \
+  --dump-code /tmp/opencode/s4-r4/xcl-codes.json
+cd ../xcl-validate
+python3 build_scenarios.py --xcl-code /tmp/opencode/s4-r4/xcl-codes.json \
+  --out /tmp/opencode/s4-r4/scenarios
+```
+
+The builder strips the same 6-instruction (24-byte) entry prologue as the carve and
+uses `f.programs[p.offset..p.offset+p.len]`, so no data block reaches the translator.
+All 8 shaders that previously failed to decode now run on the GPU; their CPU
+reference is unsupported (`v_cos_f32`, `s_getpc_b64`, `v_xnor_b32`, `v_mul_hi_i32`,
+a16/d16 image access, non-finite sample coordinate).
+
+## GPU timeout study (s4-r4)
+
+`xcl_timeout.patch` makes the runner fence timeout (and, for the experiment, the
+emitted `xcl_budget` loop guard) env-driven in the Windows test build:
+
+```sh
+cd /tmp/opencode/xcl-s4 && patch -p1 < <worktree>/tools/xcl-validate/xcl_timeout.patch
+cargo test -p xcl --no-run --release --target x86_64-pc-windows-gnu
+XCL_CMP_GPU_TIMEOUT_MS=15000 python3 s4_xcl_vs_cpuref.py run-gpu \
+  --scenarios /tmp/opencode/s4-r4/scenarios-all \
+  --out /tmp/opencode/s4-r4/gpu-all.jsonl --batch 1 --timeout 30
+```
+
+The hardcoded error text still says "10 s" even when the env timeout is used.
+Results: raising the fence to 30–60 s and shrinking `xcl_budget` to 256 did **not**
+make any of the 23 timeouts finish. Each ran in its own wine process (a hang poisons
+the device: later shaders in the same process read back an all-zero `mem` buffer, and
+even a following copy canary returns zeroes instead of `0x12345678`).
+
+Classification: 2 hit the cpu_ref step limit (`22340`, `24652`) — fake-input
+infinite loops. The other 21 are GPU-only hangs. 13 of them contain a guarded
+`[loop] for(;;)` / `while (pc ...)` in the emitted HLSL (e.g. `22340` at `+0x110`,
+`24652` at `+0x1f0`); 9 more are straight-line HLSL and `22264` is a VS program the
+CS dump does not cover — for `22320` a padded prefix bisect isolates the stall to
+`buffer_load_format_d16_xyzw` at `+0x70` (prefix 20 runs, prefix 21 never signals
+the fence). All 23 stay not-run.

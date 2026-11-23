@@ -248,3 +248,55 @@ a16/d16 image 3, `s_setreg_imm32_b32` 2, MIMG opcode 2, other 12).
 Prefixes 1..14 were bit-identical in output and written registers; prefix 15 diverges.
 This is now a real translator/runtime candidate, not an input mismatch. Artifacts:
 `/tmp/opencode/s4-r3/{scenarios,gpu_all.jsonl,cmp_all.json,bisect.json,copy.jsonl}`.
+
+## s4-r4: translator fix, exact program code, timeout study
+
+Date: 2026-11-23. Branch `track/s4`; commits `8454a33`, `e66f5c8`, `2d2e285`.
+
+### Step 1 — the reported `v_fmac_f32` is correct on both sides
+
+`56 02 04 ff 3d 93 a9 2a` at `+0x54` is VOP2 `v_fmac_f32 v1, 0x3d93a92a, v2`:
+VDST=v1, VSRC1=v2, SRC0=literal, no DPP/SDWA. `rdna2_spec.rs` lists V_FMAC_F32 with
+VDST as both an output and an input (`VDST = SRC0*VSRC1 + VDST`, one fused rounding).
+XCL emits `mad(asfloat(0x3D93A92Au), asfloat(v2), asfloat(v1))` and cpu_ref does
+`fma32(..., v[vdst])` — the same ISA semantics. The divergence reported at #15 was a
+symptom: prefix bisection with a *register* diff hides earlier writes whose GPU value
+happens to equal the initial value.
+
+The real bug is at `+0x28`: `buffer_load_dwordx3 v[0:2], v[0:1], s[0:3], 0 idxen`.
+VDATA overlaps VADDR, so the first component's store overwrote `v0` before the second
+and third components' `v0 < s2` bounds checks; GPU v1/v2 became 0. Fixed in
+`third_party/xcl/src/gpu/recomp/emit.rs` by snapshotting the IDXEN index into a local
+at the start of the MUBUF instruction and using it for the address and every bounds
+check. Exact-encoding tests added to `tools/xcl-recomp/tests/corpus.rs`.
+
+### Step 2 — the 8 `cannot decode` shaders were carved with data blocks
+
+The carve appended FSSM constant-data blocks (44–84 bytes) after the last `s_endpgm`;
+XCL treats those as `data_blocks`, not instructions, so the first word `0x00000008`
+became `cannot decode (Unknown(8))`. `xcl-corpus --dump-code` now exports the exact
+`f.programs[p.offset..p.offset+p.len]` bytes and `build_scenarios.py --xcl-code` uses
+them. All 8 now run on the GPU; cpu_ref is unsupported for all 8
+(`v_cos_f32`, `s_getpc_b64`, `v_xnor_b32`, `v_mul_hi_i32`, a16/d16 image, non-finite
+sample coordinate).
+
+### Step 3 — the 23 GPU timeouts are real GPU stalls, not input loops (mostly)
+
+`xcl_timeout.patch` makes the runner fence (and experimentally the loop guard)
+env-driven. Raising the fence to 30–60 s and lowering `xcl_budget` to 256 changed
+nothing: all 23 still fail to signal the fence in an isolated wine process. A hang
+poisons the device — later shaders in the same process read back an all-zero `mem`
+(and a following copy canary returns 0 instead of `0x12345678`), so batched results
+after a hang are invalid. Classification: 2 CPU step-limit (`22340`, `24652`) =
+fake-input infinite loops; 21 GPU-only hangs. 13 of the 21 contain a guarded
+`[loop]` in the emitted HLSL; 9 are straight-line (e.g. `22320` stalls at
+`buffer_load_format_d16_xyzw +0x70`); `22264` is a VS program.
+
+### Step 4 — new CS counts (100 serialized scenarios, exact program code)
+
+| stage | equal | different | not run | total |
+|---|---:|---:|---:|---:|
+| CS | 33 | 0 | 67 | 100 |
+
+Not-run: 23 GPU fence stalls, 44 cpu_ref unsupported. `23465` is now EQUAL.
+Artifacts: `/tmp/opencode/s4-r4/{scenarios-all,gpu-all.jsonl,cmp-all.json,xcl-codes.json}`.

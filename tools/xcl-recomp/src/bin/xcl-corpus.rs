@@ -1,5 +1,6 @@
 //! `xcl-corpus <shaders.rpf | folder> [--compile] [--jobs N] [--limit N] [--json out.json]`
 //! `xcl-corpus <shaders.rpf | folder> --dump-hlsl DIR --limit N --stage cs|ps`
+//! `xcl-corpus <shaders.rpf | folder> --dump-code FILE`
 //!
 //! Walks a console shader pack (or a folder of shader blobs) the way XCL's
 //! `xcl shaders --precompile` does, translates every program with the vendored
@@ -207,6 +208,32 @@ impl Totals {
             self.stages.entry(*stage).or_default().merge(stats);
         }
     }
+}
+
+/// Write the exact code bytes of every FSSM program, as XCL parses them, to a JSON
+/// map of record name to hex. Unlike a raw carve of the code region this excludes
+/// the constant data blocks after the last `s_endpgm`, which the recompiler cannot
+/// decode as instructions.
+fn dump_program_codes(input: &Input, path: &Path) {
+    let mut codes: BTreeMap<String, String> = BTreeMap::new();
+    for i in 0..input.len() {
+        let (name, blob) = input.get(i);
+        let Some(blob) = blob else { continue };
+        let Some(sh) = xbox::parse(&blob) else { continue };
+        for f in &sh.fssm {
+            for p in &f.programs {
+                let code = &f.data[p.offset..p.offset + p.len];
+                let hex: String = code.iter().map(|b| format!("{b:02x}")).collect();
+                codes.entry(name.split(" @").next().unwrap_or(&name).to_string()).or_insert(hex);
+            }
+        }
+    }
+    let text = serde_json::to_string(&codes).unwrap_or_else(|_| "{}".into());
+    if let Err(e) = std::fs::write(path, text) {
+        eprintln!("xcl-corpus: cannot write {}: {e}", path.display());
+        std::process::exit(2);
+    }
+    eprintln!("xcl-corpus: dumped {} program codes to {}", codes.len(), path.display());
 }
 
 /// What the corpus tool reads: an RPF9 pack or a folder of blobs.
@@ -510,6 +537,7 @@ fn usage() -> ! {
     eprintln!(
         "xcl-corpus <shaders.rpf | folder> [--compile] [--jobs N] [--limit N] [--host-wave 32|64] [--json out.json]\n\
          xcl-corpus <shaders.rpf | folder> --dump-hlsl DIR --limit N --stage cs|ps\n\
+         xcl-corpus <shaders.rpf | folder> --dump-code FILE\n\
          \n\
          Translates every program of a console shader pack with XCL's recompiler.\n\
          With --compile the HLSL is compiled with the Linux dxc CLI (XCL's arguments).\n\
@@ -534,6 +562,7 @@ fn main() {
     let mut host_wave = 0u32;
     let mut json: Option<PathBuf> = None;
     let mut dump: Option<PathBuf> = None;
+    let mut dump_code: Option<PathBuf> = None;
     let mut dump_stage: Option<Stage> = None;
     let mut i = 0;
     while i < args.len() {
@@ -565,6 +594,13 @@ fn main() {
                 i += 1;
                 dump = args.get(i).map(PathBuf::from);
                 if dump.is_none() {
+                    usage();
+                }
+            }
+            "--dump-code" => {
+                i += 1;
+                dump_code = args.get(i).map(PathBuf::from);
+                if dump_code.is_none() {
                     usage();
                 }
             }
@@ -645,6 +681,11 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if let Some(path) = &dump_code {
+        dump_program_codes(&input, path);
+        return;
+    }
 
     // In dump mode `--limit` counts programs of one stage, which can be far into the pack;
     // the scan therefore covers all records and stops when that many files were written.
