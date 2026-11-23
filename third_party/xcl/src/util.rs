@@ -87,28 +87,21 @@ pub unsafe fn from_cstr_ptr(p: *const u8) -> Option<String> {
 
 /// ANSI (current code page) → String. Falls back to lossy UTF-8.
 pub unsafe fn from_ansi_ptr(p: *const u8) -> Option<String> {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
-        if p.is_null() {
-            return None;
-        }
-        let len = std::ffi::CStr::from_ptr(p as *const std::ffi::c_char).to_bytes().len();
-        if len == 0 {
-            return Some(String::new());
-        }
-        let n = MultiByteToWideChar(CP_ACP, 0, p, len as i32, std::ptr::null_mut(), 0);
-        if n <= 0 {
-            return from_cstr_ptr(p);
-        }
-        let mut buf = vec![0u16; n as usize];
-        MultiByteToWideChar(CP_ACP, 0, p, len as i32, buf.as_mut_ptr(), n);
-        Some(String::from_utf16_lossy(&buf))
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
+    if p.is_null() {
+        return None;
     }
-    #[cfg(not(windows))]
-    {
-        from_cstr_ptr(p)
+    let len = std::ffi::CStr::from_ptr(p as *const std::ffi::c_char).to_bytes().len();
+    if len == 0 {
+        return Some(String::new());
     }
+    let n = MultiByteToWideChar(CP_ACP, 0, p, len as i32, std::ptr::null_mut(), 0);
+    if n <= 0 {
+        return from_cstr_ptr(p);
+    }
+    let mut buf = vec![0u16; n as usize];
+    MultiByteToWideChar(CP_ACP, 0, p, len as i32, buf.as_mut_ptr(), n);
+    Some(String::from_utf16_lossy(&buf))
 }
 
 /// Normalised DLL key: lower-case file name, ".dll" appended when no extension.
@@ -154,7 +147,6 @@ pub unsafe fn write_wide_out(src: &str, buf: *mut u16, size: u32) -> u32 {
     std::ptr::copy_nonoverlapping(w.as_ptr(), buf, n);
     *buf.add(n) = 0;
     if w.len() >= size as usize {
-        #[cfg(windows)]
         windows_sys::Win32::Foundation::SetLastError(122); // ERROR_INSUFFICIENT_BUFFER
         size
     } else {
@@ -162,21 +154,122 @@ pub unsafe fn write_wide_out(src: &str, buf: *mut u16, size: u32) -> u32 {
     }
 }
 
-pub unsafe fn write_ansi_out(src: &str, buf: *mut u8, size: u32) -> u32 {
+/// Encode `src` into `buf` (capacity `size` bytes, including NUL) using Windows `codepage`
+/// (`GetModuleFileNameA` semantics): returns bytes written (without terminator), or `size` with
+/// `ERROR_INSUFFICIENT_BUFFER` when truncated. Truncation always stops at a complete character
+/// boundary so multi-byte sequences (DBCS / UTF-8) and UTF-16 surrogate pairs are never split.
+unsafe fn write_codepage_out(src: &str, codepage: u32, buf: *mut u8, size: u32) -> u32 {
+    use windows_sys::Win32::Foundation::{SetLastError, ERROR_INSUFFICIENT_BUFFER};
+    use windows_sys::Win32::Globalization::WideCharToMultiByte;
+
     if buf.is_null() || size == 0 {
         return 0;
     }
-    let b = src.as_bytes();
-    let n = b.len().min(size as usize - 1);
-    std::ptr::copy_nonoverlapping(b.as_ptr(), buf, n);
-    *buf.add(n) = 0;
-    if b.len() >= size as usize {
-        #[cfg(windows)]
-        windows_sys::Win32::Foundation::SetLastError(122);
-        size
-    } else {
-        n as u32
+    let w: Vec<u16> = src.encode_utf16().collect();
+    if w.is_empty() {
+        // SAFETY: `buf` is non-null and `size >= 1`.
+        *buf = 0;
+        return 0;
     }
+    let Ok(w_len) = i32::try_from(w.len()) else {
+        // SAFETY: `buf` is non-null and `size >= 1`.
+        *buf = 0;
+        return 0;
+    };
+    let needed = WideCharToMultiByte(
+        codepage,
+        0,
+        w.as_ptr(),
+        w_len,
+        std::ptr::null_mut(),
+        0,
+        std::ptr::null(),
+        std::ptr::null_mut(),
+    );
+    if needed <= 0 {
+        // SAFETY: `buf` is non-null and `size >= 1`.
+        *buf = 0;
+        return 0;
+    }
+    let cap = (size as usize - 1).min(i32::MAX as usize);
+    if (needed as usize) <= cap {
+        let written = WideCharToMultiByte(
+            codepage,
+            0,
+            w.as_ptr(),
+            w_len,
+            buf,
+            needed,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        if written <= 0 {
+            // SAFETY: `buf` is non-null and `size >= 1`.
+            *buf = 0;
+            return 0;
+        }
+        // SAFETY: `written <= needed <= cap <= size - 1`, so `buf.add(written)` is in bounds.
+        *buf.add(written as usize) = 0;
+        return written as u32;
+    }
+
+    let written = if cap == 0 {
+        0
+    } else {
+        let mut bounds = Vec::with_capacity(src.len() + 1);
+        bounds.push(0usize);
+        let mut u16_pos = 0usize;
+        for ch in src.chars() {
+            u16_pos += ch.len_utf16();
+            bounds.push(u16_pos);
+        }
+        let mut lo = 0usize;
+        let mut hi = bounds.len() - 1;
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            let n = WideCharToMultiByte(
+                codepage,
+                0,
+                w.as_ptr(),
+                bounds[mid] as i32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            );
+            if n >= 0 && (n as usize) <= cap {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let fit_u16 = bounds[lo];
+        if fit_u16 == 0 {
+            0
+        } else {
+            let n = WideCharToMultiByte(
+                codepage,
+                0,
+                w.as_ptr(),
+                fit_u16 as i32,
+                buf,
+                cap as i32,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            );
+            n.max(0) as usize
+        }
+    };
+    // SAFETY: `written <= cap <= size - 1`, so `buf.add(written)` is in bounds.
+    *buf.add(written) = 0;
+    SetLastError(ERROR_INSUFFICIENT_BUFFER);
+    size
+}
+
+/// Win32-style "copy ANSI string" (GetModuleFileNameA semantics): converts `src` to `CP_ACP`,
+/// NUL-terminates, and returns bytes written (without terminator) or `size` when truncated.
+pub unsafe fn write_ansi_out(src: &str, buf: *mut u8, size: u32) -> u32 {
+    write_codepage_out(src, windows_sys::Win32::Globalization::CP_ACP, buf, size)
 }
 
 /// Wrapper to keep raw pointers in statics.
@@ -223,6 +316,123 @@ mod tests {
             assert_eq!(&buf[..4], b"abc\0");
             assert_eq!(write_cstr_out("toolongstr", buf.as_mut_ptr(), 8, &mut used), E_NOT_SUFFICIENT_BUFFER);
             assert_eq!(used, 11);
+        }
+    }
+
+    #[test]
+    fn ansi_out_encodes_codepage_and_truncates_on_char_boundaries() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_INSUFFICIENT_BUFFER};
+        use windows_sys::Win32::Globalization::{GetACP, MultiByteToWideChar, CP_UTF8};
+
+        unsafe fn decode_cp(bytes: &[u8], cp: u32) -> String {
+            let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            if nul == 0 {
+                return String::new();
+            }
+            let n = MultiByteToWideChar(cp, 0, bytes.as_ptr(), nul as i32, std::ptr::null_mut(), 0);
+            assert!(n > 0);
+            let mut w = vec![0u16; n as usize];
+            MultiByteToWideChar(cp, 0, bytes.as_ptr(), nul as i32, w.as_mut_ptr(), n);
+            String::from_utf16_lossy(&w)
+        }
+
+        unsafe {
+            // Null / zero-size / empty edge cases.
+            let mut tiny = [0xAAu8; 4];
+            assert_eq!(write_ansi_out("abc", std::ptr::null_mut(), 4), 0);
+            assert_eq!(write_ansi_out("abc", tiny.as_mut_ptr(), 0), 0);
+            assert_eq!(write_ansi_out("", tiny.as_mut_ptr(), 1), 0);
+            assert_eq!(tiny[0], 0);
+
+            // CP1252: non-ASCII French path encodes as single bytes (0xC9 / 0xE9), not UTF-8.
+            let fr = "C:\\Jeux\\Été\\game.exe";
+            let mut buf = [0xCCu8; 64];
+            let n = write_codepage_out(fr, 1252, buf.as_mut_ptr(), buf.len() as u32);
+            assert_eq!(n, 20);
+            assert_eq!(buf[n as usize], 0);
+            assert_eq!(decode_cp(&buf, 1252), fr);
+
+            // CP1250: Central European diacritics ("Č" = 0xC8, "Ž" = 0x8E) round-trip cleanly.
+            let cz = "C:\\Hry\\Český_Život\\game.exe";
+            buf.fill(0xCC);
+            let n = write_codepage_out(cz, 1250, buf.as_mut_ptr(), buf.len() as u32);
+            assert_eq!(n, 27);
+            assert_eq!(buf[n as usize], 0);
+            assert_eq!(decode_cp(&buf, 1250), cz);
+
+            // CJK character outside CP1252 maps cleanly to the codepage default char ('?').
+            let cjk = "C:\\Games\\漢\\game.exe";
+            buf.fill(0xCC);
+            let n = write_codepage_out(cjk, 1252, buf.as_mut_ptr(), buf.len() as u32);
+            assert_eq!(n, 19);
+            assert_eq!(buf[n as usize], 0);
+            assert_eq!(decode_cp(&buf, 1252), "C:\\Games\\?\\game.exe");
+
+            // Active CP_ACP round-trip through write_ansi_out -> from_ansi_ptr.
+            let acp = GetACP();
+            let sample = match acp {
+                1250 => cz,
+                1252 | 65001 => fr,
+                _ => "C:\\Games\\Title\\game.exe",
+            };
+            buf.fill(0xCC);
+            let n = write_ansi_out(sample, buf.as_mut_ptr(), buf.len() as u32);
+            assert!(n > 0 && (n as usize) < buf.len());
+            assert_eq!(buf[n as usize], 0);
+            assert_eq!(from_ansi_ptr(buf.as_ptr()).as_deref(), Some(sample));
+
+            // Active CP_ACP with CJK path: round-trips if ACP supports it, else substitutes '?' cleanly.
+            buf.fill(0xCC);
+            let n = write_ansi_out(cjk, buf.as_mut_ptr(), buf.len() as u32);
+            assert!(n > 0 && (n as usize) < buf.len());
+            assert_eq!(buf[n as usize], 0);
+            let decoded_cjk = from_ansi_ptr(buf.as_ptr()).unwrap();
+            assert!(
+                decoded_cjk == cjk || decoded_cjk == "C:\\Games\\?\\game.exe",
+                "unexpected CP_ACP ({acp}) round-trip for CJK path: {decoded_cjk:?}"
+            );
+
+            // DBCS truncation (CP932, 2 bytes per Hiragana char): never splits a lead/trail byte.
+            let jp = "あいう";
+            buf.fill(0xCC);
+            SetLastError(0);
+            assert_eq!(write_codepage_out(jp, 932, buf.as_mut_ptr(), 2), 2);
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(buf[0], 0);
+
+            buf.fill(0xCC);
+            SetLastError(0);
+            assert_eq!(write_codepage_out(jp, 932, buf.as_mut_ptr(), 4), 4);
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(decode_cp(&buf, 932), "あ");
+            assert_eq!(buf[2], 0);
+
+            buf.fill(0xCC);
+            SetLastError(0);
+            assert_eq!(write_codepage_out(jp, 932, buf.as_mut_ptr(), 5), 5);
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(decode_cp(&buf, 932), "あい");
+            assert_eq!(buf[4], 0);
+
+            buf.fill(0xCC);
+            assert_eq!(write_codepage_out(jp, 932, buf.as_mut_ptr(), 7), 6);
+            assert_eq!(decode_cp(&buf, 932), jp);
+            assert_eq!(buf[6], 0);
+
+            // UTF-8 truncation with a 4-byte emoji (UTF-16 surrogate pair): never splits codepoint.
+            let emoji = "a😀b";
+            buf.fill(0xCC);
+            SetLastError(0);
+            assert_eq!(write_codepage_out(emoji, CP_UTF8, buf.as_mut_ptr(), 5), 5);
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(&buf[..2], b"a\0");
+
+            buf.fill(0xCC);
+            SetLastError(0);
+            assert_eq!(write_codepage_out(emoji, CP_UTF8, buf.as_mut_ptr(), 6), 6);
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(decode_cp(&buf, CP_UTF8), "a😀");
+            assert_eq!(buf[5], 0);
         }
     }
 }

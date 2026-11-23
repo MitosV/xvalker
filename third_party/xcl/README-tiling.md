@@ -1,7 +1,7 @@
 # XCL, vendored: the console's texture layout (GFX10 tiling)
 
 Source: https://github.com/gefydev/xcl (the author allows copying; same author as this
-project), commit `dd713e3`, repository checkout at `~/dev/projects/xcl` (read-only).
+project), commit `db5dc26`, repository checkout at `~/dev/projects/xcl` (read-only).
 Vendored byte-identical, unmodified, under `src/` with the paths they have there
 (`crates/xcl/src/…` → `src/…`):
 

@@ -11,6 +11,7 @@
 //! the title rewrote one) – that comes with the game executable.
 
 use super::desc::{self, Image, ImageType};
+use super::fence;
 use super::tiling::{self, Chain, PipeConfig};
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -279,16 +280,11 @@ pub unsafe fn record_upload(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList
 
 /// Wait until `queue` has run everything submitted so far.
 pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(), String> {
-    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-    queue.Signal(&fence, 1).map_err(err)?;
-    let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(err)?;
-    fence.SetEventOnCompletion(1, ev).map_err(err)?;
-    windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
-    let _ = windows::Win32::Foundation::CloseHandle(ev);
-    if fence.GetCompletedValue() < 1 {
-        return Err(format!("GPU did not finish the texture copy within 10 s ({:?})", dev.GetDeviceRemovedReason()));
-    }
-    Ok(())
+    let copy_error = |e| format!("texture copy: {e}");
+    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+        .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
+    queue.Signal(&fence, 1).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    fence::wait(&fence, 1, dev, None, 10_000).map_err(copy_error)
 }
 
 unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String> {
@@ -514,9 +510,7 @@ mod tests {
 
     fn device() -> Option<(ID3D12Device, ID3D12CommandQueue)> {
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            windows::Win32::Graphics::Direct3D12::D3D12CreateDevice(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0, &mut dev).ok()?;
-            let dev = dev?;
+            let dev = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0).ok()?;
             let queue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).ok()?;
             Some((dev, queue))
         }

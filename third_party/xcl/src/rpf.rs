@@ -4,8 +4,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
 
 use crate::gpu::pack;
 
@@ -81,65 +84,12 @@ fn atomic_write_with(
         return Err(io::Error::new(io::ErrorKind::AlreadyExists, "output appeared during extraction"));
     }
     before_commit(&temporary.0)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
-        let from: Vec<u16> = temporary.0.as_os_str().encode_wide().chain([0]).collect();
-        let to: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
+    let from: Vec<u16> = temporary.0.as_os_str().encode_wide().chain([0]).collect();
+    let to: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(io::Error::last_os_error());
     }
-    #[cfg(not(windows))]
-    rename_noreplace(&temporary.0, path)?;
     Ok(())
-}
-
-/// Rename `from` to `to`, failing when `to` exists.
-///
-/// `std::fs::rename` replaces the target, but the extraction must not clobber a file
-/// that appeared meanwhile (Windows' `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`
-/// fails too). Linux has `renameat2` with `RENAME_NOREPLACE` for that.
-#[cfg(not(windows))]
-fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    const AT_FDCWD: libc::c_int = -100;
-    const RENAME_NOREPLACE: libc::c_uint = 1;
-
-    let old = CString::new(from.as_os_str().as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path with a NUL byte"))?;
-    let new = CString::new(to.as_os_str().as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path with a NUL byte"))?;
-    // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            AT_FDCWD,
-            old.as_ptr(),
-            AT_FDCWD,
-            new.as_ptr(),
-            RENAME_NOREPLACE,
-        )
-    };
-    if rc == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(code) if code == libc::EEXIST => {
-            Err(io::Error::new(io::ErrorKind::AlreadyExists, "output appeared during extraction"))
-        }
-        // the kernel or the file system does not know RENAME_NOREPLACE: fall back to the
-        // check that `rename` cannot do atomically
-        Some(code) if code == libc::ENOSYS || code == libc::EINVAL => {
-            if to.exists() {
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "output appeared during extraction"));
-            }
-            std::fs::rename(from, to)
-        }
-        _ => Err(error),
-    }
 }
 
 fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {

@@ -12,7 +12,7 @@ The author of XCL owns this project: copying XCL code is allowed.
 | | |
 |---|---|
 | Repository | XCL (`~/dev/projects/xcl`) |
-| Commit | `dd713e3` ("Merge pull request #52 from gefydev/xml-attr-entities") |
+| Commit | `db5dc26` ("Shader loading: dumps on request, translations kept on disk, precompile of compute") |
 | Path in XCL | `crates/xcl/src/` |
 
 ## Files
@@ -33,6 +33,8 @@ All files are copies of `crates/xcl/src/<path>` of the commit above. The ones ma
 | `src/gpu/recomp/emit.rs` | `crates/xcl/src/gpu/recomp/emit.rs` | no |
 | `src/gpu/recomp/mesh_wave.rs` | `crates/xcl/src/gpu/recomp/mesh_wave.rs` | no |
 | `src/gpu/recomp/mesh_dispatch.rs` | `crates/xcl/src/gpu/recomp/mesh_dispatch.rs` | yes |
+| `src/gpu/recomp/upper_lanes.rs` | `crates/xcl/src/gpu/recomp/upper_lanes.rs` | no |
+| `src/gpu/recomp/x64_masks.rs` | `crates/xcl/src/gpu/recomp/x64_masks.rs` | no |
 | `src/shaders.rs` | `crates/xcl/src/shaders.rs` | yes |
 | `src/rpf.rs` | `crates/xcl/src/rpf.rs` | yes |
 | `src/rpf_probe.rs` | `crates/xcl/src/rpf_probe.rs` | no |

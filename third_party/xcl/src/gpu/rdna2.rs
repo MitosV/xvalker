@@ -661,7 +661,7 @@ pub fn find_programs(blob: &[u8]) -> Vec<(usize, usize)> {
     progs
 }
 
-#[cfg(all(test, feature = "xcl_vendored_tests"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

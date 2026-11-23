@@ -1,6 +1,6 @@
 # Patches to the vendored XCL tiling files
 
-The files under `src/` are byte-identical with XCL commit `dd713e3` (see README-tiling.md);
+The files under `src/` are byte-identical with XCL commit `db5dc26` (see README-tiling.md);
 none of them is edited. What the runtime builds differs from them as recorded here.
 
 ## tools/xcl-tiling (the crate, `xcl_tiling.dll`)
