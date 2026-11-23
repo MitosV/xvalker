@@ -1,9 +1,12 @@
 //! `xcl-corpus <shaders.rpf | folder> [--compile] [--jobs N] [--limit N] [--json out.json]`
+//! `xcl-corpus <shaders.rpf | folder> --dump-hlsl DIR --limit N --stage cs|ps`
 //!
 //! Walks a console shader pack (or a folder of shader blobs) the way XCL's
 //! `xcl shaders --precompile` does, translates every program with the vendored
 //! recompiler and – with `--compile` – compiles the HLSL with the Linux `dxc` CLI
-//! using XCL's exact arguments.
+//! using XCL's exact arguments. With `--dump-hlsl` it writes the first `N`
+//! translated programs of the chosen stage as `.hlsl` files instead; `--limit`
+//! counts dumped programs in that mode and records in the corpus mode.
 //!
 //! The walk is the one of `shaders.rs` (`precompile`):
 //!   * records of an RPF9 pack (`gpu::pack::scan` / `inflate`), or the files of a folder,
@@ -56,6 +59,16 @@ impl Stage {
             Stage::Compute => "compute",
             Stage::Mesh => "mesh",
             Stage::Geometry => "geometry",
+        }
+    }
+
+    fn slot(self) -> usize {
+        match self {
+            Stage::Vertex => 0,
+            Stage::Pixel => 1,
+            Stage::Compute => 2,
+            Stage::Mesh => 3,
+            Stage::Geometry => 4,
         }
     }
 }
@@ -259,9 +272,46 @@ fn jobs_of(mode: &recomp::Mode) -> Vec<(String, Option<String>)> {
     }
 }
 
-/// Translate and compile one record.
-fn process(name: &str, blob: &[u8], compile: bool, totals: &mut Totals) {
+/// Writes the translated HLSL of the first `limit` programs of one stage.
+struct Dump {
+    dir: PathBuf,
+    stage: Stage,
+    limit: usize,
+    /// Reserved file numbers per stage; only `stage` is used, indexed by `Stage::slot`.
+    reserved: [AtomicUsize; 5],
+    /// Unique file prefix across the worker threads.
+    seq: AtomicUsize,
+}
+
+impl Dump {
+    fn full(&self) -> bool {
+        self.reserved[self.stage.slot()].load(Ordering::Relaxed) >= self.limit
+    }
+
+    fn write(&self, stage: Stage, record: usize, program: usize, name: &str, hlsl: &str) {
+        let n = self.reserved[stage.slot()].fetch_add(1, Ordering::Relaxed);
+        if n >= self.limit {
+            return;
+        }
+        let safe: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') { c } else { '_' })
+            .take(64)
+            .collect();
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let file = self.dir.join(format!("{}-{n:04}-r{record:06}-p{program:02}-s{seq:05}-{safe}.hlsl", stage.name().to_ascii_lowercase()));
+        if let Err(e) = std::fs::write(&file, hlsl) {
+            eprintln!("xcl-corpus: cannot write {}: {e}", file.display());
+        }
+    }
+}
+
+/// Translate, compile and optionally dump one record.
+fn process(name: &str, blob: &[u8], record: usize, compile: bool, totals: &mut Totals, dump: Option<&Dump>) {
     totals.records += 1;
+    if dump.is_some_and(Dump::full) {
+        return;
+    }
     let Some(sh) = xbox::parse(blob) else {
         totals.not_console += 1;
         return;
@@ -270,12 +320,17 @@ fn process(name: &str, blob: &[u8], compile: bool, totals: &mut Totals) {
     for f in &sh.fssm {
         let Some(mode) = recomp::interface(blob, &sh, f) else { continue };
         let stage = stage_of(&mode);
+        if let Some(d) = dump {
+            if stage != d.stage {
+                continue;
+            }
+        }
         if !record_stages.contains(&stage) {
             totals.stages.entry(stage).or_default().records += 1;
             record_stages.push(stage);
         }
         let jobs = jobs_of(&mode);
-        for p in &f.programs {
+        for (program, p) in f.programs.iter().enumerate() {
             totals.programs += 1;
             let stats = totals.stages.entry(stage).or_default();
             stats.programs += 1;
@@ -316,6 +371,10 @@ fn process(name: &str, blob: &[u8], compile: bool, totals: &mut Totals) {
                 stats.complete += 1;
             }
 
+            if let Some(d) = dump {
+                d.write(stage, record, program, name, &translation.hlsl);
+            }
+
             if jobs.is_empty() {
                 // GS: it needs its pipeline partner, the runtime pairs it.
                 totals.skipped += 1;
@@ -347,9 +406,12 @@ fn process(name: &str, blob: &[u8], compile: bool, totals: &mut Totals) {
 fn usage() -> ! {
     eprintln!(
         "xcl-corpus <shaders.rpf | folder> [--compile] [--jobs N] [--limit N] [--json out.json]\n\
+         xcl-corpus <shaders.rpf | folder> --dump-hlsl DIR --limit N --stage cs|ps\n\
          \n\
          Translates every program of a console shader pack with XCL's recompiler.\n\
          With --compile the HLSL is compiled with the Linux dxc CLI (XCL's arguments).\n\
+         With --dump-hlsl the first N translated programs of --stage are written as\n\
+         .hlsl files to DIR (limit counts records in the other modes).\n\
          \n\
          Environment:\n\
          \x20 XCL_DXC        the dxc executable (default: dxc on the PATH)\n\
@@ -365,6 +427,8 @@ fn main() {
     let mut jobs = 24usize;
     let mut limit = usize::MAX;
     let mut json: Option<PathBuf> = None;
+    let mut dump: Option<PathBuf> = None;
+    let mut dump_stage: Option<Stage> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -384,6 +448,21 @@ fn main() {
                     usage();
                 }
             }
+            "--dump-hlsl" => {
+                i += 1;
+                dump = args.get(i).map(PathBuf::from);
+                if dump.is_none() {
+                    usage();
+                }
+            }
+            "--stage" => {
+                i += 1;
+                dump_stage = match args.get(i).map(String::as_str) {
+                    Some("cs") => Some(Stage::Compute),
+                    Some("ps") => Some(Stage::Pixel),
+                    _ => usage(),
+                };
+            }
             "--help" | "-h" => usage(),
             other if other.starts_with("--") => {
                 eprintln!("xcl-corpus: unknown option {other}");
@@ -400,6 +479,34 @@ fn main() {
         i += 1;
     }
     let Some(path) = path else { usage() };
+    match (dump.as_ref(), dump_stage, limit) {
+        (Some(_), None, _) => {
+            eprintln!("xcl-corpus: --dump-hlsl needs --stage cs|ps");
+            usage();
+        }
+        (None, Some(_), _) => {
+            eprintln!("xcl-corpus: --stage needs --dump-hlsl DIR");
+            usage();
+        }
+        (Some(_), Some(_), usize::MAX) => {
+            eprintln!("xcl-corpus: --dump-hlsl needs --limit N");
+            usage();
+        }
+        _ => {}
+    }
+    let dumper = dump.as_ref().map(|dir| {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("xcl-corpus: cannot create {}: {e}", dir.display());
+            std::process::exit(2);
+        }
+        Dump {
+            dir: dir.clone(),
+            stage: dump_stage.unwrap(),
+            limit,
+            reserved: std::array::from_fn(|_| AtomicUsize::new(0)),
+            seq: AtomicUsize::new(0),
+        }
+    });
 
     let t0 = Instant::now();
     let input = if path.is_dir() {
@@ -426,7 +533,9 @@ fn main() {
         }
     };
 
-    let n = input.len().min(limit);
+    // In dump mode `--limit` counts programs of one stage, which can be far into the pack;
+    // the scan therefore covers all records and stops when that many files were written.
+    let n = if dumper.is_some() { input.len() } else { input.len().min(limit) };
     if compile {
         // The compiler must be there before the run: a missing dxc would otherwise
         // show up as thousands of identical compile errors.
@@ -453,6 +562,9 @@ fn main() {
                 s.spawn(|| {
                     let mut totals = Totals::default();
                     loop {
+                        if dumper.as_ref().is_some_and(Dump::full) {
+                            break;
+                        }
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= n {
                             break;
@@ -462,7 +574,7 @@ fn main() {
                             totals.inflate_errors += 1;
                             continue;
                         };
-                        process(&name, &blob, compile, &mut totals);
+                        process(&name, &blob, i, compile, &mut totals, dumper.as_ref());
                         let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                         if d % 1000 == 0 {
                             eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
@@ -479,6 +591,10 @@ fn main() {
         totals.merge(part);
     }
 
+    if let Some(d) = &dumper {
+        let dumped = d.reserved[d.stage.slot()].load(Ordering::Relaxed).min(limit);
+        eprintln!("xcl-corpus: dumped {dumped} {} HLSL programs to {}", d.stage.name(), d.dir.display());
+    }
     report(&path, &totals, compile, limit, t0.elapsed().as_secs_f64());
 
     if let Some(json) = json {
