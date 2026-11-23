@@ -1,0 +1,243 @@
+--- a/crates/xcl/src/gpu/recomp/tests.rs
++++ b/crates/xcl/src/gpu/recomp/tests.rs
+@@ -4098,3 +4098,240 @@
+     assert!(split.hlsl.contains("xcl_logical_wave64 = true;"));
+     assert!(split.complete(), "{:?}", split.unsupported_why);
+ }
++
++// ---------------------------------------------------------------------------
++// s4-r3: scenario-driven xcl-vs-cpu_ref comparison (env-driven, ignored).
++// Both sides load the same scenario JSON; no input is rebuilt on the GPU side.
++// ---------------------------------------------------------------------------
++
++#[derive(Clone)]
++struct CmpImg {
++    srv_index: u32,
++    dim: u32,
++    w: u32,
++    h: u32,
++    depth: u32,
++    layers: u32,
++    fmt: u32,
++    data: Vec<u8>,
++    uav: bool,
++}
++
++struct CmpScenario {
++    code: Vec<u8>,
++    sgpr: Vec<u32>,
++    vgpr: Vec<Vec<u32>>,
++    mem: Vec<u32>,
++    regions: Vec<(u32, usize)>,
++    data: Vec<String>,
++    images: Vec<CmpImg>,
++    hashes: serde_json::Map<String, serde_json::Value>,
++}
++
++fn cmp_hex(bytes: &[u8]) -> String {
++    const H: &[u8; 16] = b"0123456789abcdef";
++    let mut s = String::with_capacity(bytes.len() * 2);
++    for b in bytes {
++        s.push(H[(b >> 4) as usize] as char);
++        s.push(H[(b & 15) as usize] as char);
++    }
++    s
++}
++
++fn cmp_unhex(s: &str) -> Result<Vec<u8>, String> {
++    if s.len() % 2 != 0 { return Err("odd hex length".into()); }
++    (0..s.len()).step_by(2)
++        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
++        .collect()
++}
++
++/// FNV-1a over raw bytes; the Python scenario builder uses the same function.
++fn cmp_hash(bytes: &[u8]) -> String {
++    let mut h = 0xCBF29CE484222325u64;
++    for &b in bytes {
++        h ^= b as u64;
++        h = h.wrapping_mul(0x100000001B3);
++    }
++    format!("{h:016x}")
++}
++
++fn cmp_u32_field(v: &serde_json::Value, field: &str) -> Result<u32, String> {
++    v.get(field).and_then(|x| x.as_u64()).and_then(|x| u32::try_from(x).ok())
++        .ok_or_else(|| format!("missing u32 field {field}"))
++}
++
++fn cmp_load_scenario(id: &str) -> Result<CmpScenario, String> {
++    let dir = std::env::var("XCL_CMP_SCENARIOS").map_err(|_| "XCL_CMP_SCENARIOS not set".to_string())?;
++    let path = std::path::Path::new(&dir).join(format!("{id}.json"));
++    let txt = std::fs::read_to_string(&path).map_err(|e| format!("scenario {id}: {e}"))?;
++    let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| format!("scenario JSON {id}: {e}"))?;
++    if let Some(e) = v.get("error") {
++        return Err(format!("scenario build failed: {}", e.as_str().unwrap_or("?")));
++    }
++    let code = cmp_unhex(v["code"].as_str().ok_or("missing code")?)?;
++    let sgpr: Vec<u32> = v["sgpr"].as_array().ok_or("missing sgpr")?.iter()
++        .map(|x| x.as_u64().unwrap_or(0) as u32).collect();
++    let vgpr: Vec<Vec<u32>> = v["vgpr"].as_array().ok_or("missing vgpr")?.iter()
++        .map(|row| match row.as_array() {
++            Some(a) => a.iter().map(|x| x.as_u64().unwrap_or(0) as u32).collect(),
++            None => Vec::new(),
++        }).collect();
++    let mut regions = Vec::new();
++    let mut end = 0usize;
++    for r in v["regions"].as_array().ok_or("missing regions")? {
++        let base = cmp_u32_field(r, "base")? as usize;
++        let bytes = cmp_unhex(r["data"].as_str().ok_or("missing region data")?)?;
++        end = end.max(base + bytes.len());
++        regions.push((base as u32, bytes.len()));
++    }
++    let mut mem = vec![0u32; (end + 3) / 4];
++    for r in v["regions"].as_array().unwrap() {
++        let base = cmp_u32_field(r, "base")? as usize;
++        let bytes = cmp_unhex(r["data"].as_str().unwrap())?;
++        for (i, b) in bytes.chunks(4).enumerate() {
++            let mut w = [0u8; 4];
++            w[..b.len()].copy_from_slice(b);
++            mem[base / 4 + i] = u32::from_le_bytes(w);
++        }
++    }
++    let mut images = Vec::new();
++    for im in v["images"].as_array().ok_or("missing images")? {
++        images.push(CmpImg {
++            srv_index: cmp_u32_field(im, "srv_index")?, dim: cmp_u32_field(im, "dim")?,
++            w: cmp_u32_field(im, "w")?, h: cmp_u32_field(im, "h")?,
++            depth: cmp_u32_field(im, "depth")?, layers: cmp_u32_field(im, "layers")?,
++            fmt: cmp_u32_field(im, "fmt")?, uav: im["uav"].as_bool().unwrap_or(false),
++            data: cmp_unhex(im["data"].as_str().ok_or("missing image data")?)?,
++        });
++    }
++    let data: Vec<String> = v["data"].as_array().ok_or("missing data")?.iter()
++        .filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
++    // Hash the state the GPU is about to run, exactly as the Python side hashes
++    // the serialized scenario. A mismatch makes the shader "not run".
++    let mut hashes = serde_json::Map::new();
++    hashes.insert("code".into(), serde_json::json!(cmp_hash(&code)));
++    let mut sb = Vec::new();
++    for w in &sgpr { sb.extend_from_slice(&w.to_le_bytes()); }
++    hashes.insert("sgpr".into(), serde_json::json!(cmp_hash(&sb)));
++    let mut vb = Vec::new();
++    for row in &vgpr { for w in row { vb.extend_from_slice(&w.to_le_bytes()); } }
++    hashes.insert("vgpr".into(), serde_json::json!(cmp_hash(&vb)));
++    for (base, len) in &regions {
++        let mut b = Vec::new();
++        b.extend_from_slice(&base.to_le_bytes());
++        b.extend_from_slice(&(*len as u32).to_le_bytes());
++        b.extend_from_slice(&mem[*base as usize / 4..(*base as usize + *len) / 4].iter()
++            .flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>());
++        hashes.insert(format!("region:0x{base:x}"), serde_json::json!(cmp_hash(&b)));
++    }
++    for im in &images {
++        hashes.insert(format!("image:{}", im.srv_index), serde_json::json!(cmp_hash(&im.data)));
++    }
++    let want = v["hash"].as_object().ok_or("missing hash map")?;
++    for (k, got) in &hashes {
++        if want.get(k).and_then(|x| x.as_str()) != got.as_str() {
++            return Err(format!("input mismatch: {k}: expected {:?}, got {got}", want.get(k)));
++        }
++    }
++    Ok(CmpScenario { code, sgpr, vgpr, mem, regions, data, images, hashes })
++}
++
++fn run_one_cmp(id: &str) -> Result<serde_json::Value, String> {
++    let sc = cmp_load_scenario(id)?;
++    let opt = super::Options { mode: super::Mode::Kernel, wave64: false, hw_wave: 0,
++        geometry_wave32: false, mesh_wave32: false, static_sampler_base: 0, mem_windows: 1, structured: true };
++    let t = super::translate(&sc.code, &opt).map_err(|e| format!("translate: {e}"))?;
++    if let Ok(dir) = std::env::var("XCL_CMP_HLSL_DIR") {
++        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{id}.hlsl")), &t.hlsl);
++    }
++    if !t.complete() { return Err(format!("unsupported: {:?}", t.unsupported)); }
++    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("dxc: {e}"))?;
++    let mut st = KernelState::default();
++    st.sgpr = sc.sgpr.clone();
++    st.sgpr.resize(128, 0);
++    st.vgpr = sc.vgpr.clone();
++    let mut texs = Vec::new();
++    for img in &sc.images {
++        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_UINT};
++        let dim = match img.dim { 0 => runner::TexDim::D2, 1 => runner::TexDim::D2,
++            2 => runner::TexDim::D3, 3 => runner::TexDim::Cube, 4 => runner::TexDim::D2Array,
++            _ => runner::TexDim::D2 };
++        let (format, texel_bytes) = if img.fmt == 77 { (DXGI_FORMAT_R32G32B32A32_FLOAT, 16u32) }
++            else { (DXGI_FORMAT_R32_UINT, 4u32) };
++        texs.push(runner::TestTexture { dim, format, width: img.w, height: img.h.max(1),
++            depth: if img.dim == 2 { img.depth } else { img.layers },
++            texel_bytes, data: img.data.clone(), uav: img.uav });
++    }
++    let r = runner::run_with_statics(&dxil, &st, &sc.mem, &texs, &[], &t.static_samplers)
++        .map_err(|e| format!("run: {e}"))?;
++    let mut dumps = serde_json::Map::new();
++    for addr in &sc.data {
++        let a = u64::from_str_radix(addr.trim_start_matches("0x"), 16).map_err(|e| e.to_string())? as usize;
++        let len = sc.regions.iter().find(|(b, _)| *b as usize == a).map(|(_, l)| *l)
++            .ok_or_else(|| format!("unknown data region {addr}"))?;
++        let mut bytes = Vec::with_capacity(len);
++        for j in 0..len / 4 {
++            bytes.extend_from_slice(&r.mem.get(a / 4 + j).copied().unwrap_or(0).to_le_bytes());
++        }
++        dumps.insert(addr.clone(), serde_json::Value::String(cmp_hex(&bytes)));
++    }
++    let mut img_dumps = serde_json::Map::new();
++    let mut ui = 0usize;
++    for img in &sc.images {
++        if img.uav {
++            if let Some(b) = r.textures.get(ui) {
++                img_dumps.insert(img.srv_index.to_string(), serde_json::Value::String(cmp_hex(b)));
++            }
++            ui += 1;
++        }
++    }
++    let mut out = serde_json::json!({"outcome":"RAN","data":dumps,"images":img_dumps,
++        "input_hash": sc.hashes, "wave": 32});
++    if std::env::var_os("XCL_CMP_REGS").is_some() {
++        let mut sg = Vec::new();
++        for w in r.sgpr.iter().take(128) { sg.extend_from_slice(&w.to_le_bytes()); }
++        let mut regs = serde_json::Map::new();
++        regs.insert("sgpr".into(), serde_json::Value::String(cmp_hex(&sg)));
++        let lanes: Vec<serde_json::Value> = r.vgpr.iter().take(32).map(|lane| {
++            let mut b = Vec::new();
++            for w in lane.iter().take(256) { b.extend_from_slice(&w.to_le_bytes()); }
++            serde_json::Value::String(cmp_hex(&b))
++        }).collect();
++        regs.insert("vgpr".into(), serde_json::Value::Array(lanes));
++        out["regs"] = serde_json::Value::Object(regs);
++    }
++    Ok(out)
++}
++
++fn cmp_raw_hash(id: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
++    let dir = std::env::var("XCL_CMP_SCENARIOS").ok()?;
++    let txt = std::fs::read_to_string(std::path::Path::new(&dir).join(format!("{id}.json"))).ok()?;
++    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
++    v.get("hash")?.as_object().cloned()
++}
++
++#[test]
++#[ignore]
++fn xcl_cmp_manifest() {
++    use std::io::Write;
++    if std::env::var_os("XCL_CMP_SCENARIOS").is_none() { return; }
++    let out_path = std::env::var("XCL_CMP_OUT").unwrap();
++    let ids: Vec<String> = std::env::var("XCL_CMP_IDS").unwrap_or_default()
++        .split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect();
++    if ids.is_empty() { return; }
++    if !gpu_ready_wave32() { eprintln!("SKIP: GPU/DXC unavailable"); return; }
++    let mut out = std::fs::File::create(&out_path).unwrap();
++    for id in ids {
++        let mut rec = match run_one_cmp(&id) {
++            Ok(r) => r,
++            Err(e) => serde_json::json!({"outcome":"NOT_RUN","reason":e}),
++        };
++        if let Some(h) = cmp_raw_hash(&id) {
++            rec["input_hash"] = serde_json::Value::Object(h);
++        }
++        rec["idx"] = serde_json::json!(id);
++        writeln!(out, "{}", rec).unwrap();
++        out.flush().unwrap();
++        eprintln!("cmp {id} {}", rec.get("outcome").and_then(|v| v.as_str()).unwrap_or("?"));
++    }
++}
