@@ -1,5 +1,6 @@
 #include "runtime/modules/placement.hpp"
 #include "runtime/common/runtime.hpp"
+#include "runtime/modules/d3d12x/title_textures.hpp"
 #include "runtime/modules/xg.hpp"
 #include <algorithm>
 #include <atomic>
@@ -343,6 +344,7 @@ void prepare_title_write(const void *address, std::size_t bytes) {
     const auto first = reinterpret_cast<std::uintptr_t>(address), last = first + bytes;
     if (!address || !bytes)
         return;
+    d3d12x::title_textures::prepare_write(address, bytes);
     const std::lock_guard lock(mutex);
     for (auto at = placements.lower_bound(last); at != placements.begin();) {
         auto &placement = (--at)->second;
