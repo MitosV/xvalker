@@ -384,6 +384,8 @@ fn process(name: &str, blob: &[u8], compile: bool, host_wave: u32, totals: &mut 
 /// and compile the compute + mesh pass-through pair.
 fn process_gs_pairs(input: &Input, compile: bool, host_wave: u32, totals: &mut Totals) {
     let key = |name: &str| -> String {
+        // Input::get includes the record offset: "NAME @0x...".
+        let name = name.split(" @").next().unwrap_or(name);
         name.split_once('_').map(|(_, tail)| tail).unwrap_or(name).trim_end_matches("_Wrapped").to_string()
     };
     let mut es: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
