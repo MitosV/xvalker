@@ -61,8 +61,11 @@ int main(int argc, char **argv) {
         const auto result = lower_xbox_dxil(bytes, &why);
         if (!result) {
             std::printf("%s: not lowered: %s\n", path.filename().string().c_str(), why.c_str());
+            std::fflush(stdout);
             continue;
         }
+        std::printf("%s: lowered\n", path.filename().string().c_str());
+        std::fflush(stdout);
         ++lowered;
         if (result->signed_ok)
             ++signed_ok;
