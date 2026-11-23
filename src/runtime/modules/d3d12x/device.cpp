@@ -488,12 +488,25 @@ void *scratch_memory(ID3D12Resource *self) {
                    size};
         const bool tracked =
             scratch.memory && title_textures::track_scratch(self, scratch.memory, scratch.size);
-        if (static std::atomic<int> shown{0}; !tracked && shown++ < 4) {
-            std::fprintf(stderr,
-                         "[Runtime] the title writes a %llux%u texture's memory, which the host "
-                         "does not give: what it writes there is lost\n",
-                         desc.Width, desc.Height);
-            std::fflush(stderr);
+        // When the DLL is there the scratch is write-watched anyway: warn about a console
+        // layout we cannot model only if the title really writes the memory, not when it
+        // only asks for its address. An MSAA render target/depth is defined by the GPU's
+        // rendering, so a CPU write to its scratch is not a missing texture. Without the
+        // DLL, keep the old immediate warning.
+        const bool gpu_defined =
+            desc.SampleDesc.Count > 1 &&
+            (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
+        if (!tracked && scratch.memory &&
+            !title_textures::watch_lost_writes(self, scratch.memory, scratch.size, desc,
+                                               gpu_defined)) {
+            if (static std::atomic<int> shown{0}; shown++ < 4) {
+                std::fprintf(stderr,
+                             "[Runtime] the title writes a %llux%u texture's memory, which the "
+                             "host does not give: what it writes there is lost\n",
+                             desc.Width, desc.Height);
+                std::fflush(stderr);
+            }
         }
     }
     return scratch.memory;
@@ -3921,8 +3934,13 @@ HRESULT STDMETHODCALLTYPE create_committed_resource_2(
         host_rules(heap, host_desc.Flags, state);
     const auto result = original<Create>(self, 69)(self, heap, flags, desc ? &host_desc : nullptr,
                                                    state, clear, session, iid, resource);
-    if (SUCCEEDED(result) && resource && *resource)
+    if (SUCCEEDED(result) && resource && *resource) {
         console_resource(*resource);
+        if (desc)
+            title_textures::note_desc(
+                static_cast<ID3D12Resource *>(*resource),
+                *reinterpret_cast<const D3D12_RESOURCE_DESC *>(desc), state);
+    }
     if (FAILED(result) && desc) {
         std::fprintf(stderr,
                      "[Runtime] CreateCommittedResource2 dimension %d %llux%ux%u mips %u format "

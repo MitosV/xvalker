@@ -101,10 +101,20 @@ struct Entry {
     bool gpu_written = false; // the title's GPU work wrote it: the CPU view is stale
     bool readable = true; // placed memory committed yet
 };
+// a scratch the console layout does not model: its writes are not uploaded, but warn
+// only when the title actually writes it (a query for its address alone is harmless)
+struct WatchedLost {
+    std::uintptr_t memory = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t width = 0, height = 0;
+    bool gpu_defined = false;
+};
 std::mutex mutex;
 std::map<ID3D12Resource *, Created> created;
 std::map<ID3D12Resource *, Entry> entries;
+std::map<ID3D12Resource *, WatchedLost> lost;
 std::atomic<std::size_t> kept{0}; // the fast path of refresh
+std::atomic<std::size_t> watched_lost{0};
 PVOID handler = nullptr;
 
 constexpr std::uintptr_t page = 4096;
@@ -180,6 +190,27 @@ void warn_upload(const char *what) {
         std::fflush(stderr);
     }
 }
+void warn_lost(const WatchedLost &watched) {
+    if (watched.gpu_defined) {
+        if (static std::atomic<int> shown{0}; std::getenv("XV_D3D_TRACE") && shown++ < 4) {
+            std::fprintf(stderr,
+                         "[Runtime] CPU wrote an MSAA render target/depth scratch of "
+                         "%llux%llu; its content is defined by the GPU\n",
+                         static_cast<unsigned long long>(watched.width),
+                         static_cast<unsigned long long>(watched.height));
+            std::fflush(stderr);
+        }
+        return;
+    }
+    if (static std::atomic<int> shown{0}; shown++ < 4) {
+        std::fprintf(stderr,
+                     "[Runtime] the title writes a %llux%llu texture's memory, which the host "
+                     "does not give: what it writes there is lost\n",
+                     static_cast<unsigned long long>(watched.width),
+                     static_cast<unsigned long long>(watched.height));
+        std::fflush(stderr);
+    }
+}
 
 // the uploads' own list, allocator and fence, as upload_placements_d3d12 keeps them: the
 // staging buffers live until the GPU is past them
@@ -191,6 +222,7 @@ struct Uploader {
     std::vector<ID3D12Resource *> buffers;
 };
 Uploader uploader; // under mutex, which refresh holds
+void *watch_pages[16384]; // GetWriteWatch output, under the same mutex
 D3D12_RESOURCE_BARRIER transition(ID3D12Resource *resource, D3D12_RESOURCE_STATES before,
                                   D3D12_RESOURCE_STATES after) {
     D3D12_RESOURCE_BARRIER barrier{};
@@ -333,13 +365,33 @@ bool track_scratch(ID3D12Resource *resource, void *memory, std::uint64_t bytes) 
     {
         const std::lock_guard lock(mutex);
         const auto found = created.find(resource);
-        if (found == created.end())
+        if (found == created.end()) {
+            if (std::getenv("XV_D3D_TRACE")) {
+                const auto d = resource->GetDesc();
+                std::fprintf(stderr,
+                             "[Runtime] title texture without a creation desc: %llux%u format %d "
+                             "samples %u layout 0x%x flags 0x%x\n",
+                             d.Width, d.Height, d.Format, d.SampleDesc.Count, d.Layout, d.Flags);
+                std::fflush(stderr);
+            }
             return false;
+        }
         stored = found->second;
     }
     XclTiling *layout = nullptr;
-    if (a->create(reinterpret_cast<const uint8_t *>(&stored.desc), 0, &layout) != 0 || !layout)
+    const auto made = a->create(reinterpret_cast<const uint8_t *>(&stored.desc), 0, &layout);
+    if (made != 0 || !layout) {
+        if (std::getenv("XV_D3D_TRACE")) {
+            const auto &d = stored.desc;
+            std::fprintf(stderr,
+                         "[Runtime] title texture layout of %llux%u format %d mips %u array %u "
+                         "layout 0x%x flags 0x%x: 0x%08lx\n",
+                         d.Width, d.Height, d.Format, d.MipLevels, d.DepthOrArraySize, d.Layout,
+                         d.Flags, static_cast<unsigned long>(made));
+            std::fflush(stderr);
+        }
         return false;
+    }
     if (a->size(layout) > bytes) {
         a->destroy(layout);
         return false;
@@ -363,6 +415,20 @@ bool track_scratch(ID3D12Resource *resource, void *memory, std::uint64_t bytes) 
         kept.store(entries.size(), std::memory_order_relaxed);
     }
     release_entry(old);
+    return true;
+}
+
+bool watch_lost_writes(ID3D12Resource *resource, void *memory, std::uint64_t bytes,
+                       const D3D12_RESOURCE_DESC &desc, bool gpu_defined) {
+    const auto *const a = api();
+    if (!a || !resource || !memory || !bytes)
+        return false;
+    // scratch_memory asks for MEM_WRITE_WATCH when the DLL is there
+    ResetWriteWatch(memory, static_cast<SIZE_T>(bytes));
+    const std::lock_guard lock(mutex);
+    lost[resource] = {reinterpret_cast<std::uintptr_t>(memory), bytes, desc.Width, desc.Height,
+                      gpu_defined};
+    watched_lost.store(lost.size(), std::memory_order_relaxed);
     return true;
 }
 
@@ -423,7 +489,8 @@ void note_gpu_write(ID3D12Resource *resource) {
 }
 
 void refresh(ID3D12CommandQueue *queue) {
-    if (!kept.load(std::memory_order_relaxed) || !queue)
+    if ((!kept.load(std::memory_order_relaxed) && !watched_lost.load(std::memory_order_relaxed)) ||
+        !queue)
         return;
     // shader resource states are a direct queue's: the uploads wait for one
     if (queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
@@ -432,20 +499,36 @@ void refresh(ID3D12CommandQueue *queue) {
     if (!a)
         return;
     const std::lock_guard lock(mutex);
+    // scratch without a console layout: a write there really is lost; a query for its
+    // address alone is not. One warning per texture, before the title's next submission.
+    for (auto at = lost.begin(); at != lost.end();) {
+        ULONG_PTR count = std::size(watch_pages);
+        DWORD granularity = 0;
+        const auto &w = at->second;
+        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void *>(w.memory),
+                          static_cast<SIZE_T>(w.bytes), watch_pages, &count, &granularity) == 0 &&
+            count) {
+            warn_lost(w);
+            at = lost.erase(at);
+        } else {
+            ++at;
+        }
+    }
+    watched_lost.store(lost.size(), std::memory_order_relaxed);
     // scratch memory: what the CPU wrote since the last look (the watch resets as it reads)
-    void *pages[16384];
     for (auto &[resource, entry] : entries) {
         if (entry.placed || !entry.readable)
             continue;
-        ULONG_PTR count = std::size(pages);
+        ULONG_PTR count = std::size(watch_pages);
         DWORD granularity = 0;
         while (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void *>(entry.memory),
-                             static_cast<SIZE_T>(entry.bytes), pages, &count, &granularity) == 0) {
+                             static_cast<SIZE_T>(entry.bytes), watch_pages, &count,
+                             &granularity) == 0) {
             if (count)
                 entry.dirty = true;
-            if (count < std::size(pages))
+            if (count < std::size(watch_pages))
                 break;
-            count = std::size(pages);
+            count = std::size(watch_pages);
         }
     }
     // placed memory the title has committed since the last look: followed from now on
@@ -527,6 +610,8 @@ void forget(ID3D12Resource *resource) {
     {
         const std::lock_guard lock(mutex);
         created.erase(resource);
+        if (lost.erase(resource))
+            watched_lost.store(lost.size(), std::memory_order_relaxed);
         const auto found = entries.find(resource);
         if (found == entries.end())
             return;

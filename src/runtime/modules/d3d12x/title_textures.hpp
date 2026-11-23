@@ -21,6 +21,12 @@ std::uint64_t console_bytes(ID3D12Resource *resource);
 // a scratch-mapped texture (Map of a default-heap one): `memory` is the write-watched
 // scratch of `bytes` the title writes; kept in step from now on
 bool track_scratch(ID3D12Resource *resource, void *memory, std::uint64_t bytes);
+// a scratch the console layout cannot be computed for (MSAA, 3D): watch it for CPU writes
+// so the caller warns only if a write there really is lost. `gpu_defined` marks an MSAA
+// render target/depth: the GPU's rendering defines its content, so a CPU write there is
+// not a texture whose data went missing. False when there is no watch.
+bool watch_lost_writes(ID3D12Resource *resource, void *memory, std::uint64_t bytes,
+                       const D3D12_RESOURCE_DESC &desc, bool gpu_defined);
 // a placed texture (CreatePlacedResourceX): the title's memory at `address`, page-protected
 // between uploads (write-watch is impossible on the title's physical memory)
 bool track_placed(ID3D12Resource *resource, std::uint64_t address,
