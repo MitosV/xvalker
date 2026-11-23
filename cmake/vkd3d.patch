@@ -1,0 +1,22 @@
+Only the resource check of vkd3d-proton changes: the host's runtime keeps the console's
+vtable one entry before the host's own vtable (the console's vtable block starts with the
+host's vtable, so the block's [-1] is the host's vtable). A resource that the title
+reached through the console's vtable therefore fails the check, though the object behind
+it is the host's own. Every other check stays as it is, and the checks stay in the build
+(no NDEBUG).
+
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -1299,7 +1299,11 @@ static inline struct d3d12_resource *impl_from_ID3D12Resource2(ID3D12Resource2 *ifa
+     extern CONST_VTBL struct ID3D12Resource2Vtbl d3d12_resource_vtbl;
+     if (!iface)
+         return NULL;
+-    assert(iface->lpVtbl == &d3d12_resource_vtbl);
++    /* The console's vtable block keeps the host's vtable one entry before the console's
++     * own, so a resource the title reached through the console's vtable has the host's
++     * vtable just before it. */
++    assert(iface->lpVtbl == &d3d12_resource_vtbl ||
++           ((void *const *)iface->lpVtbl)[-1] == &d3d12_resource_vtbl);
+     return CONTAINING_RECORD(iface, struct d3d12_resource, ID3D12Resource_iface);
+ }
+ 

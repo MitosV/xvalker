@@ -20,6 +20,27 @@ jobs:
       - run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
       - run: cmake --build build --config ${{ matrix.config }} --parallel 3
       - run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+  linux-cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cache the Windows SDK
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/xwin
+          key: xwin-0.10.0-${{ hashFiles('cmake/toolchains/clang-cl-xwin.cmake') }}
+      - name: install xwin
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o xwin.tar.gz https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf xwin.tar.gz
+          sudo mv xwin /usr/local/bin/xwin
+      - name: splat the Windows SDK
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: xwin splat --accept-license
+      - name: cross-compile for Windows
+        run: tools/build-linux.sh
   format:
     runs-on: windows-2022
     steps:
