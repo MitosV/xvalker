@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=XValkyrie
+GenericName=Console title runner
+Comment=Run Xbox One and Xbox Series X|S titles with XValkyrie
+Exec=xvalker gui
+TryExec=xvalker
+Icon=xvalkyrie
+Terminal=false
+Categories=Game;Emulator;
+Keywords=xbox;proton;wine;minecraft;
+StartupNotify=true

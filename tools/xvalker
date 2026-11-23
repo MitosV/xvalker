@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# xvalker: runs the Windows build of XValkyrie (xvboot.exe / xvalkyrie.exe) on Linux with
+# Proton's Wine, and tells whether the machine is ready for it.
+#
+#   tools/xvalker run <title folder> [flags]   run a title (xvboot exec <title folder>)
+#   tools/xvalker gui [title folder]           run the launcher window (xvalkyrie.exe)
+#   tools/xvalker kill                         end the wineserver of our prefix
+#   tools/xvalker logs                         show the log of the last run
+#   tools/xvalker doctor                       check GPU, Proton, prefix and the DLLs
+#
+# Proton's own launcher (`proton run`) goes through steam.exe, which drops the program's
+# standard output; this script uses Proton only to make the prefix, then starts Proton's
+# wine itself with the overrides Proton would set.
+#
+# Environment:
+#   XV_BIN      folder with xvboot.exe, xvalkyrie.exe and the DLLs
+#               (default: build/linux of this repository)
+#   XV_PROTON   the Proton folder (default: found, see below)
+#   XV_PREFIX   the compat data folder Proton keeps its prefix in
+#               (default: ~/.cache/xvalker/prefix)
+#   XV_CACHE    the cache folder for the shader caches
+#               (default: ~/.cache/xvalker/cache)
+#   XV_STATE    the folder that holds the logs and the saves, outside the prefix
+#               (default: ~/.local/share/xvalker)
+#
+# Proton is looked for in this order:
+#   1. $XV_PROTON
+#   2. GE-Proton* in ~/.steam/steam/compatibilitytools.d (the newest one)
+#   3. "Proton - Experimental" in every library of libraryfolders.vdf
+#   4. "Proton 10.0" in every library of libraryfolders.vdf
+set -uo pipefail
+here=$(cd "$(dirname "$0")/.." && pwd)
+bin=${XV_BIN:-$here/build/linux}
+steam=${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$HOME/.steam/steam}
+prefix=${XV_PREFIX:-$HOME/.cache/xvalker/prefix}
+cache=${XV_CACHE:-$HOME/.cache/xvalker/cache}
+state=${XV_STATE:-$HOME/.local/share/xvalker}
+
+die() { echo "xvalker: $*" >&2; exit 1; }
+note() { echo "xvalker: $*"; }
+
+usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# --- Proton ---------------------------------------------------------------------------------
+
+proton_ok() { [ -n "${1:-}" ] && [ -f "$1/proton" ] && [ -x "$1/files/bin/wine" ]; }
+
+# the libraries Steam knows: the paths in libraryfolders.vdf, and the Steam folder itself
+libraries() {
+    local vdf=$steam/steamapps/libraryfolders.vdf
+    [ -f "$vdf" ] || return 0
+    sed -n 's/^[[:space:]]*"path"[[:space:]]*"\(.*\)".*/\1/p' "$vdf"
+}
+
+# the version a Proton folder says of itself, newest first
+proton_version() {
+    local dir=$1
+    if [ -f "$dir/version" ]; then
+        # the file holds the build's time and the name, e.g. "1784963766 GE-Proton11-3"
+        awk '{print $1; exit}' "$dir/version"
+    else
+        stat -c %Y "$dir" 2>/dev/null || echo 0
+    fi
+}
+
+find_proton() {
+    if [ -n "${XV_PROTON:-}" ]; then
+        proton_ok "$XV_PROTON" || die "XV_PROTON=$XV_PROTON is not a Proton folder"
+        echo "$XV_PROTON"
+        return 0
+    fi
+    local dir version best="" best_version=-1
+    # GE-Proton*, newest first
+    for dir in "$steam"/compatibilitytools.d/GE-Proton*; do
+        [ -d "$dir" ] || continue
+        proton_ok "$dir" || continue
+        version=$(proton_version "$dir")
+        if [ "$version" -gt "$best_version" ] 2>/dev/null; then
+            best=$dir
+            best_version=$version
+        fi
+    done
+    if [ -n "$best" ]; then
+        echo "$best"
+        return 0
+    fi
+    # "Proton - Experimental" and "Proton 10.0", in every library
+    local name lib
+    for name in "Proton - Experimental" "Proton 10.0"; do
+        while read -r lib; do
+            [ -n "$lib" ] || continue
+            for dir in "$lib/steamapps/common/$name" "$steam/compatibilitytools.d/$name"; do
+                if proton_ok "$dir"; then
+                    echo "$dir"
+                    return 0
+                fi
+            done
+        done < <(libraries; echo "$steam")
+    done
+    return 1
+}
+
+# --- the prefix -----------------------------------------------------------------------------
+
+# the prefix's own folders are symlinked to the state folder, so that the logs and the saves
+# survive a prefix that is made again
+link_state() {
+    local roaming=$prefix/pfx/drive_c/users/steamuser/AppData/Roaming
+    local local=$prefix/pfx/drive_c/users/steamuser/AppData/Local
+    mkdir -p "$state/xvalkyrie" "$state/logs" "$state/temp" "$state/pictures"
+    if [ -d "$roaming" ]; then
+        rm -rf "$roaming/xvalkyrie"
+        ln -sfn "$state/xvalkyrie" "$roaming/xvalkyrie"
+    fi
+    if [ -d "$local" ]; then
+        rm -rf "$local/Temp"
+        ln -sfn "$state/temp" "$local/Temp"
+    fi
+}
+
+ensure_prefix() {
+    local proton=$1
+    if [ ! -f "$prefix/pfx/system.reg" ]; then
+        note "making the prefix $prefix"
+        mkdir -p "$prefix"
+        STEAM_COMPAT_CLIENT_INSTALL_PATH=$steam STEAM_COMPAT_DATA_PATH=$prefix \
+            "$proton/proton" run wineboot -u || die "the prefix could not be made"
+    fi
+    link_state
+}
+
+# --- running --------------------------------------------------------------------------------
+
+# the environment Proton's wine runs with
+wine_env() {
+    export WINEPREFIX=$prefix/pfx
+    export WINEDLLOVERRIDES="d3d11,d3d10core,dxgi,d3d12,d3d12core=n;${WINEDLLOVERRIDES:-}"
+    export WINEDEBUG=${WINEDEBUG:--all}
+    export WINEESYNC=1 WINEFSYNC=1
+    export WINE_LARGE_ADDRESS_AWARE=1
+    export VKD3D_SHADER_CACHE_PATH=$cache/vkd3d-shader
+    export DXVK_STATE_CACHE_PATH=$cache/dxvk-state
+    mkdir -p "$VKD3D_SHADER_CACHE_PATH" "$DXVK_STATE_CACHE_PATH"
+}
+
+# a path of the host the wine side can use
+wine_path() {
+    local path=$1
+    printf 'Z:%s' "${path//\//\\}"
+}
+
+# the picture the probe wrote, as a PNG in the state folder
+picture() {
+    local bmp
+    bmp=$(ls -1t "$state"/temp/xv_*.bmp 2>/dev/null | head -1)
+    [ -n "$bmp" ] || return 1
+    echo "$bmp"
+    if command -v magick >/dev/null 2>&1; then
+        local png=$state/pictures/$(basename "${bmp%.bmp}").png
+        magick "$bmp" "$png" >/dev/null 2>&1 && echo "$png"
+    fi
+}
+
+finish() {
+    local proton=$1 status=$2
+    # the wineserver is asked to end the program first, and is ended when it does not
+    stop_server "$proton"
+    return $status
+}
+
+stop_server() {
+    local proton=$1
+    # the wineserver is asked to end the program first, and is ended when it does not
+    timeout 30 "$proton/files/bin/wineserver" -w >/dev/null 2>&1
+    kill_server "$proton"
+}
+
+kill_server() { "$1/files/bin/wineserver" -k >/dev/null 2>&1; }
+
+run_program() {
+    local proton=$1 program=$2
+    shift 2
+    ensure_prefix "$proton"
+    wine_env
+    local args=() arg
+    for arg in "$@"; do
+        if [[ $arg == /* && -e $arg ]]; then
+            args+=("$(wine_path "$arg")")
+        else
+            args+=("$arg")
+        fi
+    done
+    mkdir -p "$state/logs"
+    local log=$state/logs/$(date +%Y%m%d-%H%M%S)-$program.log
+    note "log: $log"
+    cd "$bin" || die "no $bin"
+    # when the run is cut short, the wineserver of our prefix goes with it
+    trap 'kill_server "$proton"; picture; exit 143' TERM INT
+    "$proton/files/bin/wine" "./$program.exe" "${args[@]}" 2>&1 | tee "$log"
+    local status=${PIPESTATUS[0]}
+    trap - TERM INT
+    finish "$proton" "$status"
+}
+
+command_run() {
+    [ $# -ge 1 ] || die "usage: xvalker run <title folder> [flags]"
+    local title=$1
+    shift
+    local proton
+    proton=$(find_proton) || die "no Proton found"
+    note "proton: $proton"
+    run_program "$proton" xvboot exec "$title" "$@"
+    picture || true
+}
+
+command_gui() {
+    local proton
+    proton=$(find_proton) || die "no Proton found"
+    note "proton: $proton"
+    run_program "$proton" xvalkyrie "$@"
+}
+
+command_kill() {
+    local proton
+    proton=$(find_proton) || die "no Proton found"
+    wine_env
+    "$proton/files/bin/wineserver" -k
+}
+
+command_logs() {
+    local log
+    log=$(ls -1t "$state"/logs/*.log 2>/dev/null | head -1)
+    [ -n "$log" ] || die "no log in $state/logs"
+    echo "$log"
+    tail -n 200 "$log"
+}
+
+# --- the doctor ------------------------------------------------------------------------------
+
+command_doctor() {
+    local failed=0
+    # the GPU
+    if command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary 2>/dev/null | grep -q "deviceName"; then
+        local gpu
+        gpu=$(vulkaninfo --summary 2>/dev/null | sed -n 's/.*deviceName *= *//p' | head -1)
+        echo "OK: the GPU is there ($gpu)"
+    else
+        echo "FAIL: vulkaninfo does not find a GPU"
+        failed=1
+    fi
+    # Proton
+    local proton
+    if proton=$(find_proton); then
+        echo "OK: Proton ($proton)"
+    else
+        echo "FAIL: no Proton found"
+        failed=1
+    fi
+    # the prefix
+    if [ -n "$proton" ]; then
+        if ensure_prefix "$proton" >/dev/null 2>&1 && [ -f "$prefix/pfx/system.reg" ]; then
+            echo "OK: the prefix ($prefix)"
+        else
+            echo "FAIL: the prefix ($prefix)"
+            failed=1
+        fi
+    else
+        echo "FAIL: the prefix ($prefix), without Proton there is none"
+        failed=1
+    fi
+    # the DLLs of the build
+    local dll
+    for dll in d3d12.dll d3d12core.dll dxcompiler.dll dxil.dll; do
+        if [ -f "$bin/$dll" ]; then
+            echo "OK: $dll is in $bin"
+        else
+            echo "FAIL: $dll is not in $bin"
+            failed=1
+        fi
+    done
+    return $failed
+}
+
+# --- the commands -----------------------------------------------------------------------------
+
+case "${1:-}" in
+    run) shift; command_run "$@" ;;
+    gui) shift; command_gui "$@" ;;
+    kill) shift; command_kill "$@" ;;
+    logs) shift; command_logs "$@" ;;
+    doctor) shift; command_doctor "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) echo "xvalker: unknown command: $1" >&2; usage >&2; exit 2 ;;
+esac
