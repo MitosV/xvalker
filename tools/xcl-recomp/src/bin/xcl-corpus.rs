@@ -83,6 +83,8 @@ struct StageStats {
     pub wave32: usize,
     /// programs with a wave hazard (a cross-lane read that a 32-lane wave cannot do)
     pub wave_hazards: usize,
+    /// programs refused for the host's wave size, by hazard kind (may overlap)
+    pub refused_hazards: BTreeMap<String, usize>,
     /// the translate errors, by message
     pub translate_error_groups: BTreeMap<String, usize>,
     /// one example program name per translate error message
@@ -105,6 +107,9 @@ impl StageStats {
         self.wave64 += other.wave64;
         self.wave32 += other.wave32;
         self.wave_hazards += other.wave_hazards;
+        for (k, v) in &other.refused_hazards {
+            *self.refused_hazards.entry(k.clone()).or_default() += v;
+        }
         for (k, v) in &other.translate_error_groups {
             *self.translate_error_groups.entry(k.clone()).or_default() += v;
         }
@@ -143,6 +148,8 @@ struct Totals {
     pub wave32: usize,
     /// programs with a wave hazard
     pub wave_hazards: usize,
+    /// programs refused for the host's wave size, by hazard kind (may overlap)
+    pub refused_hazards: BTreeMap<String, usize>,
     /// HLSL compiled by DXC
     pub compiled: usize,
     /// HLSL that failed to compile
@@ -165,6 +172,9 @@ impl Totals {
         self.wave64 += other.wave64;
         self.wave32 += other.wave32;
         self.wave_hazards += other.wave_hazards;
+        for (k, v) in &other.refused_hazards {
+            *self.refused_hazards.entry(k.clone()).or_default() += v;
+        }
         self.compiled += other.compiled;
         self.compile_errors += other.compile_errors;
         self.incomplete += other.incomplete;
@@ -260,7 +270,7 @@ fn jobs_of(mode: &recomp::Mode) -> Vec<(String, Option<String>)> {
 }
 
 /// Translate and compile one record.
-fn process(name: &str, blob: &[u8], compile: bool, totals: &mut Totals) {
+fn process(name: &str, blob: &[u8], compile: bool, host_wave: u32, totals: &mut Totals) {
     totals.records += 1;
     let Some(sh) = xbox::parse(blob) else {
         totals.not_console += 1;
@@ -289,18 +299,31 @@ fn process(name: &str, blob: &[u8], compile: bool, totals: &mut Totals) {
                 stats.wave32 += 1;
                 totals.wave32 += 1;
             }
-            let hazards = recomp::wave_hazards(code);
+            let hazards = if host_wave == 32 { recomp::host_hazards(code, &mode, host_wave) } else { recomp::wave_hazards(code) };
             if !hazards.is_empty() {
                 stats.wave_hazards += 1;
                 totals.wave_hazards += 1;
             }
 
-            let opt = recomp::Options { mode: mode.clone(), wave64, ..Default::default() };
+            // A 32-lane host runs a wave64 program in two native wave32 halves.
+            let opt = recomp::Options {
+                mode: mode.clone(),
+                wave64,
+                hw_wave: host_wave,
+                geometry_wave32: host_wave == 32 && matches!(mode, recomp::Mode::Geometry(_)),
+                mesh_wave32: host_wave == 32 && matches!(mode, recomp::Mode::Mesh(_)),
+                host_wave,
+                ..Default::default()
+            };
             let translation = match recomp::translate(code, &opt) {
                 Ok(t) => t,
                 Err(e) => {
                     stats.translate_errors += 1;
                     totals.translate_errors += 1;
+                    for hazard in &hazards {
+                        *stats.refused_hazards.entry((*hazard).to_string()).or_default() += 1;
+                        *totals.refused_hazards.entry((*hazard).to_string()).or_default() += 1;
+                    }
                     let message = e.lines().next().unwrap_or(&e).trim().to_string();
                     *stats.translate_error_groups.entry(message.clone()).or_default() += 1;
                     stats.translate_error_examples.entry(message).or_insert_with(|| name.to_string());
@@ -346,10 +369,12 @@ fn process(name: &str, blob: &[u8], compile: bool, totals: &mut Totals) {
 
 fn usage() -> ! {
     eprintln!(
-        "xcl-corpus <shaders.rpf | folder> [--compile] [--jobs N] [--limit N] [--json out.json]\n\
+        "xcl-corpus <shaders.rpf | folder> [--compile] [--jobs N] [--limit N] [--host-wave 32|64] [--json out.json]\n\
          \n\
          Translates every program of a console shader pack with XCL's recompiler.\n\
          With --compile the HLSL is compiled with the Linux dxc CLI (XCL's arguments).\n\
+         --host-wave 32 models a GPU with 32-lane subgroups: wave64 mesh/geometry programs\n\
+         run as two halves and wave64 programs with cross-half hazards are refused.\n\
          \n\
          Environment:\n\
          \x20 XCL_DXC        the dxc executable (default: dxc on the PATH)\n\
@@ -364,6 +389,7 @@ fn main() {
     let mut compile = false;
     let mut jobs = 24usize;
     let mut limit = usize::MAX;
+    let mut host_wave = 0u32;
     let mut json: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
@@ -376,6 +402,13 @@ fn main() {
             "--limit" => {
                 i += 1;
                 limit = args.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+            }
+            "--host-wave" => {
+                i += 1;
+                host_wave = args.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+                if host_wave != 32 && host_wave != 64 {
+                    usage();
+                }
             }
             "--json" => {
                 i += 1;
@@ -462,7 +495,7 @@ fn main() {
                             totals.inflate_errors += 1;
                             continue;
                         };
-                        process(&name, &blob, compile, &mut totals);
+                        process(&name, &blob, compile, host_wave, &mut totals);
                         let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                         if d % 1000 == 0 {
                             eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
@@ -479,10 +512,10 @@ fn main() {
         totals.merge(part);
     }
 
-    report(&path, &totals, compile, limit, t0.elapsed().as_secs_f64());
+    report(&path, &totals, compile, limit, host_wave, t0.elapsed().as_secs_f64());
 
     if let Some(json) = json {
-        let value = to_json(&totals, compile, limit, jobs, t0.elapsed().as_secs_f64());
+        let value = to_json(&totals, compile, limit, jobs, host_wave, t0.elapsed().as_secs_f64());
         let text = serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
         if let Err(e) = std::fs::write(&json, text) {
             eprintln!("xcl-corpus: cannot write {}: {e}", json.display());
@@ -500,8 +533,9 @@ fn top_groups(groups: &BTreeMap<String, usize>, examples: &BTreeMap<String, Stri
     v
 }
 
-fn report(path: &Path, totals: &Totals, compile: bool, limit: usize, seconds: f64) {
+fn report(path: &Path, totals: &Totals, compile: bool, limit: usize, host_wave: u32, seconds: f64) {
     println!("{}", path.display());
+    println!("host wave {}, wave hazards {}, refused for host {}", if host_wave == 0 { "native".to_string() } else { host_wave.to_string() }, totals.wave_hazards, totals.translate_errors);
     println!(
         "records {}, programs {}, translated {} ({} complete), translate errors {}",
         totals.records, totals.programs, totals.translated, totals.translated - totals.incomplete, totals.translate_errors
@@ -529,6 +563,9 @@ fn report(path: &Path, totals: &Totals, compile: bool, limit: usize, seconds: f6
             stats.wave64,
             stats.wave_hazards
         );
+        for (hazard, count) in &stats.refused_hazards {
+            println!("    [{stage}] refused {count:>6}  {hazard}");
+        }
     }
     println!("top translate errors:");
     for (stage, stats) in &totals.stages {
@@ -547,7 +584,7 @@ fn report(path: &Path, totals: &Totals, compile: bool, limit: usize, seconds: f6
     println!("limit {}, time {:.1} s", if limit == usize::MAX { "none".to_string() } else { limit.to_string() }, seconds);
 }
 
-fn to_json(totals: &Totals, compile: bool, limit: usize, jobs: usize, seconds: f64) -> serde_json::Value {
+fn to_json(totals: &Totals, compile: bool, limit: usize, jobs: usize, host_wave: u32, seconds: f64) -> serde_json::Value {
     let mut stages = serde_json::Map::new();
     for (stage, stats) in &totals.stages {
         let translate_errors: Vec<serde_json::Value> = top_groups(&stats.translate_error_groups, &stats.translate_error_examples, 30)
@@ -574,6 +611,8 @@ fn to_json(totals: &Totals, compile: bool, limit: usize, jobs: usize, seconds: f
                 "wave64": stats.wave64,
                 "wave32": stats.wave32,
                 "wave_hazards": stats.wave_hazards,
+                "refused": stats.translate_errors,
+                "refused_hazards": stats.refused_hazards,
             }),
         );
     }
@@ -590,6 +629,8 @@ fn to_json(totals: &Totals, compile: bool, limit: usize, jobs: usize, seconds: f
         "wave64": totals.wave64,
         "wave32": totals.wave32,
         "wave_hazards": totals.wave_hazards,
+        "refused_hazards": totals.refused_hazards,
+        "host_wave": host_wave,
         "compiled": totals.compiled,
         "compile_errors": totals.compile_errors,
         "compile_requested": compile,

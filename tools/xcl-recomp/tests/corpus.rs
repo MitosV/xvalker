@@ -110,6 +110,20 @@ fn the_stage_of_a_mode_is_the_one_of_the_program() {
     assert!(matches!(mode, Mode::Kernel));
 }
 
+/// `v_readlane_b32 s14, v6, 32; s_endpgm` (gfx1010), assembled with llvm-mc.
+#[test]
+fn a_32_lane_host_refuses_a_read_of_the_upper_half() {
+    let code = [0x0e, 0x00, 0x60, 0xd7, 0x06, 0x41, 0x01, 0x02, 0x00, 0x00, 0x81, 0xbf];
+    let mode = xcl_recomp::gpu::recomp::Mode::Kernel;
+    assert!(xcl_recomp::gpu::recomp::wave_hazards(&code).contains("v_readlane/writelane: lane ≥ 32"));
+    assert!(xcl_recomp::gpu::recomp::host_hazards(&code, &mode, 32).contains("v_readlane/writelane: lane ≥ 32"));
+    assert!(xcl_recomp::gpu::recomp::host_hazards(&code, &mode, 64).is_empty());
+    let opt = xcl_recomp::gpu::recomp::Options { mode: mode.clone(), wave64: true, host_wave: 32, ..Default::default() };
+    assert!(xcl_recomp::gpu::recomp::translate(&code, &opt).is_err());
+    let opt = xcl_recomp::gpu::recomp::Options { mode, wave64: true, ..Default::default() };
+    assert!(xcl_recomp::gpu::recomp::translate(&code, &opt).is_ok());
+}
+
 /// The error groups of the tool are the errors by message, most frequent first.
 #[test]
 fn the_error_groups_are_sorted_by_count() {

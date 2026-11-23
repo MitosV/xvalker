@@ -464,6 +464,8 @@ pub struct Options {
     pub geometry_wave32: bool,
     /// mesh mode: run a logical wave64 mesh program as two native wave32 halves
     pub mesh_wave32: bool,
+    /// host subgroup size: 32 runs a logical wave64 in two native wave32 halves (0: native wave64)
+    pub host_wave: u32,
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
     pub static_sampler_base: u32,
@@ -478,7 +480,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, mesh_wave32: false, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, mesh_wave32: false, host_wave: 0, static_sampler_base: 0, mem_windows: 1, structured: true }
     }
 }
 
@@ -1155,6 +1157,21 @@ pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
     out
 }
 
+/// Cross-lane operations of a wave64 program that a `host_wave` of 32 lanes cannot run.
+///
+/// Mesh and geometry already carry a whole-wave mask in each half, so their split form must
+/// also preserve mask semantics; VS, PS and CS have one invocation per lane and only need
+/// the lane exchanges to be representable in a half.
+pub fn host_hazards(code: &[u8], mode: &Mode, host_wave: u32) -> BTreeSet<&'static str> {
+    if host_wave != 32 {
+        return BTreeSet::new();
+    }
+    match mode {
+        Mode::Mesh(_) | Mode::Geometry(_) => geometry_wave32_hazards(code),
+        _ => wave_hazards(code),
+    }
+}
+
 /// Translate a complete ES+GS program for the adapter-selected geometry path.
 pub fn translate_geometry(code: &[u8], interface: GsInterface, geometry_wave32: bool) -> Result<Translation, String> {
     if geometry_wave32 {
@@ -1163,7 +1180,10 @@ pub fn translate_geometry(code: &[u8], interface: GsInterface, geometry_wave32: 
             return Err(format!("geometry program requires unsupported cross-half wave64 semantics: {hazards:?}"));
         }
     }
-    translate(code, &Options { mode: Mode::Geometry(interface), wave64: true, geometry_wave32, ..Default::default() })
+    translate(
+        code,
+        &Options { mode: Mode::Geometry(interface), wave64: true, geometry_wave32, host_wave: if geometry_wave32 { 32 } else { 0 }, ..Default::default() },
+    )
 }
 
 /// Translate an NGG mesh program; a wave64 program split into wave32 halves is refused
@@ -1175,7 +1195,7 @@ pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, mesh_wave32: b
             return Err(format!("mesh program requires unsupported cross-half wave64 semantics: {hazards:?}"));
         }
     }
-    translate(code, &Options { mode: Mode::Mesh(ms), wave64, mesh_wave32, ..Default::default() })
+    translate(code, &Options { mode: Mode::Mesh(ms), wave64, mesh_wave32, host_wave: if wave64 && mesh_wave32 { 32 } else { 0 }, ..Default::default() })
 }
 
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.
@@ -1261,6 +1281,12 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    if opt.wave64 {
+        let hazards = host_hazards(code, &opt.mode, opt.host_wave);
+        if !hazards.is_empty() {
+            return Err(format!("wave64 program needs unsupported cross-half semantics on a {}-lane host: {hazards:?}", opt.host_wave));
+        }
+    }
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {

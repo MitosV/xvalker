@@ -207,6 +207,19 @@ must not clobber a file that appeared meanwhile. Linux has `renameat2` with
 +        windows_sys::Win32::Foundation::SetLastError(122);
 ```
 
+## `src/gpu/recomp/mod.rs` (wave64 on a 32-lane host)
+
+The corpus tool models an NVIDIA GPU (host subgroup 32), so wave64 programs must say
+which cross-half operations their host cannot perform. Added to the vendored emitter:
+
+- `Options.host_wave: u32` (0 = native wave64, as before; 32 = two native wave32 halves).
+- `host_hazards(code, mode, host_wave)`: `geometry_wave32_hazards` for mesh/geometry (the split
+  forms also carry a mask), `wave_hazards` for the other stages.
+- `translate` refuses a wave64 program when `host_hazards` is not empty, before emitting HLSL.
+- `translate_geometry` / `translate_mesh` pass `host_wave = 32` when they split the wave.
+
+No other vendored file is changed by these edits.
+
 ## xvalker build of the DLL (orchestrator)
 
 `src/gpu/shader.rs`: the 11 `#[cfg(windows)]` gates added above are `#[cfg(xcl_runtime)]`
