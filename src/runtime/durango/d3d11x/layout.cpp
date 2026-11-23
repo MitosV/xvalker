@@ -956,7 +956,7 @@ template <void (STDMETHODCALLTYPE ID3D11DeviceContext::*Set)(UINT, UINT,
                                                              ID3D11ShaderResourceView *const *)>
 void STDMETHODCALLTYPE set_shader_resource(void *self, void **view, UINT slot, UINT) {
     auto *const host = static_cast<ID3D11ShaderResourceView *>(view ? unwrap(*view) : nullptr);
-    if constexpr (Set == &ID3D11DeviceContext::PSSetShaderResources)
+    if (Set == &ID3D11DeviceContext::PSSetShaderResources)
         keep_pixel_view(self, slot, host);
     (static_cast<ID3D11DeviceContext *>(unwrap(self))->*Set)(slot, 1, &host);
 }
@@ -1037,7 +1037,7 @@ template <class T, void (STDMETHODCALLTYPE ID3D11DeviceContext::*Set)(UINT, UINT
 void STDMETHODCALLTYPE set_one(void *self, UINT slot, void *object) {
     auto *const host = static_cast<T *>(unwrap(object));
     if constexpr (std::is_same_v<T, ID3D11ShaderResourceView>)
-        if constexpr (Set == &ID3D11DeviceContext::PSSetShaderResources)
+        if (Set == &ID3D11DeviceContext::PSSetShaderResources)
             keep_pixel_view(self, slot, host);
     (static_cast<ID3D11DeviceContext *>(unwrap(self))->*Set)(slot, 1, &host);
 }

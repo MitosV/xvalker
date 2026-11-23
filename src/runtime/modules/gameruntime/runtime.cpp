@@ -46,8 +46,10 @@ HRESULT WINAPI unimplemented(Table *table, std::uint64_t a, std::uint64_t b, std
     return E_NOTIMPL;
 }
 template <std::size_t... Id> void fill_unimplemented(std::index_sequence<Id...>) {
-    ((vtables[Id / table_slots][Id % table_slots] = reinterpret_cast<Slot>(&unimplemented<Id>)),
-     ...);
+    // a list rather than a fold: clang caps how deep a fold of 3072 terms may nest
+    const Slot slots[] = {reinterpret_cast<Slot>(&unimplemented<Id>)...};
+    for (std::size_t id = 0; id < sizeof...(Id); ++id)
+        vtables[id / table_slots][id % table_slots] = slots[id];
 }
 // the tables live as long as the process, and one answers for every info of its API
 HRESULT WINAPI table_query(Table *table, const GUID *, void **object) {

@@ -1468,8 +1468,7 @@ HRESULT STDMETHODCALLTYPE create_placed_resource_x(ID3D12Device *self, std::uint
 // topologies 17 and 19). Here both are triangles: a quad list through indices of ours (see
 // draw_instanced), a rectangle list through a geometry shader of ours (see
 // rectangle_pipeline).
-constexpr D3D12_PRIMITIVE_TOPOLOGY_TYPE rectangle_type =
-    static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(19);
+const D3D12_PRIMITIVE_TOPOLOGY_TYPE rectangle_type = static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(19);
 D3D12_PRIMITIVE_TOPOLOGY_TYPE host_topology_type(D3D12_PRIMITIVE_TOPOLOGY_TYPE type) {
     return type == 19 || type == 32 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE : type;
 }

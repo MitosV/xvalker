@@ -209,7 +209,8 @@ bool open_with_host(const std::filesystem::path &path) {
 }
 namespace {
 void check_path(const std::filesystem::path &path) {
-    if (path.empty() || path.native().find('\0') != std::filesystem::path::string_type::npos)
+    if (path.empty() || path.native().find(std::filesystem::path::value_type{}) !=
+                            std::filesystem::path::string_type::npos)
         throw std::invalid_argument("Expected nonempty path without embedded NUL");
 }
 std::size_t checked_size(std::uintmax_t bytes, std::size_t limit) {
