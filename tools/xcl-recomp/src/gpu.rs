@@ -3,6 +3,11 @@
 //! XCL keeps these under `crates/xcl/src/gpu/`. Here they are loaded from
 //! `third_party/xcl/src/gpu/` (see `third_party/xcl/README.md`), so the recompiler
 //! can be built and audited outside XCL.
+//!
+//! The test modules of two vendored files need XCL's Windows-only modules (`dxc`,
+//! `runner`) or its Windows-only memory probe (`readable`); they are behind the
+//! `xcl_vendored_tests` feature, which is off by default. The tests of this crate
+//! live in `tests/` and in the crate's own modules.
 
 #[path = "../../../third_party/xcl/src/gpu/dxbc.rs"]
 pub mod dxbc;

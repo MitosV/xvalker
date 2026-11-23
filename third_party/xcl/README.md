@@ -22,7 +22,7 @@ All files are copies of `crates/xcl/src/<path>` of the commit above. The ones ma
 
 | File | Origin in XCL | Edited |
 |---|---|---|
-| `src/gpu/rdna2.rs` | `crates/xcl/src/gpu/rdna2.rs` | no |
+| `src/gpu/rdna2.rs` | `crates/xcl/src/gpu/rdna2.rs` | yes |
 | `src/gpu/rdna2_spec.rs` | `crates/xcl/src/gpu/rdna2_spec.rs` | no |
 | `src/gpu/rdna2_xbox.rs` | `crates/xcl/src/gpu/rdna2_xbox.rs` | no |
 | `src/gpu/xbox.rs` | `crates/xcl/src/gpu/xbox.rs` | no |
@@ -32,7 +32,7 @@ All files are copies of `crates/xcl/src/<path>` of the commit above. The ones ma
 | `src/gpu/recomp/mod.rs` | `crates/xcl/src/gpu/recomp/mod.rs` | yes |
 | `src/gpu/recomp/emit.rs` | `crates/xcl/src/gpu/recomp/emit.rs` | no |
 | `src/gpu/recomp/mesh_wave.rs` | `crates/xcl/src/gpu/recomp/mesh_wave.rs` | no |
-| `src/gpu/recomp/mesh_dispatch.rs` | `crates/xcl/src/gpu/recomp/mesh_dispatch.rs` | no |
+| `src/gpu/recomp/mesh_dispatch.rs` | `crates/xcl/src/gpu/recomp/mesh_dispatch.rs` | yes |
 | `src/shaders.rs` | `crates/xcl/src/shaders.rs` | yes |
 | `src/rpf.rs` | `crates/xcl/src/rpf.rs` | yes |
 | `src/rpf_probe.rs` | `crates/xcl/src/rpf_probe.rs` | no |

@@ -82,11 +82,48 @@ The imports that only the Windows part uses are now conditional (3 lines):
 +use std::sync::Mutex;
 ```
 
+The test module of the file needs `readable`, which is Windows only, so it is behind
+the `xcl_vendored_tests` feature of the crate (1 line):
+
+```
+-#[cfg(test)]
++#[cfg(all(test, feature = "xcl_vendored_tests"))]
+ mod tests {
+```
+
 One call site changed, like in `shaders.rs` (1 line):
 
 ```
 -            let built = if dxc && t.complete() { Some(recomp::dxc::compile_cached(&t.hlsl, "main", profile)) } else { None };
 +            let built = if dxc && t.complete() { Some(crate::dxc::compile_cached(&t.hlsl, "main", profile)) } else { None };
+```
+
+---
+
+## `src/gpu/rdna2.rs`
+
+The test module of the file reads the LLVM disassembly corpus of XCL
+(`tests/data/llvm-amdgpu`), which is not part of the vendored files. The test module
+is behind the `xcl_vendored_tests` feature of the crate (1 line):
+
+```
+-#[cfg(test)]
++#[cfg(all(test, feature = "xcl_vendored_tests"))]
+ mod tests {
+```
+
+---
+
+## `src/gpu/recomp/mesh_dispatch.rs`
+
+The test module of the file needs XCL's Windows-only modules `recomp::dxc` and
+`recomp::runner`, which are not vendored. The test module is behind the
+`xcl_vendored_tests` feature of the crate (1 line):
+
+```
+-#[cfg(test)]
++#[cfg(all(test, feature = "xcl_vendored_tests"))]
+ mod tests {
 ```
 
 ---
@@ -104,8 +141,8 @@ The import of `std::os::windows::ffi::OsStrExt` and of `windows_sys` was removed
 ```
 
 The commit of the file is now platform specific (the Windows branch keeps XCL's
-code, the Linux branch renames the temporary file, which is atomic within a
-filesystem):
+code, the Linux branch renames the temporary file without replacing an existing
+one, as Windows' `MoveFileExW` does without `MOVEFILE_REPLACE_EXISTING`):
 
 ```
 -    let from: Vec<u16> = temporary.0.as_os_str().encode_wide().chain([0]).collect();
@@ -123,8 +160,16 @@ filesystem):
 +        }
      }
 +    #[cfg(not(windows))]
-+    std::fs::rename(&temporary.0, path)?;
++    rename_noreplace(&temporary.0, path)?;
 ```
+
+`rename_noreplace` is new: `std::fs::rename` replaces the target, but the extraction
+must not clobber a file that appeared meanwhile. Linux has `renameat2` with
+`RENAME_NOREPLACE` for that (the crate depends on `libc` for it on non-Windows).
+
+---
+
+## `src/util.rs`
 
 ---
 

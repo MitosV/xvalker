@@ -368,7 +368,7 @@ pub fn stats() -> ShaderStats {
     s
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "xcl_vendored_tests"))]
 mod tests {
     use super::*;
 

@@ -18,3 +18,13 @@ path = "src/bin/xcl-corpus.rs"
 miniz_oxide = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(not(windows))'.dependencies]
+# renameat2(RENAME_NOREPLACE): the extraction must not replace a file that appeared
+# meanwhile, as on Windows.
+libc = "0.2"
+
+[features]
+# The test modules of the vendored files that need XCL's Windows-only modules
+# (`gpu::recomp::dxc`, `gpu::recomp::runner`) or its Windows-only memory probe.
+xcl_vendored_tests = []

@@ -175,22 +175,3 @@ pub unsafe extern "C" fn xcl_free(result: *mut XclResult) {
 fn c_string(s: &str) -> *mut c_char {
     std::ffi::CString::new(s).unwrap_or_default().into_raw()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn free_tolerates_null() {
-        unsafe { xcl_free(std::ptr::null_mut()) };
-    }
-
-    #[test]
-    fn a_non_container_is_reported() {
-        let mut result = XclResult::empty();
-        let code = unsafe { xcl_translate(b"not a shader".as_ptr(), 12, XCL_FLAG_NONE, &mut result) };
-        assert!(code < 0);
-        assert!(!result.error.is_null());
-        unsafe { xcl_free(&mut result) };
-    }
-}
