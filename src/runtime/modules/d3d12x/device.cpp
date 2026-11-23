@@ -34,6 +34,7 @@ AdapterWrapper adapter_wrapper = nullptr;
 // the console's resource states and layout, as the host's (defined further down)
 D3D12_RESOURCE_STATES host_state(D3D12_RESOURCE_STATES state);
 D3D12_RESOURCE_DESC host_resource_desc(const D3D12_RESOURCE_DESC &desc);
+bool mapped_address(const void *resource, std::uint64_t &address);
 template <class... Interfaces> bool is_any(REFIID iid) {
     return ((iid == __uuidof(Interfaces)) || ...);
 }
@@ -296,6 +297,21 @@ Slot *original_vtable(void *object) {
 template <class Method> Method original(void *object, std::size_t index) {
     return reinterpret_cast<Method>(original_vtable(object)[index]);
 }
+// A buffer of the title placed on a heap of the console's unified memory. A heap opened over
+// process memory takes these flags; the host's states and layout have been made already.
+HRESULT place_uma_buffer(ID3D12Device *self, ID3D12Heap *heap, std::uint64_t offset,
+                         const D3D12_RESOURCE_DESC &desc, D3D12_RESOURCE_STATES state,
+                         const D3D12_CLEAR_VALUE *clear, REFIID iid, void **resource) {
+    using Place = HRESULT(STDMETHODCALLTYPE *)(void *, ID3D12Heap *, UINT64,
+                                               const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES,
+                                               const D3D12_CLEAR_VALUE *, REFIID, void **);
+    auto host = desc;
+    host.Alignment = 0;
+    host.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        host.Flags | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+        D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+    return original<Place>(self, 29)(self, heap, offset, &host, state, clear, iid, resource);
+}
 // The host's runtime calls its own objects through their vtable too: a slot the console has
 // differently runs the console's method only when the title calls it, and the host's
 // otherwise (its callers pass the object first; the title's, for methods that return a
@@ -496,6 +512,15 @@ void *scratch_memory(ID3D12Resource *self) {
 }
 HRESULT STDMETHODCALLTYPE map_resource(ID3D12Resource *self, UINT subresource,
                                        const D3D12_RANGE *range, void **data) {
+    // A buffer in the console's unified memory is the memory the title writes to: mapping it
+    // gives the console address itself, not a copy of it.
+    if (std::uint64_t address = 0;
+        !subresource && mapped_address(self, address) &&
+        d3d12x::uma_contains(static_cast<std::uintptr_t>(address))) {
+        if (data)
+            *data = reinterpret_cast<void *>(address);
+        return S_OK;
+    }
     using Map = HRESULT(STDMETHODCALLTYPE *)(void *, UINT, const D3D12_RANGE *, void **);
     const auto result = original<Map>(self, 8)(self, subresource, range, data);
     if (SUCCEEDED(result) || !data)
@@ -514,6 +539,10 @@ HRESULT STDMETHODCALLTYPE map_resource(ID3D12Resource *self, UINT subresource,
 }
 void STDMETHODCALLTYPE unmap_resource(ID3D12Resource *self, UINT subresource,
                                       const D3D12_RANGE *range) {
+    if (std::uint64_t address = 0;
+        !subresource && mapped_address(self, address) &&
+        d3d12x::uma_contains(static_cast<std::uintptr_t>(address)))
+        return;
     {
         const std::lock_guard lock(scratch_mutex);
         if (scratch_maps.contains(self))
@@ -893,6 +922,21 @@ std::uint64_t host_address(std::uint64_t address) {
         return address;
     --found;
     return address < found->second.end ? found->second.gpu + (address - found->first) : address;
+}
+// A buffer in the unified memory: the title's address of it is the console address (the
+// window's memory itself), and the host's GPU address is the window's plus the offset in it.
+void track_console_buffer(ID3D12Resource *resource, std::uintptr_t address) {
+    const auto desc = resource->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        return;
+    const auto gpu = resource->GetGPUVirtualAddress();
+    const std::lock_guard lock(buffer_mutex);
+    for (auto old = mapped_at.lower_bound(address);
+         old != mapped_at.end() && old->first < address + desc.Width;)
+        old = mapped_at.erase(old);
+    mapped_at[address] = {address + desc.Width, gpu};
+    mapped_start[resource] = address;
+    buffers_at[address] = {address + desc.Width, resource};
 }
 void track_buffer(ID3D12Resource *resource, bool mapped = false) {
     const auto desc = resource->GetDesc();
@@ -1626,15 +1670,16 @@ HRESULT STDMETHODCALLTYPE create_placed_resource_x(ID3D12Device *self, std::uint
     std::uint64_t uma_offset = 0;
     if (uma_enabled() && uma_heap_of(address, uma_heap, uma_offset) && desc &&
         desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        using Create = HRESULT(STDMETHODCALLTYPE *)(void *, ID3D12Heap *, UINT64,
-                                                    const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES,
-                                                    const D3D12_CLEAR_VALUE *, REFIID, void **);
-        D3D12_RESOURCE_DESC host = host_resource_desc(*desc);
-        // a placed buffer in the host's memory needs the flags the console has not
-        host.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        result = original<Create>(self, 29)(self, uma_heap, uma_offset, &host, host_state(state),
-                                            clear, iid, resource);
-        if (FAILED(result)) {
+        const auto host = host_resource_desc(*desc);
+        result = place_uma_buffer(self, uma_heap, uma_offset, host, host_state(state), clear, iid,
+                                  resource);
+        if (SUCCEEDED(result) && resource && *resource) {
+            console_resource(*resource);
+            mappable_resource(*resource);
+            // the title's address of the buffer stays its console address; a view naming it
+            // is translated to the host's GPU address when the host takes it
+            track_console_buffer(static_cast<ID3D12Resource *>(*resource), address);
+        } else if (FAILED(result)) {
             std::fprintf(stderr, "[Runtime] CreatePlacedResourceX on the UMA heap at %llx: "
                                  "0x%08lx\n",
                          static_cast<unsigned long long>(uma_offset),
@@ -2281,6 +2326,7 @@ HRESULT STDMETHODCALLTYPE create_committed_resource(
         state = D3D12_RESOURCE_STATE_GENERIC_READ;
     // resource flags above the desktop's (0x100000, 0x200000 on Unreal's render targets) are
     // the console's own
+    const auto *const asked = heap;
     D3D12_RESOURCE_DESC host_desc{};
     if (desc) {
         host_desc = *desc;
@@ -2298,11 +2344,40 @@ HRESULT STDMETHODCALLTYPE create_committed_resource(
         }
         host_rules(heap, host_desc.Flags, state);
     }
+    // With the XCL shader backend a title buffer of the default heap is made directly on a
+    // heap of the console's unified memory: its console address is the memory the title and
+    // the shaders see, and the host's GPU address of it is found from the heap.
+    if (uma_enabled() && resource && asked && asked->Type == D3D12_HEAP_TYPE_DEFAULT && desc &&
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        void *const console_address = uma_alloc(host_desc.Width, 0x10000);
+        if (console_address) {
+            ID3D12Heap *uma_heap = nullptr;
+            std::uint64_t uma_offset = 0;
+            if (uma_heap_of(reinterpret_cast<std::uintptr_t>(console_address), uma_heap,
+                            uma_offset)) {
+                ID3D12Resource *placed = nullptr;
+                const auto placed_result = place_uma_buffer(
+                    self, uma_heap, uma_offset, host_desc, host_state(state), clear, iid,
+                    reinterpret_cast<void **>(&placed));
+                if (SUCCEEDED(placed_result) && placed) {
+                    console_resource(placed);
+                    mappable_resource(placed);
+                    track_console_buffer(placed,
+                                         reinterpret_cast<std::uintptr_t>(console_address));
+                    *resource = placed;
+                    return placed_result;
+                }
+                std::fprintf(stderr, "[Runtime] CreateCommittedResource on the UMA heap: "
+                                     "0x%08lx\n",
+                             static_cast<unsigned long>(placed_result));
+            }
+            uma_free(console_address);
+        }
+    }
     // All of the console's memory is the CPU's as well: a title maps a buffer of the default
     // heap and writes to it. The host only maps what is in a heap the CPU can reach, so such
     // a buffer goes in one (unless it is written by the GPU, which those heaps do not take).
     D3D12_HEAP_PROPERTIES mappable{};
-    const auto *const asked = heap;
     if (console == Target::scarlett && heap && desc && heap->Type == D3D12_HEAP_TYPE_DEFAULT &&
         desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         mappable = {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
@@ -3140,10 +3215,10 @@ void STDMETHODCALLTYPE set_graphics_root_srv(void *self, UINT index, std::uint64
     host_of(self)->SetGraphicsRootShaderResourceView(index, root_address(address));
 }
 void STDMETHODCALLTYPE set_compute_root_uav(void *self, UINT index, std::uint64_t address) {
-    host_of(self)->SetComputeRootUnorderedAccessView(index, host_address(address));
+    host_of(self)->SetComputeRootUnorderedAccessView(index, root_address(address));
 }
 void STDMETHODCALLTYPE set_graphics_root_uav(void *self, UINT index, std::uint64_t address) {
-    host_of(self)->SetGraphicsRootUnorderedAccessView(index, host_address(address));
+    host_of(self)->SetGraphicsRootUnorderedAccessView(index, root_address(address));
 }
 void STDMETHODCALLTYPE so_set_targets(void *self, UINT start, UINT count,
                                       const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) {
@@ -4227,6 +4302,9 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
     if (SUCCEEDED(result)) {
         d3d12_device = host;
         graphics::drawing_with("Direct3D 12");
+        // The unified memory of the console, opened as a heap on the host: the shaders of the
+        // XCL backend reach it through the ABI's memory windows.
+        uma_reserve();
     }
     if (ID3D12InfoQueue *queue = nullptr;
         SUCCEEDED(result) && SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&queue))))
