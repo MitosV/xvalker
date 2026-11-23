@@ -99,6 +99,12 @@ semantic difference was observed. Step 1 therefore covers the vendored translato
   `cpu_compare_ps.py` uses `/usr/bin/glslangValidator` instead of its hard-coded Windows
   path).
 
+> **Scope of this table (orchestrator review):** `exec` runs americas-recomp's own RDNA2 -> SPIR-V
+> translation, not the HLSL that xvalker's vendored XCL translator emits. The numbers below say how that
+> other translator and `cpu_ref.py` agree on GTA's shaders; they do not validate xvalker's translator.
+> Validating xvalker's HLSL against `cpu_ref.py` needs a harness that runs the dumped HLSL with the same
+> bindings and inputs (not done yet).
+
 | stage | equal (MATCH) | different (MISMATCH) | not run (SKIP) | not run (GPU_FAIL) |
 |---|---:|---:|---:|---:|
 | CS | 30 (15 changed memory) | 1 | 58 | 11 |
