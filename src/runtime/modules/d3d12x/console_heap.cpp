@@ -360,6 +360,39 @@ std::uintptr_t register_heap(ID3D12Device *device, void *owner, ID3D12Descriptor
     }
     std::memset(memory, 0, std::size_t{n} * (sampler ? sampler_slot : image_slot));
     const auto base = reinterpret_cast<std::uintptr_t>(memory);
+    if (!sampler) {
+        const std::lock_guard lock(shared_mutex);
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+        uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        for (UINT k = 0; k < n; ++k) {
+            const auto srv_h = D3D12_CPU_DESCRIPTOR_HANDLE{
+                static_cast<SIZE_T>(shared.cpu + std::uint64_t{first + 2 * k} * shared.inc)};
+            const auto uav_h = D3D12_CPU_DESCRIPTOR_HANDLE{
+                static_cast<SIZE_T>(shared.cpu + std::uint64_t{first + 2 * k + 1} * shared.inc)};
+            device->CreateShaderResourceView(nullptr, &srv, srv_h);
+            device->CreateUnorderedAccessView(nullptr, nullptr, &uav, uav_h);
+            null_words(reinterpret_cast<std::uint32_t *>(base + std::uint64_t{k} * image_slot),
+                       first + 2 * k, false);
+        }
+    } else {
+        D3D12_SAMPLER_DESC desc{};
+        desc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        desc.AddressU = desc.AddressV = desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        desc.MaxLOD = D3D12_FLOAT32_MAX;
+        for (UINT k = 0; k < n; ++k) {
+            const auto h = D3D12_CPU_DESCRIPTOR_HANDLE{
+                static_cast<SIZE_T>(pc_cpu + std::uint64_t{k} * pc_stride)};
+            device->CreateSampler(&desc, h);
+            null_words(reinterpret_cast<std::uint32_t *>(base + std::uint64_t{k} * sampler_slot),
+                       k, true);
+        }
+    }
     std::uint64_t actual_cpu = pc_cpu, actual_gpu = pc_gpu;
     UINT actual_inc = pc_stride;
     if (!sampler) {
