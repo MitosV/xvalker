@@ -255,3 +255,11 @@ exceeded the 32 KB group limit and DXC reported "vertex plus primitive output si
 greater than 32768" (19 MS programs). Round the stride the same way before deciding
 how many groups a mesh record needs.
 
+## `src/gpu/recomp/emit.rs` (groupshared budget with cross-half exchange)
+
+The groupshared exchange added 64–1024 dwords on top of the emitter's full 32 KB
+`xcl_lds`, so DXC rejected 100 compute programs with "Total Thread Group Shared Memory
+used ... is 33024, exceeding maximum: 32768". Reserve 64 dwords per logical wave64 in
+the workgroup for `xcl_xchg`, size `xcl_lds` from the same 8192-dword budget, and use
+the matching index mask for both. This also keeps multi-wave workgroups from indexing
+past the exchange array.

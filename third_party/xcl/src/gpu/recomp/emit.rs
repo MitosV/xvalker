@@ -313,6 +313,31 @@ impl Em {
         std::mem::take(&mut self.out)
     }
 
+    /// Groupshared slots reserved for cross-half exchange: 64 per logical wave64 in
+    /// the workgroup. The emitter already budgets the D3D12 LDS limit (32 KB), so the
+    /// program's own array shrinks by the same number of dwords when both are used.
+    fn xchg_slots(&self) -> u32 {
+        if !matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
+            || self.opt.host_map.exchange.is_empty()
+        {
+            return 0;
+        }
+        let threads = match &self.opt.mode {
+            Mode::Compute(cs) => cs.threads.iter().product::<u32>(),
+            Mode::Mesh(ms) => ms.threads,
+            _ => 64,
+        };
+        64 * threads.max(1).div_ceil(64)
+    }
+
+    fn lds_words(&self) -> u32 {
+        8192 - self.xchg_slots()
+    }
+
+    fn lds_mask(&self) -> u32 {
+        self.lds_words() - 1
+    }
+
     fn line(&mut self, s: &str) {
         for _ in 0..self.indent {
             self.out.push_str("    ");
@@ -3363,7 +3388,8 @@ impl Em {
         let addr = self.vreg(f("ADDR"));
         let a = format!("{t}_ad");
         self.line(&format!("uint {a} = {addr};"));
-        let lds = |at: String| format!("xcl_lds[(({at}) >> 2) & 8191u]");
+        let mask = self.lds_mask();
+        let lds = |at: String| format!("xcl_lds[(({at}) >> 2) & {mask}u]");
         let mut st = Vec::new();
         let rw = |n: &str| -> Option<(bool, u64, u64, bool)> {
             // (write?, dwords per element, stride of offsets (bytes), two elements?)
@@ -3519,7 +3545,11 @@ impl Em {
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
         h.push_str(PRELUDE);
-        if matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_)) && !self.opt.host_map.exchange.is_empty() {
+        let xchg_slots = self.xchg_slots();
+        let lds_words = self.lds_words();
+        let lds_mask = self.lds_mask();
+        if xchg_slots > 0 {
+            let _ = writeln!(h, "#define XCL_XCHG_SLOTS {xchg_slots}u");
             h.push_str(PRELUDE_XCHG);
         }
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
@@ -3545,7 +3575,7 @@ impl Em {
                 let lanes = if host_split { 32 } else if self.opt.wave64 || split { 64 } else { 32 };
                 let threads = if host_split { 64 } else { lanes };
                 if self.uses_lds {
-                    h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
+                    let _ = writeln!(h, "groupshared uint xcl_lds[{lds_words}]; // D3D12 limit: 32 KB (the console allows 64 KB)");
                 }
                 let _ = writeln!(h, "[WaveSize({lanes})]\n[numthreads({threads}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex)\n{{");
                 if host_split {
@@ -3610,7 +3640,7 @@ impl Em {
                 let host_split = self.opt.host_wave == 32 && self.opt.wave64;
                 let lanes = if host_split { 32 } else if self.opt.wave64 { 64 } else { 32 };
                 if self.uses_lds {
-                    h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
+                    let _ = writeln!(h, "groupshared uint xcl_lds[{lds_words}]; // D3D12 limit: 32 KB (the console allows 64 KB)");
                 }
                 let [x, y, z] = cs.threads;
                 let _ = writeln!(
@@ -3654,7 +3684,7 @@ impl Em {
                 let native_lanes = if !self.opt.wave64 || split_wave32 { 32 } else { 64 };
                 let lanes = if self.opt.wave64 { 64 } else { 32 };
                 if self.uses_lds {
-                    h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
+                    let _ = writeln!(h, "groupshared uint xcl_lds[{lds_words}]; // D3D12 limit: 32 KB (the console allows 64 KB)");
                 }
                 let t = ms.threads;
                 let _ = writeln!(h, "[WaveSize({native_lanes})]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{{");
@@ -3689,7 +3719,7 @@ impl Em {
                     let maxt = g.max_vertex_count.saturating_sub(2).max(1);
                     let nreg = g.input_registers();
                     let fetched = super::fetched_registers(&g.es_inputs);
-                    h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
+                    let _ = writeln!(h, "groupshared uint xcl_lds[{lds_words}]; // D3D12 limit: 32 KB (the console allows 64 KB)");
                     h.push_str("[WaveSize(64)]\n[numthreads(64, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{\n");
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                     let _ = writeln!(h, "    uint xcl_total = io.Load({}u);\n    uint xcl_vin = io.Load({}u);", super::IO_GS_PRIMS * 4, super::IO_GS_VERTICES * 4);
@@ -3731,7 +3761,7 @@ impl Em {
                     let _ = writeln!(h, "        uint src = xcl_gs_base + k * {vb}u;\n        uint dst = xcl_rec + {MESH_HEADER}u + vi * {vd}u;");
                     for (slot, r) in regs.iter().enumerate() {
                         for c in 0..4 {
-                            let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[((src + {}u) >> 2) & 8191u]);", 4 * slot + c, 16 * r + 4 * c as u32);
+                            let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[((src + {}u) >> 2) & {lds_mask}u]);", 4 * slot + c, 16 * r + 4 * c as u32);
                         }
                     }
                     h.push_str("    }\n");
@@ -3751,7 +3781,7 @@ impl Em {
                 let nreg = g.input_registers();
                 let fetched = super::fetched_registers(&g.es_inputs);
                 let native_lanes = if self.opt.geometry_wave32 { 32 } else { 64 };
-                h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
+                let _ = writeln!(h, "groupshared uint xcl_lds[{lds_words}]; // D3D12 limit: 32 KB (the console allows 64 KB)");
                 let _ = writeln!(h, "[WaveSize({native_lanes})]\n[numthreads(64, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{{");
                 let _ = writeln!(h, "    uint xcl_total = io.Load({}u);\n    uint xcl_vin = io.Load({}u);", super::IO_GS_PRIMS * 4, super::IO_GS_VERTICES * 4);
                 let _ = writeln!(h, "    uint xcl_p0 = gid.x * {pg}u;\n    uint xcl_np = xcl_total > xcl_p0 ? min({pg}u, xcl_total - xcl_p0) : 0u;\n    uint xcl_nv = 3u * xcl_np;");
@@ -3812,7 +3842,7 @@ impl Em {
                 let _ = writeln!(h, "        uint src = xcl_gs_base + k * {vb}u;\n        uint dst = xcl_rec + {MESH_HEADER}u + vi * {vd}u;");
                 for (slot, r) in regs.iter().enumerate() {
                     for c in 0..4 {
-                        let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[((src + {}u) >> 2) & 8191u]);", 4 * slot + c, 16 * r + 4 * c as u32);
+                        let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[((src + {}u) >> 2) & {lds_mask}u]);", 4 * slot + c, 16 * r + 4 * c as u32);
                     }
                 }
                 h.push_str("    }\n");
@@ -4697,7 +4727,7 @@ uint fclass64(double f) {
 // Each half publishes its VGPR value at its own lane slot, then reads the lane chosen
 // by the RDNA2 instruction from the other half. Declared only when the program needs it.
 const PRELUDE_XCHG: &str = r#"
-groupshared uint xcl_xchg[64];
+groupshared uint xcl_xchg[XCL_XCHG_SLOTS];
 uint xcl_xchg_rla(uint v, uint lane) {
     xcl_xchg[xcl_xchg_base + lane_id] = v;
     GroupMemoryBarrierWithGroupSync();
