@@ -4,8 +4,11 @@
 
 - Vendored decoder: `third_party/bcpack/` (the `xbox-emulator` project's
   `xcrdapi` BCPack module, byte for byte; see its README for the licenses).
+- `src/bc1_history.rs`, `src/bc1_quad.rs`: the BC1 built-in history and the
+  quadrant codes, as the reference decoder (`tools/bcpack.py` of the Leonida
+  project, GPL-3.0) has them.
 - `src/bc345.rs`: BC3, BC4 and BC5, a Rust port of Leonida's strict
-  rebuilders (`tools/bcpack.py` in that project, GPL-3.0).
+  rebuilders.
 
 ## The C ABI
 
@@ -25,6 +28,16 @@ destination when it fails, and every failure has a line on stderr.
 Modes 2 (BC2), 6 (BC6H) and 7 (BC7) are refused: their block layouts are not
 confirmed, and the runtime does not guess.
 
+## The tables
+
+The vendored module brings a window of its own for the BC1 built-in history
+and its own quadrant codes. The crate uses the reference decoder's tables
+instead: they differ in 76 of the 256 history entries and in 4 of the 256
+quadrant codes, and the reference measured its own against the game's
+textures. The entries the reference does not confirm are absent, so a chunk
+that reaches one of them is refused instead of being decoded with guessed
+endpoints, the way the reference refuses it.
+
 ## Building
 
 ```sh
@@ -36,5 +49,27 @@ executable (by default `build/linux`, the folder `tools/build-linux.sh` uses).
 The DLL is not part of the CMake build; the runtime loads it on the first
 compressed request and fails that request when it is not there.
 
-`cargo test` runs the vendored tests (with their golden hashes) and the
-tests of this crate.
+## The tests
+
+```sh
+cargo test
+```
+
+runs the vendored tests (with their golden hashes), the test vectors in
+`tests/data/` (made by `make_fixtures.py` with the reference project's
+encoder) and the comparison with the reference decoder over the game's own
+chunks.
+
+The game's chunks are not in the repository. `extract_samples.py` writes them,
+and what the reference decoder makes of them, into
+`~/.cache/xvalker/bcpack-samples`:
+
+```sh
+python3 tools/bcpack/extract_samples.py <pool.ttpf> [<pool.ttpf> ...]
+```
+
+The comparison test reads that folder (`$XV_BCPACK_SAMPLES` names another
+one) and does nothing when it is not there.
+
+`cargo run --example decode -- <mode> <chunk> <size> [out]` decodes one
+chunk and writes its blocks.
