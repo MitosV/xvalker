@@ -1047,10 +1047,10 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
 /// (VS / PS: the driver picks the wave size): reads of a lane ≥ 32 or of a lane chosen at run
 /// time. A wave32 program in 64-lane waves is handled (the halves act as separate waves).
 pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
-    wave_hazards_with(code, &HostWaveMap::default())
+    wave_hazards_with(code, &HostWaveMap::default(), false)
 }
 
-fn wave_hazards_with(code: &[u8], map: &HostWaveMap) -> BTreeSet<&'static str> {
+fn wave_hazards_with(code: &[u8], map: &HostWaveMap, allow_exchange: bool) -> BTreeSet<&'static str> {
     let mut out = BTreeSet::new();
     let mut off = 0;
     while off + 4 <= code.len() {
@@ -1058,7 +1058,7 @@ fn wave_hazards_with(code: &[u8], map: &HostWaveMap) -> BTreeSet<&'static str> {
         off += d.len;
         match d.inst.name {
             "V_READLANE_B32" | "V_WRITELANE_B32" => {
-                if map.is_rewritten(d.pc) {
+                if map.is_rewritten(d.pc) || (allow_exchange && map.exchange.contains(&d.pc)) {
                     continue;
                 }
                 let lane = rdna2::field_value(d.enc, &d.words, "SRC1").unwrap_or(0);
@@ -1193,7 +1193,8 @@ fn host_hazards_with(code: &[u8], mode: &Mode, host_wave: u32, map: &HostWaveMap
     }
     match mode {
         Mode::Mesh(_) | Mode::Geometry(_) => geometry_wave32_hazards_with(code, map),
-        _ => wave_hazards_with(code, map),
+        Mode::Kernel | Mode::Compute(_) => wave_hazards_with(code, map, true),
+        Mode::Vertex(_) | Mode::Pixel(_) => wave_hazards_with(code, map, false),
     }
 }
 

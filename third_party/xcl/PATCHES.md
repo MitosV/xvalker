@@ -238,3 +238,10 @@ reads and the recognized DPP/permlane chain. `add`/`xor` are not classified as i
 A `v_readlane_b32` whose source VGPR is proven uniform over the wave (SGPR broadcast or
 folded reduction) is emitted as the invoking lane's own value. SGPRs are seeded as uniform
 except saved-EXEC registers. The corresponding readlane is no longer refused.
+
+## Groupshared cross-half exchange on a 32-lane host
+
+Compute/mesh/geometry run one logical wave64 as two 32-lane subgroups in one workgroup.
+`ds_bpermute`, `v_readlane` and `v_writelane` of the other half publish values in
+`groupshared uint xcl_xchg[64]` and exchange them with two group barriers. VS/PS have no
+workgroup and still refuse these reads (one invocation per fragment/vertex).

@@ -2882,6 +2882,7 @@ impl Em {
             "v_readlane_b32" => {
                 let uniform = self.opt.host_map.uniform.contains(&self.pc);
                 let idempotent = self.opt.host_map.idempotent.contains(&self.pc);
+                let exchange = self.opt.host_map.exchange.contains(&self.pc);
                 let t = self.t();
                 if uniform {
                     // A wave-uniform value is the same in the invoking lane.
@@ -2890,6 +2891,8 @@ impl Em {
                     // Each half reduced its own lanes; the upper half's lane 32+k is
                     // the invoking half's lane k for an idempotent operation.
                     self.line(&format!("uint {t} = rla_local({a}, {b} & 31u);"));
+                } else if exchange && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_)) {
+                    self.line(&format!("uint {t} = xcl_xchg_rla({a}, {b} & 63u);"));
                 } else {
                     self.line(&format!("uint {t} = rla({a}, {b} & {wmask}u);"));
                 }
@@ -2900,7 +2903,13 @@ impl Em {
                 // ignores EXEC
                 if let Dst::V(n) = &dst {
                     let v = self.vreg(*n);
-                    self.line(&format!("if (lane_id == ({b} & {wmask}u)) {v} = {a};"));
+                    if self.opt.host_map.exchange.contains(&self.pc) && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_)) {
+                        let t = self.t();
+                        self.line(&format!("uint {t} = xcl_xchg_write({a}, {b} & 63u);"));
+                        self.line(&format!("if (lane_id == ({b} & {wmask}u)) {v} = {t};"));
+                    } else {
+                        self.line(&format!("if (lane_id == ({b} & {wmask}u)) {v} = {a};"));
+                    }
                 }
                 return Ok(());
             }
@@ -3328,7 +3337,13 @@ impl Em {
             "ds_bpermute_b32" => {
                 let (a, v) = (self.vreg(f("ADDR")), self.vreg(f("DATA0")));
                 let m = if self.opt.wave64 { 63 } else { 31 };
-                self.line(&format!("uint {t} = rla({v}, (({a} + {off16}u) >> 2) & {m}u);"));
+                let lane = format!("(({a} + {off16}u) >> 2) & {m}u");
+                let expr = if self.opt.host_map.exchange.contains(&self.pc) && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_)) {
+                    format!("xcl_xchg_rla({v}, {lane})")
+                } else {
+                    format!("rla({v}, {lane})")
+                };
+                self.line(&format!("uint {t} = {expr};"));
                 let dst = Dst::V(f("VDST"));
                 self.write32(&dst, &t);
                 return Ok(());
@@ -3504,6 +3519,9 @@ impl Em {
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
         h.push_str(PRELUDE);
+        if matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_)) && !self.opt.host_map.exchange.is_empty() {
+            h.push_str(PRELUDE_XCHG);
+        }
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
         h.push_str(PRELUDE_MEM);
@@ -3521,12 +3539,18 @@ impl Em {
             Mode::Kernel => {
                 // hw_wave 64 with a wave32 program: the wave-size independent form (two halves)
                 let split = self.opt.hw_wave == 64 && !self.opt.wave64;
-                let lanes = if self.opt.wave64 || split { 64 } else { 32 };
+                // A 32-lane host runs each logical wave64 as two native wave32 halves in one
+                // workgroup, so cross-half reads can use groupshared exchange.
+                let host_split = self.opt.host_wave == 32 && self.opt.wave64;
+                let lanes = if host_split { 32 } else if self.opt.wave64 || split { 64 } else { 32 };
+                let threads = if host_split { 64 } else { lanes };
                 if self.uses_lds {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }
-                let _ = writeln!(h, "[WaveSize({lanes})]\n[numthreads({lanes}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex)\n{{");
-                if split {
+                let _ = writeln!(h, "[WaveSize({lanes})]\n[numthreads({threads}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex)\n{{");
+                if host_split {
+                    h.push_str("    xcl_half = (gi >> 5) & 1u;\n    xcl_logical_wave64 = true;\n    xcl_xchg_base = (gi >> 6) * 64u;\n    uint xcl_hw_lane = WaveGetLaneIndex() + 32u * xcl_half;\n    lane_id = xcl_hw_lane;\n");
+                } else if split {
                     h.push_str("    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n");
                 } else {
                     h.push_str("    uint xcl_hw_lane = WaveGetLaneIndex();\n    lane_id = xcl_hw_lane;\n");
@@ -3583,7 +3607,8 @@ impl Em {
                 h.push_str("    return xo;\n}\n");
             }
             Mode::Compute(cs) => {
-                let lanes = if self.opt.wave64 { 64 } else { 32 };
+                let host_split = self.opt.host_wave == 32 && self.opt.wave64;
+                let lanes = if host_split { 32 } else if self.opt.wave64 { 64 } else { 32 };
                 if self.uses_lds {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }
@@ -3592,7 +3617,11 @@ impl Em {
                     h,
                     "[WaveSize({lanes})]\n[numthreads({x}, {y}, {z})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
                 );
-                h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                if host_split {
+                    h.push_str("    xcl_half = ((gi & 63u) >> 5);\n    xcl_logical_wave64 = true;\n    xcl_xchg_base = (gi / 64u) * 64u;\n    lane_id = WaveGetLaneIndex() + 32u * xcl_half;\n");
+                } else {
+                    h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                }
                 load_sgprs(&mut h);
                 // system SGPRs after the user data: enabled group ids, then TG_SIZE
                 let mut next = cs.user_sgprs as u64;
@@ -3630,7 +3659,7 @@ impl Em {
                 let t = ms.threads;
                 let _ = writeln!(h, "[WaveSize({native_lanes})]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{{");
                 if split_wave32 {
-                    h.push_str("    xcl_half = (gi >> 5) & 1u;\n    xcl_logical_wave64 = true;\n        lane_id = WaveGetLaneIndex() + 32u * xcl_half;\n");
+                    h.push_str("    xcl_half = (gi >> 5) & 1u;\n    xcl_logical_wave64 = true;\n    xcl_xchg_base = (gi / 64u) * 64u;\n    lane_id = WaveGetLaneIndex() + 32u * xcl_half;\n");
                 } else {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
@@ -3734,7 +3763,7 @@ impl Em {
                     let _ = writeln!(h, "        bool xcl_es_phase = {};", if es { "true" } else { "false" });
                     let _ = writeln!(h, "        uint xcl_entry_pc = {}u;", if es { 0 } else { gs_start });
                     if self.opt.geometry_wave32 {
-                        h.push_str("        lane_id = gi; xcl_half = gi >> 5; xcl_logical_wave64 = true;\n");
+                        h.push_str("        lane_id = gi; xcl_half = gi >> 5; xcl_logical_wave64 = true; xcl_xchg_base = 0u;\n");
                     } else {
                         h.push_str("        lane_id = gi; xcl_half = 0u; xcl_logical_wave64 = false;\n");
                     }
@@ -4473,6 +4502,8 @@ static bool xcl_logical_wave64 = false;
 // An idempotent wave reduction is folded in each half separately: reading the upper
 // half's lane 32+k is the same as reading lane k of the invoking half.
 uint rla_local(uint v, uint l) { return WaveReadLaneAt(v, l & 31u); }
+// Base slot of the current logical wave in xcl_xchg (64 lanes per wave).
+static uint xcl_xchg_base = 0u;
 bool lanebit(uint lo, uint hi) { return ((select(lane_id < 32u, lo, hi) >> (lane_id & 31u)) & 1u) != 0u; }
 uint2 ballot(bool b) {
     uint4 m = WaveActiveBallot(b);
@@ -4657,3 +4688,23 @@ uint fclass64(double f) {
 }
 "#;
 
+// Cross-half lane exchange for a logical wave64 running as two wave32 subgroups.
+// Each half publishes its VGPR value at its own lane slot, then reads the lane chosen
+// by the RDNA2 instruction from the other half. Declared only when the program needs it.
+const PRELUDE_XCHG: &str = r#"
+groupshared uint xcl_xchg[64];
+uint xcl_xchg_rla(uint v, uint lane) {
+    xcl_xchg[xcl_xchg_base + lane_id] = v;
+    GroupMemoryBarrierWithGroupSync();
+    uint r = xcl_xchg[xcl_xchg_base + (lane & 63u)];
+    GroupMemoryBarrierWithGroupSync();
+    return r;
+}
+uint xcl_xchg_write(uint v, uint lane) {
+    xcl_xchg[xcl_xchg_base + (lane & 63u)] = v;
+    GroupMemoryBarrierWithGroupSync();
+    uint r = xcl_xchg[xcl_xchg_base + (lane & 63u)];
+    GroupMemoryBarrierWithGroupSync();
+    return r;
+}
+"#;

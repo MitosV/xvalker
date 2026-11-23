@@ -107,13 +107,25 @@ pub fn analyze(code: &[u8]) -> HostWaveMap {
                     Val::HalfReduce(_) if known_lane => {
                         map.idempotent.insert(d.pc);
                     }
+                    _ if !(128..=159).contains(&lane) => {
+                        // Any other cross-half read can be exchanged through groupshared
+                        // memory in a stage with a workgroup (compute / mesh / geometry).
+                        map.exchange.insert(d.pc);
+                    }
                     _ => {}
                 }
                 sres = sw.first().copied().map(|r| (r, Val::Uniform));
             }
+            "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" => {
+                // A workgroup-backed stage can exchange the 64 lanes through LDS.
+                map.exchange.insert(d.pc);
+            }
             "V_WRITELANE_B32" => {
                 res = kind_v(vr.first().copied().unwrap_or(0));
-                let _lane = rdna2::field_value(d.enc, &d.words, "SRC1").unwrap_or(0);
+                let lane = rdna2::field_value(d.enc, &d.words, "SRC1").unwrap_or(0);
+                if !(128..=159).contains(&lane) {
+                    map.exchange.insert(d.pc);
+                }
             }
             "V_MOV_B32" | "V_MOVDX_B32" => {
                 if let Some(&r) = vr.first() {
