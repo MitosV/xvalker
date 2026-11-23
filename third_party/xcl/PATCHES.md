@@ -207,9 +207,59 @@ must not clobber a file that appeared meanwhile. Linux has `renameat2` with
 +        windows_sys::Win32::Foundation::SetLastError(122);
 ```
 
+## `src/gpu/recomp/mod.rs` (wave64 on a 32-lane host)
+
+The corpus tool models an NVIDIA GPU (host subgroup 32), so wave64 programs must say
+which cross-half operations their host cannot perform. Added to the vendored emitter:
+
+- `Options.host_wave: u32` (0 = native wave64, as before; 32 = two native wave32 halves).
+- `host_hazards(code, mode, host_wave)`: `geometry_wave32_hazards` for mesh/geometry (the split
+  forms also carry a mask), `wave_hazards` for the other stages.
+- `translate` refuses a wave64 program when `host_hazards` is not empty, before emitting HLSL.
+- `translate_geometry` / `translate_mesh` pass `host_wave = 32` when they split the wave.
+
+No other vendored file is changed by these edits.
+
 ## xvalker build of the DLL (orchestrator)
 
 `src/gpu/shader.rs`: the 11 `#[cfg(windows)]` gates added above are `#[cfg(xcl_runtime)]`
 (a cfg that is never set), so the Windows DLL does not build XCL's runtime capture code.
 `src/rpf.rs` is unchanged; its Windows branch uses `windows-sys`, a Windows-only dependency of
 `tools/xcl-recomp`.
+## `src/gpu/recomp/wave64_host.rs` and emit/hazard changes (idempotent reductions)
+
+A 32-lane host cannot read a wave64's lane `32+k`. A VGPR whose value is a min/max/and/or
+reduction over DPP/permlanex16 is reduced in each half separately; `v_readlane_b32 ..., 32+k`
+is emitted as `WaveReadLaneAt(v, k & 31)` (`rla_local`). The hazard detectors skip those
+reads and the recognized DPP/permlane chain. `add`/`xor` are not classified as idempotent.
+
+## Uniform readlane on a 32-lane host
+
+A `v_readlane_b32` whose source VGPR is proven uniform over the wave (SGPR broadcast or
+folded reduction) is emitted as the invoking lane's own value. SGPRs are seeded as uniform
+except saved-EXEC registers. The corresponding readlane is no longer refused.
+
+## Groupshared cross-half exchange on a 32-lane host
+
+Compute/mesh/geometry run one logical wave64 as two 32-lane subgroups in one workgroup.
+`ds_bpermute`, `v_readlane` and `v_writelane` of the other half publish values in
+`groupshared uint xcl_xchg[64]` and exchange them with two group barriers. VS/PS have no
+workgroup and still refuse these reads (one invocation per fragment/vertex).
+
+## `src/gpu/recomp/emit.rs` (mesh pass-through vertex stride)
+
+`passthrough_split` budgeted the per-vertex output as `16 * (1 + elements)`, but DXC's
+mesh validator pads the stride to a power of two of 16-byte elements (SV_Position
+included): 21 outputs cost 32 slots = 512 bytes per vertex. With 78 vertices that
+exceeded the 32 KB group limit and DXC reported "vertex plus primitive output size is
+greater than 32768" (19 MS programs). Round the stride the same way before deciding
+how many groups a mesh record needs.
+
+## `src/gpu/recomp/emit.rs` (groupshared budget with cross-half exchange)
+
+The groupshared exchange added 64–1024 dwords on top of the emitter's full 32 KB
+`xcl_lds`, so DXC rejected 100 compute programs with "Total Thread Group Shared Memory
+used ... is 33024, exceeding maximum: 32768". Reserve 64 dwords per logical wave64 in
+the workgroup for `xcl_xchg`, size `xcl_lds` from the same 8192-dword budget, and use
+the matching index mask for both. This also keeps multi-wave workgroups from indexing
+past the exchange array.

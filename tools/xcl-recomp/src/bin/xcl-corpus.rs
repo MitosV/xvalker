@@ -96,6 +96,8 @@ struct StageStats {
     pub wave32: usize,
     /// programs with a wave hazard (a cross-lane read that a 32-lane wave cannot do)
     pub wave_hazards: usize,
+    /// programs refused for the host's wave size, by hazard kind (may overlap)
+    pub refused_hazards: BTreeMap<String, usize>,
     /// the translate errors, by message
     pub translate_error_groups: BTreeMap<String, usize>,
     /// one example program name per translate error message
@@ -118,6 +120,9 @@ impl StageStats {
         self.wave64 += other.wave64;
         self.wave32 += other.wave32;
         self.wave_hazards += other.wave_hazards;
+        for (k, v) in &other.refused_hazards {
+            *self.refused_hazards.entry(k.clone()).or_default() += v;
+        }
         for (k, v) in &other.translate_error_groups {
             *self.translate_error_groups.entry(k.clone()).or_default() += v;
         }
@@ -150,12 +155,22 @@ struct Totals {
     pub translate_errors: usize,
     /// programs of a mode the corpus does not compile (GS)
     pub skipped: usize,
+    /// ES+GS pairs assembled and translated through XCL's two-pass path
+    pub gs_pairs: usize,
+    /// ES+GS pairs XCL could not assemble / translate
+    pub gs_pair_errors: usize,
+    /// DXIL jobs compiled from the two-pass geometry programs
+    pub gs_pair_compiled: usize,
+    /// DXIL jobs of the two-pass geometry programs that failed
+    pub gs_pair_compile_errors: usize,
     /// wave64 programs
     pub wave64: usize,
     /// wave32 programs
     pub wave32: usize,
     /// programs with a wave hazard
     pub wave_hazards: usize,
+    /// programs refused for the host's wave size, by hazard kind (may overlap)
+    pub refused_hazards: BTreeMap<String, usize>,
     /// HLSL compiled by DXC
     pub compiled: usize,
     /// HLSL that failed to compile
@@ -175,9 +190,16 @@ impl Totals {
         self.translated += other.translated;
         self.translate_errors += other.translate_errors;
         self.skipped += other.skipped;
+        self.gs_pairs += other.gs_pairs;
+        self.gs_pair_errors += other.gs_pair_errors;
+        self.gs_pair_compiled += other.gs_pair_compiled;
+        self.gs_pair_compile_errors += other.gs_pair_compile_errors;
         self.wave64 += other.wave64;
         self.wave32 += other.wave32;
         self.wave_hazards += other.wave_hazards;
+        for (k, v) in &other.refused_hazards {
+            *self.refused_hazards.entry(k.clone()).or_default() += v;
+        }
         self.compiled += other.compiled;
         self.compile_errors += other.compile_errors;
         self.incomplete += other.incomplete;
@@ -307,7 +329,7 @@ impl Dump {
 }
 
 /// Translate, compile and optionally dump one record.
-fn process(name: &str, blob: &[u8], record: usize, compile: bool, totals: &mut Totals, dump: Option<&Dump>) {
+fn process(name: &str, blob: &[u8], record: usize, compile: bool, host_wave: u32, totals: &mut Totals, dump: Option<&Dump>) {
     totals.records += 1;
     if dump.is_some_and(Dump::full) {
         return;
@@ -344,18 +366,31 @@ fn process(name: &str, blob: &[u8], record: usize, compile: bool, totals: &mut T
                 stats.wave32 += 1;
                 totals.wave32 += 1;
             }
-            let hazards = recomp::wave_hazards(code);
+            let hazards = if host_wave == 32 { recomp::host_hazards(code, &mode, host_wave) } else { recomp::wave_hazards(code) };
             if !hazards.is_empty() {
                 stats.wave_hazards += 1;
                 totals.wave_hazards += 1;
             }
 
-            let opt = recomp::Options { mode: mode.clone(), wave64, ..Default::default() };
+            // A 32-lane host runs a wave64 program in two native wave32 halves.
+            let opt = recomp::Options {
+                mode: mode.clone(),
+                wave64,
+                hw_wave: host_wave,
+                geometry_wave32: host_wave == 32 && matches!(mode, recomp::Mode::Geometry(_)),
+                mesh_wave32: host_wave == 32 && matches!(mode, recomp::Mode::Mesh(_)),
+                host_wave,
+                ..Default::default()
+            };
             let translation = match recomp::translate(code, &opt) {
                 Ok(t) => t,
                 Err(e) => {
                     stats.translate_errors += 1;
                     totals.translate_errors += 1;
+                    for hazard in &hazards {
+                        *stats.refused_hazards.entry((*hazard).to_string()).or_default() += 1;
+                        *totals.refused_hazards.entry((*hazard).to_string()).or_default() += 1;
+                    }
                     let message = e.lines().next().unwrap_or(&e).trim().to_string();
                     *stats.translate_error_groups.entry(message.clone()).or_default() += 1;
                     stats.translate_error_examples.entry(message).or_insert_with(|| name.to_string());
@@ -403,15 +438,85 @@ fn process(name: &str, blob: &[u8], record: usize, compile: bool, totals: &mut T
     }
 }
 
+/// The ES variant of a VS and a GS record share the name's hash; the pack holds one
+/// of each per geometry program. Assemble them the way XCL's `console_geometry` does
+/// and compile the compute + mesh pass-through pair.
+fn process_gs_pairs(input: &Input, compile: bool, host_wave: u32, totals: &mut Totals) {
+    let key = |name: &str| -> String {
+        // Input::get includes the record offset: "NAME @0x...".
+        let name = name.split(" @").next().unwrap_or(name);
+        name.split_once('_').map(|(_, tail)| tail).unwrap_or(name).trim_end_matches("_Wrapped").to_string()
+    };
+    let mut es: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+    let mut gs: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+    for i in 0..input.len() {
+        let (name, blob) = input.get(i);
+        let Some(blob) = blob else { continue };
+        let Some(sh) = xbox::parse(&blob) else { continue };
+        let hw = sh.fssm.first().and_then(|f| f.stages.first()).map(|s| s.hw);
+        match (sh.stage.as_str(), hw) {
+            ("VS", Some(2)) => es.entry(key(&name)).or_default().push(blob),
+            ("GS", Some(3)) => gs.entry(key(&name)).or_default().push(blob),
+            _ => {}
+        }
+    }
+    for (name, programs) in gs {
+        let Some(es_programs) = es.remove(&name) else {
+            eprintln!("xcl-corpus: GS {name}: no ES variant in the pack");
+            totals.gs_pair_errors += programs.len();
+            continue;
+        };
+        if es_programs.len() != programs.len() {
+            eprintln!("xcl-corpus: GS {name}: {} programs but {} ES variants", programs.len(), es_programs.len());
+            totals.gs_pair_errors += programs.len().max(es_programs.len());
+            continue;
+        }
+        for (es_blob, gs_blob) in es_programs.into_iter().zip(programs) {
+            let (code, interface) = match recomp::geometry_program(&es_blob, &gs_blob) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("xcl-corpus: GS {name}: {e}");
+                    totals.gs_pair_errors += 1;
+                    continue;
+                }
+            };
+            let translation = match recomp::translate_geometry(&code, interface.clone(), host_wave == 32) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("xcl-corpus: GS {name}: {e}");
+                    totals.gs_pair_errors += 1;
+                    continue;
+                }
+            };
+            totals.gs_pairs += 1;
+            if !compile {
+                continue;
+            }
+            let passthrough = recomp::mesh_passthrough(&interface.record());
+            for (profile, source) in [("cs_6_6", translation.hlsl.as_str()), ("ms_6_6", passthrough.as_str())] {
+                match dxc::compile_cached(source, "main", profile) {
+                    Ok(_) => totals.gs_pair_compiled += 1,
+                    Err(e) => {
+                        eprintln!("xcl-corpus: GS {name} {profile}: {}", dxc_error_line(&e));
+                        totals.gs_pair_compile_errors += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn usage() -> ! {
     eprintln!(
-        "xcl-corpus <shaders.rpf | folder> [--compile] [--jobs N] [--limit N] [--json out.json]\n\
+        "xcl-corpus <shaders.rpf | folder> [--compile] [--jobs N] [--limit N] [--host-wave 32|64] [--json out.json]\n\
          xcl-corpus <shaders.rpf | folder> --dump-hlsl DIR --limit N --stage cs|ps\n\
          \n\
          Translates every program of a console shader pack with XCL's recompiler.\n\
          With --compile the HLSL is compiled with the Linux dxc CLI (XCL's arguments).\n\
          With --dump-hlsl the first N translated programs of --stage are written as\n\
          .hlsl files to DIR (limit counts records in the other modes).\n\
+         --host-wave 32 models a GPU with 32-lane subgroups: wave64 mesh/geometry programs\n\
+         run as two halves and wave64 programs with cross-half hazards are refused.\n\
          \n\
          Environment:\n\
          \x20 XCL_DXC        the dxc executable (default: dxc on the PATH)\n\
@@ -426,6 +531,7 @@ fn main() {
     let mut compile = false;
     let mut jobs = 24usize;
     let mut limit = usize::MAX;
+    let mut host_wave = 0u32;
     let mut json: Option<PathBuf> = None;
     let mut dump: Option<PathBuf> = None;
     let mut dump_stage: Option<Stage> = None;
@@ -440,6 +546,13 @@ fn main() {
             "--limit" => {
                 i += 1;
                 limit = args.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+            }
+            "--host-wave" => {
+                i += 1;
+                host_wave = args.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+                if host_wave != 32 && host_wave != 64 {
+                    usage();
+                }
             }
             "--json" => {
                 i += 1;
@@ -574,7 +687,7 @@ fn main() {
                             totals.inflate_errors += 1;
                             continue;
                         };
-                        process(&name, &blob, i, compile, &mut totals, dumper.as_ref());
+                        process(&name, &blob, i, compile, host_wave, &mut totals, dumper.as_ref());
                         let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                         if d % 1000 == 0 {
                             eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
@@ -590,15 +703,18 @@ fn main() {
     for part in &parts {
         totals.merge(part);
     }
+    if compile {
+        process_gs_pairs(&input, compile, host_wave, &mut totals);
+    }
 
     if let Some(d) = &dumper {
         let dumped = d.reserved[d.stage.slot()].load(Ordering::Relaxed).min(limit);
         eprintln!("xcl-corpus: dumped {dumped} {} HLSL programs to {}", d.stage.name(), d.dir.display());
     }
-    report(&path, &totals, compile, limit, t0.elapsed().as_secs_f64());
+    report(&path, &totals, compile, limit, host_wave, t0.elapsed().as_secs_f64());
 
     if let Some(json) = json {
-        let value = to_json(&totals, compile, limit, jobs, t0.elapsed().as_secs_f64());
+        let value = to_json(&totals, compile, limit, jobs, host_wave, t0.elapsed().as_secs_f64());
         let text = serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
         if let Err(e) = std::fs::write(&json, text) {
             eprintln!("xcl-corpus: cannot write {}: {e}", json.display());
@@ -616,8 +732,9 @@ fn top_groups(groups: &BTreeMap<String, usize>, examples: &BTreeMap<String, Stri
     v
 }
 
-fn report(path: &Path, totals: &Totals, compile: bool, limit: usize, seconds: f64) {
+fn report(path: &Path, totals: &Totals, compile: bool, limit: usize, host_wave: u32, seconds: f64) {
     println!("{}", path.display());
+    println!("host wave {}, wave hazards {}, refused for host {}", if host_wave == 0 { "native".to_string() } else { host_wave.to_string() }, totals.wave_hazards, totals.translate_errors);
     println!(
         "records {}, programs {}, translated {} ({} complete), translate errors {}",
         totals.records, totals.programs, totals.translated, totals.translated - totals.incomplete, totals.translate_errors
@@ -628,6 +745,10 @@ fn report(path: &Path, totals: &Totals, compile: bool, limit: usize, seconds: f6
     );
     if compile {
         println!("compiled {}, compile errors {}", totals.compiled, totals.compile_errors);
+        println!(
+            "GS two-pass: {} ES+GS pairs, {} errors, {} DXIL compiled, {} compile errors",
+            totals.gs_pairs, totals.gs_pair_errors, totals.gs_pair_compiled, totals.gs_pair_compile_errors
+        );
     } else {
         println!("not compiled (no --compile)");
     }
@@ -645,6 +766,9 @@ fn report(path: &Path, totals: &Totals, compile: bool, limit: usize, seconds: f6
             stats.wave64,
             stats.wave_hazards
         );
+        for (hazard, count) in &stats.refused_hazards {
+            println!("    [{stage}] refused {count:>6}  {hazard}");
+        }
     }
     println!("top translate errors:");
     for (stage, stats) in &totals.stages {
@@ -663,7 +787,7 @@ fn report(path: &Path, totals: &Totals, compile: bool, limit: usize, seconds: f6
     println!("limit {}, time {:.1} s", if limit == usize::MAX { "none".to_string() } else { limit.to_string() }, seconds);
 }
 
-fn to_json(totals: &Totals, compile: bool, limit: usize, jobs: usize, seconds: f64) -> serde_json::Value {
+fn to_json(totals: &Totals, compile: bool, limit: usize, jobs: usize, host_wave: u32, seconds: f64) -> serde_json::Value {
     let mut stages = serde_json::Map::new();
     for (stage, stats) in &totals.stages {
         let translate_errors: Vec<serde_json::Value> = top_groups(&stats.translate_error_groups, &stats.translate_error_examples, 30)
@@ -690,6 +814,8 @@ fn to_json(totals: &Totals, compile: bool, limit: usize, jobs: usize, seconds: f
                 "wave64": stats.wave64,
                 "wave32": stats.wave32,
                 "wave_hazards": stats.wave_hazards,
+                "refused": stats.translate_errors,
+                "refused_hazards": stats.refused_hazards,
             }),
         );
     }
@@ -703,9 +829,15 @@ fn to_json(totals: &Totals, compile: bool, limit: usize, jobs: usize, seconds: f
         "incomplete": totals.incomplete,
         "translate_errors": totals.translate_errors,
         "skipped": totals.skipped,
+        "gs_pairs": totals.gs_pairs,
+        "gs_pair_errors": totals.gs_pair_errors,
+        "gs_pair_compiled": totals.gs_pair_compiled,
+        "gs_pair_compile_errors": totals.gs_pair_compile_errors,
         "wave64": totals.wave64,
         "wave32": totals.wave32,
         "wave_hazards": totals.wave_hazards,
+        "refused_hazards": totals.refused_hazards,
+        "host_wave": host_wave,
         "compiled": totals.compiled,
         "compile_errors": totals.compile_errors,
         "compile_requested": compile,

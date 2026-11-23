@@ -110,6 +110,55 @@ fn the_stage_of_a_mode_is_the_one_of_the_program() {
     assert!(matches!(mode, Mode::Kernel));
 }
 
+/// `v_readlane_b32 s14, v6, 32; s_endpgm` (gfx1010), assembled with llvm-mc.
+#[test]
+fn a_32_lane_host_exchanges_a_read_of_the_upper_half_only_with_a_workgroup() {
+    let code = [0x0e, 0x00, 0x60, 0xd7, 0x06, 0x41, 0x01, 0x02, 0x00, 0x00, 0x81, 0xbf];
+    let hazard = "v_readlane/writelane: lane ≥ 32";
+    let kernel = xcl_recomp::gpu::recomp::Mode::Kernel;
+    assert!(xcl_recomp::gpu::recomp::wave_hazards(&code).contains(hazard));
+    // Compute has a workgroup: the read is served from groupshared memory.
+    assert!(xcl_recomp::gpu::recomp::host_hazards(&code, &kernel, 32).is_empty());
+    let opt = xcl_recomp::gpu::recomp::Options { mode: kernel, wave64: true, host_wave: 32, ..Default::default() };
+    assert!(xcl_recomp::gpu::recomp::translate(&code, &opt).is_ok());
+    // A pixel shader runs one invocation per fragment: no workgroup to exchange through.
+    let pixel = xcl_recomp::gpu::recomp::Mode::Pixel(Default::default());
+    assert!(xcl_recomp::gpu::recomp::host_hazards(&code, &pixel, 32).contains(hazard));
+    let opt = xcl_recomp::gpu::recomp::Options { mode: pixel, wave64: true, host_wave: 32, ..Default::default() };
+    assert!(xcl_recomp::gpu::recomp::translate(&code, &opt).is_err());
+}
+
+/// DXC rounds the mesh pass-through's vertex stride up to a power of two of 16-byte
+/// elements. 21 outputs (SV_Position included) cost 32 slots = 512 bytes per vertex:
+/// 78 vertices no longer fit one 32 KB group, so the emitters split its primitives.
+#[test]
+fn the_mesh_passthrough_accounts_for_dxc_s_padded_vertex_stride() {
+    use xcl_recomp::gpu::recomp;
+    let ms = |outputs, vertices| recomp::MsInterface {
+        outputs: vec![
+            xcl_recomp::gpu::dxbc::SigElement {
+                name: "TEXCOORD".into(),
+                index: 0,
+                system_value: 0,
+                component_type: 3,
+                register: 0,
+                mask: 15,
+                rw_mask: 0,
+                stream: 0,
+            };
+            outputs
+        ],
+        threads: 128,
+        max_vertices: vertices,
+        max_primitives: 26,
+    };
+    assert!(recomp::mesh_passthrough(&ms(15, 128)).contains("verts[128]"));
+    assert!(recomp::mesh_passthrough(&ms(21, 64)).contains("verts[64]"));
+    // 26 primitives / 2 groups -> 13 triangles, 39 vertex copies per group.
+    let split = recomp::mesh_passthrough(&ms(21, 78));
+    assert!(split.contains("verts[39]") && split.contains("tris[13]"));
+}
+
 /// The error groups of the tool are the errors by message, most frequent first.
 #[test]
 fn the_error_groups_are_sorted_by_count() {
