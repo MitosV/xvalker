@@ -1,0 +1,17 @@
+[package]
+name = "xcl-bvh"
+version = "0.1.0"
+edition = "2021"
+description = "The console's acceleration structures (RDNA2 BVH) with a C interface"
+license = "MIT"
+
+[lib]
+name = "xcl_bvh"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "xcl-bvh-reference"
+path = "src/bin/xcl_bvh_reference.rs"
+
+[profile.release]
+panic = "abort"

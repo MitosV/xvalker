@@ -1789,7 +1789,19 @@ std::span<const std::uint8_t> shader_bytes(const D3D12_SHADER_BYTECODE &code) {
 bool host_bytecode(modules::ShaderStage stage, D3D12_SHADER_BYTECODE &code,
                    modules::HostShaderModel model = modules::HostShaderModel::sm5) {
     const auto container = shader_bytes(code);
-    if (!code.pShaderBytecode || !modules::console_only_shader(container))
+    if (!code.pShaderBytecode)
+        return false;
+    // A console shader that has DXIL is lowered, not translated from machine code. Its
+    // root signature comes from the original container, which is why only the bytecode here
+    // is replaced.
+    if (modules::shader_has_dxil(container)) {
+        const auto lowered = modules::lower_console_dxil(container);
+        if (lowered.empty())
+            return false;
+        code = {lowered.data(), lowered.size()};
+        return true;
+    }
+    if (!modules::console_only_shader(container))
         return false;
     const auto made = modules::host_shader(stage, container, model);
     if (made.empty())
