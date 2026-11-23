@@ -266,9 +266,14 @@ fn process(name: &str, blob: &[u8], compile: bool, totals: &mut Totals) {
         totals.not_console += 1;
         return;
     };
+    let mut record_stages = Vec::new();
     for f in &sh.fssm {
         let Some(mode) = recomp::interface(blob, &sh, f) else { continue };
         let stage = stage_of(&mode);
+        if !record_stages.contains(&stage) {
+            totals.stages.entry(stage).or_default().records += 1;
+            record_stages.push(stage);
+        }
         let jobs = jobs_of(&mode);
         for p in &f.programs {
             totals.programs += 1;
@@ -477,7 +482,7 @@ fn main() {
     report(&path, &totals, compile, limit, t0.elapsed().as_secs_f64());
 
     if let Some(json) = json {
-        let value = to_json(&totals, compile, limit, t0.elapsed().as_secs_f64());
+        let value = to_json(&totals, compile, limit, jobs, t0.elapsed().as_secs_f64());
         let text = serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
         if let Err(e) = std::fs::write(&json, text) {
             eprintln!("xcl-corpus: cannot write {}: {e}", json.display());
@@ -542,7 +547,7 @@ fn report(path: &Path, totals: &Totals, compile: bool, limit: usize, seconds: f6
     println!("limit {}, time {:.1} s", if limit == usize::MAX { "none".to_string() } else { limit.to_string() }, seconds);
 }
 
-fn to_json(totals: &Totals, compile: bool, limit: usize, seconds: f64) -> serde_json::Value {
+fn to_json(totals: &Totals, compile: bool, limit: usize, jobs: usize, seconds: f64) -> serde_json::Value {
     let mut stages = serde_json::Map::new();
     for (stage, stats) in &totals.stages {
         let translate_errors: Vec<serde_json::Value> = top_groups(&stats.translate_error_groups, &stats.translate_error_examples, 30)
@@ -589,7 +594,7 @@ fn to_json(totals: &Totals, compile: bool, limit: usize, seconds: f64) -> serde_
         "compile_errors": totals.compile_errors,
         "compile_requested": compile,
         "limit": if limit == usize::MAX { serde_json::Value::Null } else { serde_json::Value::from(limit) },
-        "jobs": 24,
+        "jobs": jobs,
         "stages": serde_json::Value::Object(stages),
         "seconds": seconds,
     })
