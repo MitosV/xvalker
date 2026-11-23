@@ -226,7 +226,12 @@ command_kill() {
     local proton
     proton=$(find_proton) || die "no Proton found"
     wine_env
-    "$proton/files/bin/wineserver" -k
+    # the wineserver says it has nothing to end when the prefix is not running
+    if "$proton/files/bin/wineserver" -k; then
+        note "the wineserver of $prefix is ended"
+    else
+        note "nothing of $prefix was running"
+    fi
 }
 
 command_logs() {
