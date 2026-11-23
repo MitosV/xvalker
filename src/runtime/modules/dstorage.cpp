@@ -3,6 +3,7 @@
 #include "runtime/modules/bcpack.h"
 #include "runtime/modules/inflate.hpp"
 #include "runtime/modules/kernel.hpp"
+#include "runtime/modules/memory.hpp"
 #include "runtime/modules/placement.hpp"
 #include <atomic>
 #include <cstdio>
@@ -229,17 +230,53 @@ XvBcpackDecode bcpack_decoder() {
     return decoder;
 }
 
+// The title's physical pages are 64 KiB each
+constexpr ULONG_PTR page_size = 0x10000;
+
+// The physical pages of a request, copied: the title's array is often on its stack
+struct PageArray {
+    std::vector<ULONG_PTR> pages;
+    UINT32 offset = 0;
+};
+bool snapshot_pages(const void *array, UINT32 offset, UINT32 size, PageArray &out) {
+    out.offset = offset;
+    if (!size)
+        return true;
+    if (!array || offset >= page_size)
+        return false;
+    const auto count =
+        (static_cast<std::uint64_t>(offset) + size + page_size - 1) / page_size;
+    if (count > 65536 ||
+        !readable_memory(reinterpret_cast<std::uint64_t>(array),
+                         static_cast<std::size_t>(count) * sizeof(ULONG_PTR)))
+        return false;
+    const auto *const numbers = static_cast<const ULONG_PTR *>(array);
+    out.pages.assign(numbers, numbers + count);
+    return true;
+}
+
 // A request, as the queue runs it
 struct Work {
     Request request;
     File *file = nullptr; // the file it reads, when it reads one
+    PageArray destination_pages;
+    PageArray source_pages;
 };
 
-// The bytes a request reads: from its file or from the title's memory
+// The bytes a request reads: from its file, from the title's memory or from its
+// physical pages
 HRESULT read_source(const Work &work, std::vector<std::uint8_t> &bytes) {
     const auto &request = work.request;
     bytes.resize(request.source_size);
     if (request.options & option_source_memory) {
+        if (request.options & option_source_pages) {
+            if (work.source_pages.pages.empty() ||
+                !read_title_physical_pages(work.source_pages.pages.data(),
+                                          work.source_pages.pages.size(),
+                                          work.source_pages.offset, bytes.data(), bytes.size()))
+                return E_DSTORAGE_ACCESS_VIOLATION;
+            return S_OK;
+        }
         if (!readable_memory(reinterpret_cast<std::uint64_t>(request.source), bytes.size()))
             return E_DSTORAGE_ACCESS_VIOLATION;
         if (!bytes.empty())
@@ -262,6 +299,23 @@ HRESULT read_source(const Work &work, std::vector<std::uint8_t> &bytes) {
     return S_OK;
 }
 
+// Where a request's result goes: the title's memory, or its physical pages
+HRESULT write_destination(const Work &work, const std::uint8_t *bytes, UINT32 size) {
+    if (work.request.options & option_destination_pages) {
+        if (work.destination_pages.pages.empty())
+            return E_DSTORAGE_ACCESS_VIOLATION;
+        if (!write_title_physical_pages(work.destination_pages.pages.data(),
+                                        work.destination_pages.pages.size(),
+                                        work.destination_pages.offset, bytes, size))
+            return E_DSTORAGE_ACCESS_VIOLATION;
+        return S_OK;
+    }
+    prepare_title_write(work.request.destination, size);
+    if (size)
+        std::memcpy(work.request.destination, bytes, size);
+    return S_OK;
+}
+
 HRESULT read(const Work &work) {
     const auto &request = work.request;
     if (request.options & option_swizzle) {
@@ -274,18 +328,11 @@ HRESULT read(const Work &work) {
                          static_cast<unsigned long long>((request.options & option_swizzle) >> 5));
         return E_DSTORAGE_DECOMPRESSION_ERROR;
     }
-    if (request.options & (option_destination_pages | option_source_pages)) {
-        if (static std::atomic<bool> shown{false}; !shown.exchange(true))
-            std::fprintf(stderr,
-                         "[Runtime] DirectStorage: a request with options 0x%llx (physical "
-                         "pages), which is not done\n",
-                         request.options);
-        return E_NOTIMPL;
-    }
     const bool inflated = request.options & option_zlib;
     const auto mode = static_cast<UINT32>((request.options & option_bcpack) >> 1);
     // a plain read goes straight from the file to the destination
-    if (!inflated && !mode && !(request.options & option_source_memory)) {
+    if (!inflated && !mode && !(request.options & option_source_memory) &&
+        !(request.options & option_destination_pages)) {
         if (request.source_size > request.destination_size)
             return E_DSTORAGE_INVALID_DESTINATION_SIZE;
         if (!work.file)
@@ -318,22 +365,32 @@ HRESULT read(const Work &work) {
             return E_DSTORAGE_ZLIB_BAD_DATA;
         packed = std::move(plain);
     }
-    prepare_title_write(request.destination, request.destination_size);
     if (mode) {
         // the console's texture compression, in bcpack.dll
         const auto decoder = bcpack_decoder();
         if (!decoder)
             return E_NOTIMPL;
-        const auto result = decoder(mode, packed.data(), packed.size(),
-                                    static_cast<std::uint8_t *>(request.destination),
+        // the decoder writes nothing when it fails, so the destination can be its own
+        std::vector<std::uint8_t> blocks;
+        std::uint8_t *target = nullptr;
+        if (request.options & option_destination_pages) {
+            blocks.resize(request.destination_size);
+            target = blocks.data();
+        } else {
+            prepare_title_write(request.destination, request.destination_size);
+            target = static_cast<std::uint8_t *>(request.destination);
+        }
+        const auto result = decoder(mode, packed.data(), packed.size(), target,
                                     request.destination_size);
-        return FAILED(result) ? result : S_OK;
+        if (FAILED(result))
+            return result;
+        if (request.options & option_destination_pages)
+            return write_destination(work, blocks.data(), request.destination_size);
+        return S_OK;
     }
     if (packed.size() > request.destination_size)
         return E_DSTORAGE_INVALID_DESTINATION_SIZE;
-    if (!packed.empty())
-        std::memcpy(request.destination, packed.data(), packed.size());
-    return S_OK;
+    return write_destination(work, packed.data(), request.destination_size);
 }
 
 class Queue final : public Object<QueueInterface> {
@@ -511,6 +568,21 @@ class Queue final : public Object<QueueInterface> {
             if (!File::is(request.source))
                 return E_DSTORAGE_INVALID_FILE_HANDLE;
             work.file = static_cast<File *>(request.source);
+        }
+        // the pages of the request are copied: the title's array is often on its stack
+        if (request.options & option_destination_pages) {
+            if (!snapshot_pages(request.destination,
+                                static_cast<UINT32>(request.destination_page_offset & 0xffff),
+                                request.destination_size, work.destination_pages))
+                return E_DSTORAGE_ACCESS_VIOLATION;
+        }
+        if ((request.options & option_source_pages) && !source_memory)
+            return E_DSTORAGE_INVALID_SOURCE_TYPE;
+        if (request.options & option_source_pages) {
+            if (!snapshot_pages(request.source,
+                                static_cast<UINT32>(request.file_offset & 0xffff),
+                                request.source_size, work.source_pages))
+                return E_DSTORAGE_ACCESS_VIOLATION;
         }
         if (!inflated && !mode) {
             if (request.destination_size != request.source_size)
