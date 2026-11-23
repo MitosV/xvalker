@@ -34,6 +34,12 @@ bool uma_window_of(std::uintptr_t address, std::uint32_t &window, std::uint32_t 
 // A block of the coherent window for the title's graphics memory, aligned to `alignment`.
 // Null when the windows are full.
 void *uma_alloc(std::size_t size, std::uint64_t alignment);
+// A block of a given window (`uma_alloc` takes the first window with room). Window 0 is the
+// one the console's 32-bit addresses name.
+void *uma_alloc_in(std::uint32_t window, std::size_t size, std::uint64_t alignment);
+// The bytes the windows hold and how much of it is in use.
+std::size_t uma_used();
+std::size_t uma_total();
 // A block at a fixed address (the title asked for one).
 void *uma_alloc_at(std::uintptr_t address, std::size_t size);
 // Give a block back.
@@ -46,6 +52,11 @@ std::uint64_t uma_window_va(std::uint32_t window);
 bool uma_heap_of(std::uintptr_t address, ID3D12Heap *&heap, std::uint64_t &offset);
 // The host's GPU address of a console address in the unified memory (0: it is not in it).
 std::uint64_t uma_host_address(std::uintptr_t address);
+// The host's pointer to a console address in the unified memory (null: it is not in it).
+void *uma_host_pointer(std::uintptr_t address);
+// The host's pointer to a console address: the window is in bits 33:32 and the offset in
+// the low 32 bits (the console's own address space). Null when it is not there.
+void *uma_console_pointer(std::uintptr_t address);
 // Whether the unified memory is open on the GPU.
 bool uma_on_gpu();
 } // namespace xv::runtime::modules::d3d12x

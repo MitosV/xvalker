@@ -40,5 +40,10 @@ void write_constant(void *list, UINT parameter, UINT offset, UINT count, const v
 void write_view(void *list, UINT parameter, std::uint64_t address, bool graphics);
 void write_table(void *list, UINT parameter, std::uint64_t address, bool graphics);
 // Before a draw with a translated pipeline: bind the ABI and its six UAVs.
-bool before_draw(void *list, ID3D12GraphicsCommandList *host);
+enum class Binding {
+    bound,        // the ABI is bound: the draw goes
+    untranslated, // the pipeline is not a translated one: the draw goes as the title's own
+    skipped       // the ABI could not be bound: the draw must not be recorded
+};
+Binding before_draw(void *list, ID3D12GraphicsCommandList *host);
 } // namespace xv::runtime::modules::d3d12x::xcl

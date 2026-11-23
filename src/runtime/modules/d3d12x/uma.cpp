@@ -113,6 +113,17 @@ Window *window_at(Uma &state, std::uintptr_t address, std::size_t size = 1) {
     return nullptr;
 }
 
+// The bytes the windows hold in use, and the bytes they hold. The caller holds the mutex.
+std::size_t uma_used_locked(Uma &state) {
+    std::size_t used = 0;
+    for (const auto &[address, bytes] : state.allocated)
+        used += bytes;
+    return used;
+}
+std::size_t uma_total_locked(Uma &state) {
+    return std::size_t{state.count} * state.size;
+}
+
 // Four 4 GiB-aligned windows starting at an address the console's ABI can name: the low two
 // bits of (address >> 32) must be zero at the first one.
 std::uintptr_t reserve_windows(std::size_t size) {
@@ -284,8 +295,41 @@ void *uma_alloc(std::size_t size, std::uint64_t alignment) {
                          static_cast<unsigned long long>(address));
         return reinterpret_cast<void *>(address);
     }
-    std::fprintf(stderr, "[Runtime] UMA: no room for %zu bytes\n", size);
+    std::fprintf(stderr, "[Runtime] UMA: no room for %zu bytes (%zu of %zu in use)\n", size,
+                 uma_used_locked(state), uma_total_locked(state));
     return nullptr;
+}
+
+void *uma_alloc_in(std::uint32_t window, std::size_t size, std::uint64_t alignment) {
+    if (!uma_reserve())
+        return nullptr;
+    auto &state = uma();
+    const std::lock_guard lock(state.mutex);
+    if (window >= state.count)
+        return nullptr;
+    const auto bytes = std::max<std::size_t>(grain, (size + grain - 1) & ~(grain - 1));
+    const auto align = std::bit_ceil(std::max<std::uint64_t>(alignment, grain));
+    const auto offset = take_from(state.windows[window], bytes, align);
+    if (!offset) {
+        std::fprintf(stderr, "[Runtime] UMA: no room for %zu bytes in window %u (%zu of %zu in "
+                             "use)\n",
+                     size, window, uma_used_locked(state), uma_total_locked(state));
+        return nullptr;
+    }
+    const auto address = state.windows[window].base + offset;
+    state.allocated[address] = bytes;
+    return reinterpret_cast<void *>(address);
+}
+
+std::size_t uma_used() {
+    auto &state = uma();
+    const std::lock_guard lock(state.mutex);
+    return uma_used_locked(state);
+}
+std::size_t uma_total() {
+    auto &state = uma();
+    const std::lock_guard lock(state.mutex);
+    return uma_total_locked(state);
 }
 
 void *uma_alloc_at(std::uintptr_t address, std::size_t size) {
@@ -351,6 +395,25 @@ std::uint64_t uma_host_address(std::uintptr_t address) {
     if (!window || !window->va)
         return 0;
     return window->va + (address - window->base);
+}
+
+void *uma_host_pointer(std::uintptr_t address) {
+    auto &state = uma();
+    const std::lock_guard lock(state.mutex);
+    const auto *const window = window_at(state, address);
+    if (!window)
+        return nullptr;
+    return reinterpret_cast<void *>(window->base + (address - window->base));
+}
+
+void *uma_console_pointer(std::uintptr_t address) {
+    auto &state = uma();
+    const std::lock_guard lock(state.mutex);
+    const auto window = static_cast<std::uint32_t>((address >> 32) & 3);
+    const auto offset = address & 0xffffffffull;
+    if (window >= state.count || offset >= state.windows[window].size)
+        return nullptr;
+    return reinterpret_cast<void *>(state.windows[window].base + offset);
 }
 
 bool uma_heap_of(std::uintptr_t address, ID3D12Heap *&heap, std::uint64_t &offset) {
