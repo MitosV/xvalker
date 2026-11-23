@@ -232,3 +232,9 @@ A 32-lane host cannot read a wave64's lane `32+k`. A VGPR whose value is a min/m
 reduction over DPP/permlanex16 is reduced in each half separately; `v_readlane_b32 ..., 32+k`
 is emitted as `WaveReadLaneAt(v, k & 31)` (`rla_local`). The hazard detectors skip those
 reads and the recognized DPP/permlane chain. `add`/`xor` are not classified as idempotent.
+
+## Uniform readlane on a 32-lane host
+
+A `v_readlane_b32` whose source VGPR is proven uniform over the wave (SGPR broadcast or
+folded reduction) is emitted as the invoking lane's own value. SGPRs are seeded as uniform
+except saved-EXEC registers. The corresponding readlane is no longer refused.

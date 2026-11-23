@@ -77,7 +77,8 @@ impl HostWaveMap {
 pub fn analyze(code: &[u8]) -> HostWaveMap {
     let mut map = HostWaveMap::default();
     let mut vgpr = vec![Val::Other; 256];
-    let mut sgpr = vec![Val::Other; 106];
+    // Scalar registers are uniform across the wave unless they carry a 64-bit mask.
+    let mut sgpr = vec![Val::Uniform; 106];
     let mut off = 0usize;
     while off + 4 <= code.len() {
         let Ok(d) = rdna2::decode(&code[off..], off as u64) else { break };
@@ -100,7 +101,9 @@ pub fn analyze(code: &[u8]) -> HostWaveMap {
                 let lane = rdna2::field_value(d.enc, &d.words, "SRC1").unwrap_or(0);
                 let known_lane = matches!(lane, 160..=192 | 255) || d.literal.is_some();
                 match src {
-                    Val::Uniform => {}
+                    Val::Uniform => {
+                        map.uniform.insert(d.pc);
+                    }
                     Val::HalfReduce(_) if known_lane => {
                         map.idempotent.insert(d.pc);
                     }

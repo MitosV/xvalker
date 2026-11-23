@@ -2880,9 +2880,13 @@ impl Em {
                 return Ok(());
             }
             "v_readlane_b32" => {
+                let uniform = self.opt.host_map.uniform.contains(&self.pc);
                 let idempotent = self.opt.host_map.idempotent.contains(&self.pc);
                 let t = self.t();
-                if idempotent {
+                if uniform {
+                    // A wave-uniform value is the same in the invoking lane.
+                    self.line(&format!("uint {t} = {a};"));
+                } else if idempotent {
                     // Each half reduced its own lanes; the upper half's lane 32+k is
                     // the invoking half's lane k for an idempotent operation.
                     self.line(&format!("uint {t} = rla_local({a}, {b} & 31u);"));
