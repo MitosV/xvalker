@@ -469,8 +469,8 @@ class Queue final : public Object<QueueInterface> {
             {
                 const std::lock_guard lock(mutex_);
                 fail(refusal, work);
+                pending_.emplace_back(Refused{refusal});
             }
-            pending_.emplace_back(Refused{refusal});
             submit_when_full();
             return;
         }
