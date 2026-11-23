@@ -651,7 +651,7 @@ LONG WINAPI at_breakpoint(EXCEPTION_POINTERS *info) {
         if (point.address != info->ExceptionRecord->ExceptionAddress)
             continue;
         if (point.hits++ < break_limit) {
-            std::uint64_t at_rcx[4]{}, at_rdx[4]{}, at_r8[5]{};
+            std::uint64_t at_rcx[4]{}, at_rdx[4]{}, at_r8[5]{}, at_r9[4]{};
             const auto read = [](std::uint64_t address, void *into, std::size_t size) {
                 MEMORY_BASIC_INFORMATION memory{};
                 if (VirtualQuery(reinterpret_cast<void *>(address), &memory, sizeof memory) &&
@@ -661,18 +661,19 @@ LONG WINAPI at_breakpoint(EXCEPTION_POINTERS *info) {
             read(context.Rcx, at_rcx, sizeof at_rcx);
             read(context.Rdx, at_rdx, sizeof at_rdx);
             read(context.R8, at_r8, sizeof at_r8);
+            read(context.R9, at_r9, sizeof at_r9);
             std::fprintf(stderr,
                          "[Break] image+0x%llx thread %lu rax %llx (image at %llx) rcx %llx rdx "
                          "%llx r8 %llx r9 %llx "
                          "[rcx] %llx %llx %llx %llx [rdx] %llx %llx %llx %llx [r8] %llx %llx %llx "
-                         "%llx %llx from %s\n",
+                         "%llx %llx [r9] %llx %llx %llx %llx from %s\n",
                          static_cast<unsigned long long>(
                              reinterpret_cast<std::uint64_t>(point.address) - guest->base),
                          GetCurrentThreadId(), context.Rax,
                          static_cast<unsigned long long>(guest->base), context.Rcx, context.Rdx,
                          context.R8, context.R9, at_rcx[0], at_rcx[1], at_rcx[2], at_rcx[3],
                          at_rdx[0], at_rdx[1], at_rdx[2], at_rdx[3], at_r8[0], at_r8[1], at_r8[2],
-                         at_r8[3], at_r8[4],
+                         at_r8[3], at_r8[4], at_r9[0], at_r9[1], at_r9[2], at_r9[3],
                          detail::guest_location(*reinterpret_cast<void **>(context.Rsp)).c_str());
             std::fflush(stderr);
         }
