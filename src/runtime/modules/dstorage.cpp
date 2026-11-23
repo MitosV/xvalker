@@ -86,14 +86,28 @@ template <class Interface> class Object : public Interface {
     std::atomic<ULONG> references_{1};
 };
 
-// the interfaces, with their methods in the order the console's header has them
+// the interfaces, with their methods in the order the console's header has them. The
+// methods this runtime does not know answer E_NOTIMPL: they are there so that a title
+// that calls one does not read past the end of the vtable.
 struct FileInterface : IUnknown {
     virtual void Close() = 0;
     virtual HANDLE GetHandle() = 0;
+    virtual HRESULT Unknown5() { return E_NOTIMPL; }
+    virtual HRESULT Unknown6() { return E_NOTIMPL; }
+    virtual UINT32 GetId() = 0;
+    virtual HRESULT Unknown8() { return E_NOTIMPL; }
+    virtual HRESULT Unknown9() { return E_NOTIMPL; }
+    virtual HRESULT Unknown10() { return E_NOTIMPL; }
+    virtual HRESULT Unknown11() { return E_NOTIMPL; }
 };
 struct StatusInterface : IUnknown {
-    virtual bool IsComplete(UINT32 index) = 0;
+    virtual BOOL IsComplete(UINT32 index) = 0;
     virtual HRESULT GetHResult(UINT32 index) = 0;
+    virtual HRESULT Unknown5() { return E_NOTIMPL; }
+    virtual HRESULT Unknown6() { return E_NOTIMPL; }
+    virtual HRESULT Unknown7() { return E_NOTIMPL; }
+    virtual HRESULT Unknown8() { return E_NOTIMPL; }
+    virtual HRESULT Unknown9() { return E_NOTIMPL; }
 };
 struct QueueDesc {
     UINT64 source_type;
@@ -151,6 +165,12 @@ struct QueueInterface : IUnknown {
     virtual HANDLE GetErrorEvent() = 0;
     virtual void RetrieveErrorRecord(ErrorRecord *record) = 0;
     virtual void Query(QueueInfo *info) = 0;
+    virtual HRESULT Unknown12() { return E_NOTIMPL; }
+    virtual HRESULT Unknown13() { return E_NOTIMPL; }
+    virtual HRESULT Unknown14() { return E_NOTIMPL; }
+    virtual HRESULT Unknown15() { return E_NOTIMPL; }
+    virtual HRESULT Unknown16() { return E_NOTIMPL; }
+    virtual HRESULT Unknown17() { return E_NOTIMPL; }
 };
 struct FactoryInterface : IUnknown {
     virtual HRESULT CreateQueue(const QueueDesc *desc, REFIID iid, void **queue) = 0;
@@ -160,12 +180,19 @@ struct FactoryInterface : IUnknown {
     virtual HRESULT SetCpuAffinity(UINT64 affinity) = 0;
     virtual void SetDebugFlags(UINT32 flags) = 0;
     virtual HRESULT SetStagingBufferSize(UINT32 size) = 0;
+    virtual HRESULT Unknown9() { return E_NOTIMPL; }
+    virtual HRESULT Unknown10() { return E_NOTIMPL; }
+    virtual HRESULT Unknown11() { return E_NOTIMPL; }
+    virtual HRESULT Unknown12() { return E_NOTIMPL; }
+    virtual HRESULT Unknown13() { return E_NOTIMPL; }
+    virtual HRESULT Unknown14() { return E_NOTIMPL; }
+    virtual HRESULT Unknown15() { return E_NOTIMPL; }
 };
 
 class File final : public Object<FileInterface> {
   public:
     explicit File(HANDLE handle, std::wstring path = {})
-        : Object(file_iid), handle_(handle), path_(std::move(path)) {}
+        : Object(file_iid), handle_(handle), path_(std::move(path)), id_(++counter()) {}
     ~File() override { Close(); }
     void Close() override {
         if (const auto handle = handle_.exchange(INVALID_HANDLE_VALUE);
@@ -173,6 +200,8 @@ class File final : public Object<FileInterface> {
             CloseHandle(handle);
     }
     HANDLE GetHandle() override { return handle_; }
+    // the number the console gives a file
+    UINT32 GetId() override { return id_; }
     // the path the title opened, for the error record
     const std::wstring &path() const { return path_; }
     // whether a pointer is one of our files: the title's requests name their source
@@ -194,16 +223,21 @@ class File final : public Object<FileInterface> {
         }();
         return vtable;
     }
+    static UINT32 &counter() {
+        static UINT32 next = 0;
+        return next;
+    }
     std::atomic<HANDLE> handle_;
     std::wstring path_;
+    UINT32 id_;
 };
 
 class Status final : public Object<StatusInterface> {
   public:
     explicit Status(UINT32 capacity) : Object(status_iid), entries_(capacity) {}
-    bool IsComplete(UINT32 index) override {
+    BOOL IsComplete(UINT32 index) override {
         const std::lock_guard lock(mutex_);
-        return index < entries_.size() && entries_[index].done;
+        return index < entries_.size() && entries_[index].done ? TRUE : FALSE;
     }
     HRESULT GetHResult(UINT32 index) override {
         const std::lock_guard lock(mutex_);
