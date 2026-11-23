@@ -4,6 +4,8 @@
 // What the console's device and queue have for showing frames, which the host does with a
 // swap chain: present.cpp.
 namespace xv::runtime::modules::d3d12x {
+// The host's Direct3D 12 device (the one the title's device is a proxy of), or none.
+ID3D12Device *host_device();
 // the state the title's own barriers left a render target in, `unknown` if it made none
 D3D12_RESOURCE_STATES tracked_state(ID3D12Resource *resource, D3D12_RESOURCE_STATES unknown);
 // ID3D12CommandQueue::PresentX on the host's queue

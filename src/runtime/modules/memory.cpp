@@ -1,6 +1,7 @@
 #include "runtime/modules/memory.hpp"
 #include "runtime/common/runtime.hpp"
 
+#include "runtime/modules/d3d12x/uma.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -348,10 +349,28 @@ HRESULT WINAPI d3d_allocate_graphics_memory(SIZE_T size, UINT64 alignment, UINT6
                                             void **result) {
     if (!result || alignment > 0x20000)
         return E_INVALIDARG;
+    // With the XCL shader backend the title's graphics memory comes from the unified
+    // memory: it is in a window Direct3D 12 can open as a heap, so the GPU works on it
+    // directly and a shader reaches it with the console's own addresses.
+    if (d3d12x::uma_enabled()) {
+        void *memory = nullptr;
+        if (address)
+            memory = d3d12x::uma_alloc_at(address, size);
+        else
+            memory = d3d12x::uma_alloc(size, alignment);
+        if (!memory)
+            return E_OUTOFMEMORY;
+        *result = memory;
+        return S_OK;
+    }
     *result = allocate_aligned(size, alignment, reinterpret_cast<void *>(address));
     return *result ? S_OK : E_OUTOFMEMORY;
 }
 HRESULT WINAPI d3d_free_graphics_memory(void *address) {
+    if (d3d12x::uma_enabled() && d3d12x::uma_contains(reinterpret_cast<std::uintptr_t>(address))) {
+        d3d12x::uma_free(address);
+        return S_OK;
+    }
     return VirtualFree(address, 0, MEM_RELEASE) ? S_OK : E_INVALIDARG;
 }
 

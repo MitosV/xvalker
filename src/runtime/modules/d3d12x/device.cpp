@@ -3,6 +3,7 @@
 #include "runtime/modules/console_shader.hpp"
 #include "runtime/modules/d3d12x.hpp"
 #include "runtime/modules/d3d12x/internal.hpp"
+#include "runtime/modules/d3d12x/uma.hpp"
 #include "runtime/modules/placement.hpp"
 #include <algorithm>
 #include <array>
@@ -30,6 +31,9 @@ namespace xv::runtime::modules::d3d12x {
 namespace {
 Target console = Target::durango;
 AdapterWrapper adapter_wrapper = nullptr;
+// the console's resource states and layout, as the host's (defined further down)
+D3D12_RESOURCE_STATES host_state(D3D12_RESOURCE_STATES state);
+D3D12_RESOURCE_DESC host_resource_desc(const D3D12_RESOURCE_DESC &desc);
 template <class... Interfaces> bool is_any(REFIID iid) {
     return ((iid == __uuidof(Interfaces)) || ...);
 }
@@ -1614,8 +1618,33 @@ HRESULT STDMETHODCALLTYPE create_placed_resource_x(ID3D12Device *self, std::uint
         std::fflush(stderr);
     }
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    const auto result = create_committed_resource(self, &heap, D3D12_HEAP_FLAG_NONE, desc, state,
-                                                  clear, iid, resource);
+    HRESULT result = E_FAIL;
+    // With the XCL shader backend the title's graphics memory is in a window Direct3D 12
+    // opened as a heap: a buffer the title places there is made on that heap, at its
+    // console address, so the GPU works on the memory itself.
+    ID3D12Heap *uma_heap = nullptr;
+    std::uint64_t uma_offset = 0;
+    if (uma_enabled() && uma_heap_of(address, uma_heap, uma_offset) && desc &&
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        using Create = HRESULT(STDMETHODCALLTYPE *)(void *, ID3D12Heap *, UINT64,
+                                                    const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES,
+                                                    const D3D12_CLEAR_VALUE *, REFIID, void **);
+        D3D12_RESOURCE_DESC host = host_resource_desc(*desc);
+        // a placed buffer in the host's memory needs the flags the console has not
+        host.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        result = original<Create>(self, 29)(self, uma_heap, uma_offset, &host, host_state(state),
+                                            clear, iid, resource);
+        if (FAILED(result)) {
+            std::fprintf(stderr, "[Runtime] CreatePlacedResourceX on the UMA heap at %llx: "
+                                 "0x%08lx\n",
+                         static_cast<unsigned long long>(uma_offset),
+                         static_cast<unsigned long>(result));
+            result = E_FAIL;
+        }
+    } else {
+        result = create_committed_resource(self, &heap, D3D12_HEAP_FLAG_NONE, desc, state, clear,
+                                           iid, resource);
+    }
     // a texture the title fills in its memory: the host's copy follows it
     if (SUCCEEDED(result) && resource && *resource && desc &&
         !(desc->Flags &
@@ -2484,6 +2513,9 @@ ULONG STDMETHODCALLTYPE list_release(void *self) {
 // handles. The depth clear has a float in a register the generic path does not carry.
 using Handle = D3D12_CPU_DESCRIPTOR_HANDLE;
 std::atomic<ID3D12Device *> d3d12_device{nullptr};
+} // namespace
+ID3D12Device *host_device() { return d3d12_device.load(); }
+namespace {
 HRESULT STDMETHODCALLTYPE close_list(void *self) {
     const auto result = host_of(self)->Close();
     if (FAILED(result))
