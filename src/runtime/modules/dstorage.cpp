@@ -35,8 +35,27 @@ constexpr GUID status_iid{
 constexpr GUID queue_iid{
     0xa3f6649a, 0x8c2c, 0x4b3a, {0x8b, 0x6e, 0x10, 0x18, 0x6a, 0x04, 0xb9, 0xbc}};
 
+// The console's DSTORAGE_REQUEST_OPTIONS: bit 0 zlib, bits 1 to 4 BCPack, bits 5 to 20
+// the swizzle mode, bit 21 the destination in physical pages, bit 22 the source in
+// memory, bit 23 the source in physical pages
+constexpr UINT64 option_zlib = 1ull << 0;
+constexpr UINT64 option_bcpack = 0xfull << 1;
+constexpr UINT64 option_swizzle = 0xffffull << 5;
+constexpr UINT64 option_destination_pages = 1ull << 21;
+constexpr UINT64 option_source_memory = 1ull << 22;
+constexpr UINT64 option_source_pages = 1ull << 23;
+constexpr UINT64 option_known = (1ull << 24) - 1;
+
 // The console's own results
+constexpr HRESULT E_DSTORAGE_END_OF_FILE = static_cast<HRESULT>(0x89240007u);
+constexpr HRESULT E_DSTORAGE_ACCESS_VIOLATION = static_cast<HRESULT>(0x89240009u);
+constexpr HRESULT E_DSTORAGE_RESERVED_FIELDS = static_cast<HRESULT>(0x8924000cu);
+constexpr HRESULT E_DSTORAGE_INVALID_DESTINATION_SIZE = static_cast<HRESULT>(0x8924000fu);
+constexpr HRESULT E_DSTORAGE_INVALID_FILE_HANDLE = static_cast<HRESULT>(0x89240017u);
+constexpr HRESULT E_DSTORAGE_INVALID_SOURCE_TYPE = static_cast<HRESULT>(0x8924001bu);
+constexpr HRESULT E_DSTORAGE_INVALID_INTERMEDIATE_SIZE = static_cast<HRESULT>(0x8924001cu);
 constexpr HRESULT E_DSTORAGE_DECOMPRESSION_ERROR = static_cast<HRESULT>(0x89240030u);
+constexpr HRESULT E_DSTORAGE_ZLIB_BAD_DATA = static_cast<HRESULT>(0x89240032u);
 
 template <class Interface> class Object : public Interface {
   public:
@@ -135,8 +154,25 @@ class File final : public Object<FileInterface> {
             CloseHandle(handle);
     }
     HANDLE GetHandle() override { return handle_; }
+    // whether a pointer is one of our files: the title's requests name their source
+    static bool is(const void *object) {
+        if (!object ||
+            !readable_memory(reinterpret_cast<std::uint64_t>(object), sizeof(void *)))
+            return false;
+        return *reinterpret_cast<void *const *>(object) == vtable();
+    }
 
   private:
+    // the vtable of our files, so that a source that is not one of them is refused
+    static const void *vtable() {
+        static const void *const vtable = [] {
+            File *const probe = new File(INVALID_HANDLE_VALUE);
+            const void *const address = *reinterpret_cast<void *const *>(probe);
+            probe->Release();
+            return address;
+        }();
+        return vtable;
+    }
     std::atomic<HANDLE> handle_;
 };
 
@@ -193,21 +229,52 @@ XvBcpackDecode bcpack_decoder() {
     return decoder;
 }
 
-HRESULT read(const Request &request) {
-    constexpr UINT64 zlib = 1, bcpack = 0xf << 1, swizzle = 0xffffull << 5,
-                     destination_pages = 1ull << 21, from_memory = 1ull << 22,
-                     source_pages = 1ull << 23;
-    if (request.options & swizzle) {
+// A request, as the queue runs it
+struct Work {
+    Request request;
+    File *file = nullptr; // the file it reads, when it reads one
+};
+
+// The bytes a request reads: from its file or from the title's memory
+HRESULT read_source(const Work &work, std::vector<std::uint8_t> &bytes) {
+    const auto &request = work.request;
+    bytes.resize(request.source_size);
+    if (request.options & option_source_memory) {
+        if (!readable_memory(reinterpret_cast<std::uint64_t>(request.source), bytes.size()))
+            return E_DSTORAGE_ACCESS_VIOLATION;
+        if (!bytes.empty())
+            std::memcpy(bytes.data(), request.source, bytes.size());
+        return S_OK;
+    }
+    if (!work.file)
+        return E_DSTORAGE_INVALID_FILE_HANDLE;
+    const auto handle = work.file->GetHandle();
+    if (handle == INVALID_HANDLE_VALUE)
+        return E_DSTORAGE_INVALID_FILE_HANDLE;
+    OVERLAPPED at{};
+    at.Offset = static_cast<DWORD>(request.file_offset);
+    at.OffsetHigh = static_cast<DWORD>(request.file_offset >> 32);
+    DWORD done = 0;
+    if (!ReadFile(handle, bytes.data(), request.source_size, &done, &at))
+        return HRESULT_FROM_WIN32(GetLastError() ? GetLastError() : ERROR_READ_FAULT);
+    if (done != request.source_size)
+        return E_DSTORAGE_END_OF_FILE;
+    return S_OK;
+}
+
+HRESULT read(const Work &work) {
+    const auto &request = work.request;
+    if (request.options & option_swizzle) {
         // the console's hardware texture swizzle: the mode says how the destination is
         // laid out, and this runtime does not know it
         if (static std::atomic<bool> shown{false}; !shown.exchange(true))
             std::fprintf(stderr,
                          "[Runtime] DirectStorage: a request with the swizzle mode %llu is "
                          "not done\n",
-                         static_cast<unsigned long long>((request.options & swizzle) >> 5));
+                         static_cast<unsigned long long>((request.options & option_swizzle) >> 5));
         return E_DSTORAGE_DECOMPRESSION_ERROR;
     }
-    if (request.options & (destination_pages | source_pages)) {
+    if (request.options & (option_destination_pages | option_source_pages)) {
         if (static std::atomic<bool> shown{false}; !shown.exchange(true))
             std::fprintf(stderr,
                          "[Runtime] DirectStorage: a request with options 0x%llx (physical "
@@ -215,62 +282,57 @@ HRESULT read(const Request &request) {
                          request.options);
         return E_NOTIMPL;
     }
-    if (!request.destination || !request.source)
-        return E_INVALIDARG;
-    const bool inflated = request.options & zlib;
-    const auto mode = static_cast<UINT32>((request.options & bcpack) >> 1);
-    std::vector<std::uint8_t> packed;
-    const std::uint8_t *data = nullptr;
-    if (request.options & from_memory) {
-        data = static_cast<const std::uint8_t *>(request.source);
-    } else {
-        // read straight to where it goes unless it has to be inflated or decoded first
-        const bool straight = !inflated && !mode;
-        auto *const target =
-            straight ? static_cast<std::uint8_t *>(request.destination)
-                     : (packed.resize(request.source_size), packed.data());
-        if (straight) {
-            if (request.source_size > request.destination_size)
-                return E_INVALIDARG;
-            prepare_title_write(target, request.source_size);
-        }
+    const bool inflated = request.options & option_zlib;
+    const auto mode = static_cast<UINT32>((request.options & option_bcpack) >> 1);
+    // a plain read goes straight from the file to the destination
+    if (!inflated && !mode && !(request.options & option_source_memory)) {
+        if (request.source_size > request.destination_size)
+            return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        if (!work.file)
+            return E_DSTORAGE_INVALID_FILE_HANDLE;
+        const auto handle = work.file->GetHandle();
+        if (handle == INVALID_HANDLE_VALUE)
+            return E_DSTORAGE_INVALID_FILE_HANDLE;
+        prepare_title_write(request.destination, request.source_size);
         OVERLAPPED at{};
         at.Offset = static_cast<DWORD>(request.file_offset);
         at.OffsetHigh = static_cast<DWORD>(request.file_offset >> 32);
         DWORD done = 0;
-        if (!ReadFile(static_cast<FileInterface *>(request.source)->GetHandle(), target,
-                      request.source_size, &done, &at) ||
-            done != request.source_size)
-            return HRESULT_FROM_WIN32(GetLastError() ? GetLastError() : ERROR_HANDLE_EOF);
-        if (straight)
-            return S_OK;
-        data = packed.data();
+        if (!ReadFile(handle, request.destination, request.source_size, &done, &at))
+            return HRESULT_FROM_WIN32(GetLastError() ? GetLastError() : ERROR_READ_FAULT);
+        if (done != request.source_size)
+            return E_DSTORAGE_END_OF_FILE;
+        return S_OK;
+    }
+    std::vector<std::uint8_t> packed;
+    if (const auto result = read_source(work, packed); FAILED(result))
+        return result;
+    if (inflated) {
+        // the intermediate size is the size of the inflated stream; without it the
+        // stream is the size of the destination
+        const auto stage = request.intermediate_size ? request.intermediate_size
+                                                     : request.destination_size;
+        std::vector<std::uint8_t> plain;
+        plain.reserve(stage);
+        if (!inflate_zlib({packed.data(), packed.size()}, plain, stage))
+            return E_DSTORAGE_ZLIB_BAD_DATA;
+        packed = std::move(plain);
     }
     prepare_title_write(request.destination, request.destination_size);
-    std::vector<std::uint8_t> plain;
-    if (inflated) {
-        if (!inflate_zlib({data, request.source_size}, plain) ||
-            plain.size() > request.destination_size)
-            return E_FAIL;
-        data = plain.data();
-    }
     if (mode) {
         // the console's texture compression, in bcpack.dll
         const auto decoder = bcpack_decoder();
         if (!decoder)
             return E_NOTIMPL;
-        const auto result = decoder(mode, data, request.source_size,
+        const auto result = decoder(mode, packed.data(), packed.size(),
                                     static_cast<std::uint8_t *>(request.destination),
                                     request.destination_size);
         return FAILED(result) ? result : S_OK;
     }
-    if (inflated) {
-        std::memcpy(request.destination, data, plain.size());
-        return S_OK;
-    }
-    if (request.source_size > request.destination_size)
-        return E_INVALIDARG;
-    std::memcpy(request.destination, data, request.source_size);
+    if (packed.size() > request.destination_size)
+        return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+    if (!packed.empty())
+        std::memcpy(request.destination, packed.data(), packed.size());
     return S_OK;
 }
 
@@ -285,12 +347,27 @@ class Queue final : public Object<QueueInterface> {
     void EnqueueRequest(const Request *request) override {
         if (!request)
             return;
+        Work work;
+        work.request = *request;
+        // the console refuses a request that does not fit its queue, and counts it as a
+        // failure: the status after it gets the error
+        if (const auto refusal = refuse(work); FAILED(refusal)) {
+            {
+                const std::lock_guard lock(mutex_);
+                if (!failures_++)
+                    first_failure_ = refusal;
+                SetEvent(error_);
+            }
+            pending_.emplace_back(Refused{refusal});
+            submit_when_full();
+            return;
+        }
         {
             const std::lock_guard lock(mutex_);
             // the file is held until the request is done
-            if (!(request->options & 1ull << 22) && request->source)
-                static_cast<IUnknown *>(request->source)->AddRef();
-            pending_.emplace_back(*request);
+            if (work.file)
+                work.file->AddRef();
+            pending_.emplace_back(std::move(work));
         }
         submit_when_full();
     }
@@ -325,7 +402,7 @@ class Queue final : public Object<QueueInterface> {
         const std::lock_guard running(running_);
         HRESULT since_mark = S_OK;
         for (auto &entry : work) {
-            if (auto *const request = std::get_if<Request>(&entry)) {
+            if (auto *const request = std::get_if<Work>(&entry)) {
                 const auto result = read(*request);
                 // XV_FILE_TRACE: the first requests, and every one that fails
                 if (static std::atomic<int> shown{0};
@@ -333,11 +410,12 @@ class Queue final : public Object<QueueInterface> {
                     std::fprintf(stderr,
                                  "[Runtime] DirectStorage request: options 0x%llx, %u bytes at "
                                  "%llu to %u bytes (intermediate %u): 0x%08lx\n",
-                                 request->options, request->source_size, request->file_offset,
-                                 request->destination_size, request->intermediate_size,
+                                 request->request.options, request->request.source_size,
+                                 request->request.file_offset, request->request.destination_size,
+                                 request->request.intermediate_size,
                                  static_cast<unsigned long>(result));
-                if (!(request->options & 1ull << 22) && request->source)
-                    static_cast<IUnknown *>(request->source)->Release();
+                if (request->file)
+                    request->file->Release();
                 if (FAILED(result)) {
                     if (SUCCEEDED(since_mark))
                         since_mark = result;
@@ -346,6 +424,9 @@ class Queue final : public Object<QueueInterface> {
                         first_failure_ = result;
                     SetEvent(error_);
                 }
+            } else if (auto *const refused = std::get_if<Refused>(&entry)) {
+                if (SUCCEEDED(since_mark))
+                    since_mark = refused->result;
             } else if (auto *const mark = std::get_if<Mark>(&entry)) {
                 mark->status->set(mark->index, since_mark);
                 mark->status->Release();
@@ -359,11 +440,11 @@ class Queue final : public Object<QueueInterface> {
     void CancelRequestsWithTag(UINT64 mask, UINT64 value) override {
         const std::lock_guard lock(mutex_);
         std::erase_if(pending_, [&](Entry &entry) {
-            auto *const request = std::get_if<Request>(&entry);
-            if (!request || (request->tag & mask) != value)
+            auto *const request = std::get_if<Work>(&entry);
+            if (!request || (request->request.tag & mask) != value)
                 return false;
-            if (!(request->options & 1ull << 22) && request->source)
-                static_cast<IUnknown *>(request->source)->Release();
+            if (request->file)
+                request->file->Release();
             return true;
         });
     }
@@ -399,7 +480,57 @@ class Queue final : public Object<QueueInterface> {
         ID3D12Fence *fence;
         UINT64 value;
     };
-    using Entry = std::variant<Request, Mark, Signal>;
+    struct Refused {
+        HRESULT result;
+    };
+    using Entry = std::variant<Work, Mark, Signal, Refused>;
+    // What the console refuses, the way it refuses it: a queue of files takes file
+    // sources and a queue of memory takes memory ones, and the sizes have to fit the
+    // stages the request names
+    HRESULT refuse(Work &work) const {
+        const auto &request = work.request;
+        const bool memory = desc_.source_type != 0;
+        const bool source_memory = request.options & option_source_memory;
+        if (source_memory != memory)
+            return E_DSTORAGE_INVALID_SOURCE_TYPE;
+        if (!request.destination || (source_memory && !request.source))
+            return E_DSTORAGE_ACCESS_VIOLATION;
+        if (request.options & ~option_known) {
+            if (static std::atomic<bool> shown{false}; !shown.exchange(true))
+                std::fprintf(stderr,
+                             "[Runtime] DirectStorage: a request with the unknown option bits "
+                             "0x%llx\n",
+                             static_cast<unsigned long long>(request.options & ~option_known));
+        }
+        const bool inflated = request.options & option_zlib;
+        const auto mode = static_cast<UINT32>((request.options & option_bcpack) >> 1);
+        if (mode > 7)
+            return E_DSTORAGE_DECOMPRESSION_ERROR;
+        if (!source_memory) {
+            // the source is a file of ours
+            if (!File::is(request.source))
+                return E_DSTORAGE_INVALID_FILE_HANDLE;
+            work.file = static_cast<File *>(request.source);
+        }
+        if (!inflated && !mode) {
+            if (request.destination_size != request.source_size)
+                return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        } else if (inflated && !mode) {
+            if (request.destination_size <= request.source_size)
+                return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+            if (request.intermediate_size &&
+                (request.intermediate_size <= request.source_size ||
+                 request.intermediate_size > request.destination_size))
+                return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+        } else if (mode && !inflated) {
+            if (request.intermediate_size)
+                return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+        } else if (!request.intermediate_size) {
+            // zlib and BCPack: the intermediate size is the size of the inflated stream
+            return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+        }
+        return S_OK;
+    }
     // a queue submits itself when half of it is taken
     void submit_when_full() {
         bool full;
