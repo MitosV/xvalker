@@ -2,6 +2,11 @@ add_executable(xv_tests tests.cpp pe_directories.cpp loader_image.cpp xvd.cpp pr
   console_shader.cpp)
 target_link_libraries(xv_tests PRIVATE xv_options xv_pe xv_core xv_catch xv_xvd xv_pri xv_loader
   xv_runtime_common xv_runtime_modules d3dcompiler)
+# The UMA heap probe: a standalone program (no window, no swap chain) that opens a heap over
+# committed process memory, as the XCL shader backend does.
+add_executable(xv_uma_heap_probe uma_heap_probe.cpp)
+target_link_libraries(xv_uma_heap_probe PRIVATE xv_options d3d12 dxgi)
+
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME fixture COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/corpus/generate.py"
   --all "${CMAKE_CURRENT_BINARY_DIR}")
