@@ -22,6 +22,9 @@ enum class ShaderStage {
 // whether the container's DXIL part has no bitcode
 bool console_only_shader(std::span<const std::uint8_t> container);
 bool shader_has_dxil(std::span<const std::uint8_t> container);
+// A console shader with DXIL that calls the console's own intrinsics, lowered and signed for
+// the host. The bytes stay where they are for as long as the process runs. Empty if none.
+std::span<const std::uint8_t> lower_console_dxil(std::span<const std::uint8_t> container);
 // The machine code of such a shader, as little-endian words up to and including the one
 // that ends the program. Empty if it is not found.
 std::vector<std::uint32_t> console_shader_code(std::span<const std::uint8_t> container);
