@@ -38,18 +38,23 @@ std::string trim(const std::string &text) {
     return text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
 }
 
-// The pieces of a text, split at the separators that are not inside brackets.
+// The pieces of a text, split at the separators that are not inside brackets. Type names such
+// as "vector<float, 2>" hold commas of their own; a closing '>' without a match is harmless.
 std::vector<std::string> split_top(const std::string &text, char separator) {
     std::vector<std::string> pieces;
     std::string current;
-    int depth = 0;
+    int depth = 0, angles = 0;
     for (const char c : text) {
         if (c == '{' || c == '(' || c == '[') {
             ++depth;
         } else if (c == '}' || c == ')' || c == ']') {
             --depth;
+        } else if (c == '<') {
+            ++angles;
+        } else if (c == '>' && angles > 0) {
+            --angles;
         }
-        if (c == separator && depth == 0) {
+        if (c == separator && depth == 0 && angles == 0) {
             pieces.push_back(current);
             current.clear();
             continue;
@@ -1565,7 +1570,7 @@ std::optional<std::vector<std::uint8_t>> assemble(const std::string &text, std::
         if (FAILED(status) || !blob) {
             IDxcBlobEncoding *error = nullptr, *text8 = nullptr;
             result->GetErrorBuffer(&error);
-            if (error && library->GetBlobAsUtf8(error, &text8) && text8 && why)
+            if (error && SUCCEEDED(library->GetBlobAsUtf8(error, &text8)) && text8 && why)
                 *why = std::string(static_cast<const char *>(text8->GetBufferPointer()),
                                    text8->GetBufferSize());
             if (why && why->empty())
@@ -1626,7 +1631,7 @@ bool sign(std::vector<std::uint8_t> &container, std::string *why) {
             if (FAILED(status)) {
                 IDxcBlobEncoding *error = nullptr, *text8 = nullptr;
                 result->GetErrorBuffer(&error);
-                if (error && library->GetBlobAsUtf8(error, &text8) && text8 && why)
+                if (error && SUCCEEDED(library->GetBlobAsUtf8(error, &text8)) && text8 && why)
                     *why = std::string(static_cast<const char *>(text8->GetBufferPointer()),
                                        text8->GetBufferSize());
                 if (why && why->empty())
@@ -1679,12 +1684,14 @@ std::map<std::string, std::string> metadata(const std::string &text) {
 
 // The contents of a metadata node: what is between its brackets.
 std::string node_content(const std::string &value) {
-    if (value.size() < 2 || value.front() != '{')
+    // A metadata node's value is "!{ ... }"; the bracket need not start the value.
+    const auto open = value.find('{');
+    if (open == std::string::npos)
         return {};
-    const auto close = bracket_end(value, 0);
+    const auto close = bracket_end(value, open);
     if (close == std::string::npos)
         return {};
-    return value.substr(1, close - 1);
+    return value.substr(open + 1, close - open - 1);
 }
 
 // The number a field of a resource holds.
@@ -1699,23 +1706,23 @@ int field_number(const std::string &field) {
 std::map<std::pair<int, int>, Resource> resources_of(const std::string &text, int &cbuffer_size) {
     const auto nodes = metadata(text);
     std::map<std::pair<int, int>, Resource> resources;
-    cbuffer_size = 0;
     auto top = nodes.find("!dx.resources");
     if (top == nodes.end())
         return resources;
-    const auto lists = split_top(node_content(top->second), ',');
-    for (std::size_t cls = 0; cls < lists.size(); ++cls) {
-        const auto list = trim(lists[cls]);
+    // !dx.resources points at a node whose entries are the lists of bindings, one per class
+    const auto all = nodes.find(trim(node_content(top->second)));
+    if (all == nodes.end())
+        return resources;
+    const auto classes = split_top(node_content(all->second), ',');
+    for (std::size_t cls = 0; cls < classes.size(); ++cls) {
+        const auto list = trim(classes[cls]);
         if (list.empty() || list.front() != '!')
             continue;
         const auto found = nodes.find(list);
         if (found == nodes.end())
             continue;
-        for (auto &entry : split_top(node_content(found->second), ',')) {
-            const auto name = trim(entry);
-            if (name.empty() || name.front() != '!')
-                continue;
-            const auto one = nodes.find(name);
+        for (auto &resource_name : split_top(node_content(found->second), ',')) {
+            const auto one = nodes.find(trim(resource_name));
             if (one == nodes.end())
                 continue;
             const auto fields = split_top(node_content(one->second), ',');
@@ -1737,12 +1744,77 @@ std::map<std::pair<int, int>, Resource> resources_of(const std::string &text, in
                         resource.stride = field_number(values[1]);
                 }
             }
-            if (resource.kind == 4 && cbuffer_size == 0)
-                cbuffer_size = field_number(fields.back());
+            // a constant buffer's kind field is its size in bytes; use the first one
+            if (cls == 2 && cbuffer_size == 16)
+                cbuffer_size = resource.kind;
+            // a resource with a volatile flag uses the raw-buffer kind
+            for (const auto &field : fields)
+                if (trim(field) == "i1 true")
+                    resource.kind |= 0x4000;
             resources[{static_cast<int>(cls), range}] = resource;
         }
     }
     return resources;
+}
+
+// The console's compiler sometimes puts zero in the element-offset operand of a byte-address
+// buffer operation, where the host's validator wants undef. A structured buffer, in contrast,
+// needs the offset defined, so the rewrite follows the kind of buffer each handle names.
+std::string host_buffer_offsets(const std::string &text) {
+    int cbuffer_size = 16;
+    const auto resources = resources_of(text, cbuffer_size);
+    std::map<std::string, bool> is_byte_address;
+    static const std::string pattern = "call %dx.types.Handle @dx.op.createHandle(i32 57, i8 ";
+    for (const auto &line : split_lines(text)) {
+        const auto at = line.find(pattern);
+        if (at == std::string::npos)
+            continue;
+        const auto parts = split_top(line.substr(at + pattern.size()), ',');
+        if (parts.size() < 5)
+            continue;
+        const auto cls = std::atoi(trim(parts[0]).c_str());
+        const auto range = std::atoi(trim(parts[1]).substr(3).c_str());
+        const auto found = resources.find({cls, range});
+        const int kind = found != resources.end() ? found->second.kind : 11;
+        const auto name = line.substr(0, at);
+        const auto name_at = name.find_last_of('%');
+        if (name_at != std::string::npos)
+            is_byte_address[name.substr(name_at)] = (kind & 0xFF) == 11;
+    }
+    std::vector<std::string> lines;
+    for (auto line : split_lines(text)) {
+        if (trim(line).rfind("declare ", 0) == 0) {
+            lines.push_back(line);
+            continue;
+        }
+        auto at = line.find("@dx.op.rawBufferLoad.");
+        if (at == std::string::npos)
+            at = line.find("@dx.op.rawBufferStore.");
+        if (at == std::string::npos) {
+            lines.push_back(line);
+            continue;
+        }
+        const auto open = line.find('(', at);
+        const auto close = open == std::string::npos ? std::string::npos : bracket_end(line, open);
+        if (close == std::string::npos) {
+            lines.push_back(line);
+            continue;
+        }
+        auto arguments = split_top(line.substr(open + 1, close - open - 1), ',');
+        const auto handle = arguments.size() > 1 ? trim(arguments[1]) : std::string();
+        const auto known = is_byte_address.find(handle);
+        if (known != is_byte_address.end() && known->second && arguments.size() > 3 &&
+            trim(arguments[3]) != "i32 undef")
+            arguments[3] = " i32 undef";
+        std::string joined;
+        for (std::size_t i = 0; i < arguments.size(); ++i) {
+            if (i)
+                joined += ", ";
+            joined += trim(arguments[i]);
+        }
+        lines.push_back(line.substr(0, open + 1) + joined + line.substr(close));
+    }
+    return join_lines(lines);
 }
 
 // The text as shader model 6.6: the handles are made of the bindings.
@@ -1752,14 +1824,16 @@ std::string to_shader_model_66(const std::string &text) {
     std::string out;
     bool has_res_bind = false, has_properties = false, has_annotate = false;
     for (const auto &line : split_lines(text)) {
-        // the version and the shader model
+        // the version and the shader model are metadata nodes the top-level nodes point at
         auto changed = line;
-        const auto version = changed.find("!{i32 1, i32 5}");
-        if (version != std::string::npos && changed.rfind("!dx.version", 0) == 0)
-            changed.replace(version, 13, "!{i32 1, i32 6}");
-        const auto model = changed.find("!{!\"cs\", i32 6, i32 5}");
-        if (model != std::string::npos && changed.rfind("!dx.shaderModel", 0) == 0)
-            changed.replace(model, 21, "!{!\"cs\", i32 6, i32 6}");
+        if (changed.rfind('!', 0) == 0) {
+            const auto version = changed.find("!{i32 1, i32 5}");
+            if (version != std::string::npos)
+                changed.replace(version, 15, "!{i32 1, i32 6}");
+            const auto model = changed.find("!{!\"cs\", i32 6, i32 5}");
+            if (model != std::string::npos)
+                changed.replace(model, 22, "!{!\"cs\", i32 6, i32 6}");
+        }
         // a handle of a resource
         static const std::string pattern = "call %dx.types.Handle @dx.op.createHandle(i32 57, i8 ";
         const auto at = changed.find(pattern);
@@ -1775,19 +1849,25 @@ std::string to_shader_model_66(const std::string &text) {
         }
         const auto cls = std::atoi(trim(parts[0]).c_str());
         const auto range = std::atoi(trim(parts[1]).substr(3).c_str());
-        const auto index = trim(parts[2]).substr(3);
+        const auto index = trim(trim(parts[2]).substr(3));
         const auto non_uniform = trim(parts[3]);
         const auto found = resources.find({cls, range});
         const int space = found != resources.end() ? found->second.space : 0;
         const int lower = found != resources.end() ? found->second.lower : range;
         const int count = found != resources.end() ? found->second.count : 1;
-        const int kind = found != resources.end() ? found->second.kind : 0;
+        const int kind = found != resources.end() ? found->second.kind : 11;
         const int stride = found != resources.end() ? found->second.stride : 0;
         const int upper = count > 0 ? lower + count - 1 : -1;
         const auto name = changed.substr(0, at);
         const auto name_at = name.find_last_of('%');
-        const auto number = name_at == std::string::npos ? std::string()
-                                                         : name.substr(name_at + 1);
+        auto number = name_at == std::string::npos ? std::string() : name.substr(name_at + 1);
+        const auto digits = number.find_first_not_of("0123456789");
+        if (digits != std::string::npos)
+            number.erase(digits);
+        if (number.empty()) {
+            out += changed + "\n";
+            continue;
+        }
         const auto indent = changed.substr(0, changed.find_first_not_of(" \t"));
         const auto handle = "%hraw." + number;
         std::string properties;
@@ -1801,10 +1881,10 @@ std::string to_shader_model_66(const std::string &text) {
         out += indent + handle + " = call %dx.types.Handle @dx.op.createHandleFromBinding(i32 "
                "217, %dx.types.ResBind { i32 " + std::to_string(lower) + ", i32 " +
                std::to_string(upper) + ", i32 " + std::to_string(space) + ", i8 " +
-               std::to_string(cls) + " }, i32 " + index + ", i1 " + non_uniform + ")\n";
-        out += indent + number + " = call %dx.types.Handle @dx.op.annotateHandle(i32 216, "
+               std::to_string(cls) + " }, i32 " + index + ", " + non_uniform + ")\n";
+        out += indent + "%" + number + " = call %dx.types.Handle @dx.op.annotateHandle(i32 216, "
                "%dx.types.Handle " + handle + ", %dx.types.ResourceProperties " + properties +
-               ")";
+               ")\n";
         has_res_bind = true;
         has_properties = true;
         has_annotate = true;
@@ -1858,7 +1938,8 @@ std::string to_shader_model_66(const std::string &text) {
 std::optional<XboxDxilText> lower_xbox_dxil_text(const std::string &text) {
     XboxDxilText result;
     std::vector<std::string> left;
-    result.lowered = to_shader_model_66(renumber(lower_text(text, result.calls, left)));
+    result.lowered =
+        to_shader_model_66(host_buffer_offsets(renumber(lower_text(text, result.calls, left))));
     std::set<std::string> unique(left.begin(), left.end());
     result.left.assign(unique.begin(), unique.end());
     return result;
@@ -1884,6 +1965,41 @@ bool xbox_dxil_has_intrinsics(std::span<const std::uint8_t> container) {
     if (!text)
         return false;
     return text->find("@xbox.") != std::string::npos;
+}
+
+// The validator can ask for a different shader-flags word than the console compiler wrote in
+// the entry-point properties. Read the word it wants out of its complaint.
+std::optional<std::string> wanted_flags(const std::string &error) {
+    if (error.find("Flags must match usage") == std::string::npos)
+        return std::nullopt;
+    static const std::string key = "actual=";
+    const auto at = error.find(key);
+    if (at == std::string::npos)
+        return std::nullopt;
+    const auto start = at + key.size();
+    auto end = start;
+    while (end < error.size() && std::isdigit(static_cast<unsigned char>(error[end])))
+        ++end;
+    if (end == start)
+        return std::nullopt;
+    return error.substr(start, end - start);
+}
+
+// Put a new flags word in the entry-point properties node.
+std::string with_entry_flags(const std::string &text, const std::string &value) {
+    static const std::string marker = " = !{i32 0, i64 ";
+    std::vector<std::string> lines;
+    for (auto line : split_lines(text)) {
+        const auto at = line.find(marker);
+        if (at != std::string::npos) {
+            const auto start = at + marker.size();
+            const auto end = line.find(", i32 4,", start);
+            if (end != std::string::npos)
+                line.replace(start, end - start, value);
+        }
+        lines.push_back(line);
+    }
+    return join_lines(lines);
 }
 
 std::optional<XboxDxilLowering> lower_xbox_dxil(std::span<const std::uint8_t> container,
@@ -1932,6 +2048,18 @@ std::optional<XboxDxilLowering> lower_xbox_dxil(std::span<const std::uint8_t> co
         return std::nullopt;
     }
     result.signed_ok = sign(*container_bytes, &said);
+    if (!result.signed_ok) {
+        const auto flags = wanted_flags(said);
+        if (flags) {
+            auto fixed = with_entry_flags(result.lowered, *flags);
+            auto retried = assemble(fixed, &said);
+            if (retried) {
+                result.lowered = std::move(fixed);
+                container_bytes = std::move(*retried);
+                result.signed_ok = sign(*container_bytes, &said);
+            }
+        }
+    }
     if (!result.signed_ok) {
         if (why)
             *why = said.empty() ? "the signer turned the shader down" : said;
