@@ -6,3 +6,6 @@
 /samples/*
 !/samples/.gitkeep
 __pycache__/
+
+# Rust build output of tools/xcl-recomp
+/tools/xcl-recomp/target/
