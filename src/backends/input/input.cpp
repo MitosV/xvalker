@@ -273,14 +273,16 @@ GamepadState read() {
         bindings = current;
         keys = window_keys;
     }
-    if (bindings.capture == Capture::direct) {
-        auto state = from_keys(bindings, detail::direct_key);
-        GamepadState gamepad;
-        if (bindings.host_gamepad && detail::direct_gamepad(gamepad))
-            state = merge(state, gamepad);
-        return state;
-    }
-    return from_keys(bindings, [&](int key) { return keys[static_cast<std::size_t>(key)]; });
+    auto state =
+        bindings.capture == Capture::direct
+            ? from_keys(bindings, detail::direct_key)
+            : from_keys(bindings, [&](int key) { return keys[static_cast<std::size_t>(key)]; });
+    // The window sees no gamepad events, so the host gamepad is read the same way under
+    // both captures (and only while a window of this process is in the foreground).
+    GamepadState gamepad;
+    if (bindings.host_gamepad && detail::direct_gamepad(gamepad))
+        state = merge(state, gamepad);
+    return state;
 }
 } // namespace
 } // namespace xv::input

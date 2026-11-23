@@ -218,7 +218,7 @@ void Settings::input(const Fonts &fonts, const Host &host) {
     if (begin_settings("capture")) {
         setting(fonts, "Method",
                 settings.capture == input::Capture::direct
-                    ? "Direct: the gamepad (XInput) and the keyboard, read from the system."
+                    ? "Direct: the keyboard, read from the system."
                     : "Window: the keyboard, from this window's events.");
         static constexpr const char *methods[] = {"Window", "Direct"};
         int method = settings.capture == input::Capture::direct ? 1 : 0;
@@ -226,11 +226,9 @@ void Settings::input(const Fonts &fonts, const Host &host) {
             settings.capture = method ? input::Capture::direct : input::Capture::window;
             changed();
         }
-        setting(fonts, "Host gamepad", "With direct capture, also read the gamepad plugged in.");
-        ImGui::BeginDisabled(settings.capture != input::Capture::direct);
+        setting(fonts, "Host gamepad", "Also read the gamepad plugged in.");
         if (ImGui::Checkbox("##gamepad", &settings.host_gamepad))
             changed();
-        ImGui::EndDisabled();
         end_settings();
     }
 

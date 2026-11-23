@@ -65,15 +65,15 @@ const char *control_id(Control control);   // for the settings file
 
 // How key and gamepad state is obtained.
 enum class Capture {
-    window, // from the events of the title's window: keyboard only, while it has the focus
-    direct  // from the system: host gamepad (XInput) and keyboard, without going through
-            // the window
+    window, // keyboard from the events of the title's window, while it has the focus
+    direct  // keyboard from the system, without going through the window
+    // either way the host gamepad (XInput) is read too, unless host_gamepad is off
 };
 // Keys are Windows virtual-key codes; 0 is "not bound".
 struct Settings {
     Capture capture = Capture::window;
     std::array<int, control_count> keys{};
-    bool host_gamepad = true; // direct capture: also read the first gamepad of the host
+    bool host_gamepad = true; // also read the first gamepad of the host
 };
 Settings default_settings();
 std::string key_name(int key);
