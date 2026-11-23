@@ -1,0 +1,31 @@
+--- a/tools/xbox/cpu_ref.py
++++ b/tools/xbox/cpu_ref.py
+@@ -26,7 +26,7 @@
+     import rdna2_recomp as rdna2
+ 
+ M32 = 0xffffffff
+-WAVE = 64
++WAVE = int(os.environ.get("XBOX_WAVE", "64"))
+ RECOMPILER_DECODER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "core", "shader", "recompiler", "RdnaDecoder", "src", "RdnaVectorOpDecoder.cpp")
+ 
+ 
+@@ -185,7 +185,7 @@
+         self.v = [[0] * WAVE for _ in range(256)]
+         for lane in range(WAVE):
+             self.v[0][lane] = lane
+-        self.s[126], self.s[127] = M32, M32      # exec = all 64 lanes
++        self.s[126], self.s[127] = M32, 0 if WAVE == 32 else M32   # exec mask
+         self.scc = 0
+         self.lds = bytearray(65536)
+         self.lds_written = set()      # dword addresses written so far: reading any other LDS dword is uninitialised memory on a GPU
+@@ -1050,6 +1050,10 @@
+         base = (words[0] << 8) | ((words[1] & 0xff) << 40)
+         img_id = (base - 0x7000000000) >> 24
+         img = self.images.get(img_id) if base >= 0x7000000000 and (base - 0x7000000000) % 0x1000000 == 0 else None
++        if img is None and words[0] % 2 == 0 and (words[3] & 0x0FFFFFFF) == 0xFAC and (words[3] >> 28) in (8, 9, 10, 11, 13):
++            # XCL T#: BASE_ADDRESS = SRV heap index (2 per image), FORMAT, TYPE
++            img_id = words[0] // 2 + 1
++            img = self.images.get(img_id)
+         if img is None:
+             raise Unsupported("image descriptor does not name a known image")
+         wd, ht = img["w"], img["h"]
