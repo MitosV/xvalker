@@ -12,4 +12,7 @@ namespace xv::runtime {
 // An `executable` gets index 0 instead (see static_tls.cpp).
 void install_static_tls(const nlohmann::json &tls, std::uint64_t base, std::uint64_t image_base,
                         bool executable = false);
+// On the thread about to run the executable's entry point: its TLS callbacks are told of
+// the process there.
+void start_static_tls();
 } // namespace xv::runtime

@@ -90,6 +90,61 @@ std::int32_t texture2d_layout(const TextureDescription *description, void *layou
 std::int32_t resource_layout(Computer *self, void *layout) {
     return texture2d_layout(&self->description, layout);
 }
+// XG_TEXTURE3D_DESC, and the part of XG_MIPLEVEL_LAYOUT that says where a mip level is.
+struct VolumeDescription {
+    std::uint32_t width, height, depth, mips, format, usage, bind_flags, cpu_access, misc_flags,
+        esram_offset, esram_usage, tile_mode, pitch;
+};
+struct MipLayout {
+    std::uint64_t size, offset, slice_size;
+    std::uint32_t pitch_pixels, pitch_bytes, alignment, padded_width, padded_height, padded_depth,
+        width, height, depth, samples;
+};
+constexpr std::size_t plane_size = 0x20, bytes_per_element = 0x38, first_mip = 0x40,
+                      mip_bytes = 0x60;
+std::int32_t texture3d_layout(const VolumeDescription *description, void *layout) {
+    if (!description || !layout)
+        return static_cast<std::int32_t>(0x80070057); // E_INVALIDARG
+    std::memset(layout, 0, layout_bytes);
+    const auto &d = *description;
+    const auto size = format_size(d.format);
+    auto mips = d.mips;
+    if (!mips) {
+        for (auto side = std::max({d.width, d.height, d.depth}); side; side >>= 1)
+            ++mips;
+    }
+    mips = std::min(mips, 15u);
+    const auto base = static_cast<char *>(layout);
+    std::uint64_t total = 0;
+    for (std::uint32_t mip = 0; mip < mips; ++mip) {
+        const std::uint32_t w = std::max(d.width >> mip, 1u), h = std::max(d.height >> mip, 1u),
+                            depth = std::max(d.depth >> mip, 1u);
+        const std::uint32_t across = size.blocks ? (w + 3) / 4 : w,
+                            down = size.blocks ? (h + 3) / 4 : h;
+        MipLayout level{};
+        level.slice_size = std::uint64_t{across} * down * size.bytes;
+        level.size = level.slice_size * depth;
+        level.offset = total;
+        level.pitch_pixels = size.blocks ? across * 4 : across;
+        level.pitch_bytes = across * size.bytes;
+        level.alignment = 1;
+        level.padded_width = level.width = across;
+        level.padded_height = level.height = down;
+        level.padded_depth = level.depth = depth;
+        level.samples = 1;
+        std::memcpy(base + first_mip + mip * mip_bytes, &level, sizeof level);
+        total += level.size;
+    }
+    total = (total + 4095) & ~std::uint64_t{4095};
+    const std::uint64_t header[2] = {total, 4096};
+    std::memcpy(base, header, sizeof header);
+    const std::uint32_t counts[2] = {mips, 1}; // mip levels, planes
+    std::memcpy(base + sizeof header, counts, sizeof counts);
+    const std::uint64_t plane[3] = {total, 0, 4096}; // size, offset, alignment
+    std::memcpy(base + plane_size, plane, sizeof plane);
+    std::memcpy(base + bytes_per_element, &size.bytes, sizeof(std::uint32_t));
+    return 0;
+}
 template <int Slot> std::int32_t unknown(Computer *) {
     std::fprintf(stderr, "[Runtime] unimplemented xg_x.dll texture computer method %d\n", Slot);
     std::fflush(stderr);
@@ -140,6 +195,7 @@ void install_xg(Registry &registry, std::string_view module) {
     registry.add(module, "XGCreateTextureComputer",
                  reinterpret_cast<void *>(&create_texture_computer));
     registry.add(module, "XGComputeTexture2DLayout", reinterpret_cast<void *>(&texture2d_layout));
+    registry.add(module, "XGComputeTexture3DLayout", reinterpret_cast<void *>(&texture3d_layout));
     registry.add(module, "XGComputeOptimalTileMode", reinterpret_cast<void *>(&optimal_tile_mode));
     registry.add(module, "XGComputeOptimalDepthStencilTileModes",
                  reinterpret_cast<void *>(&optimal_depth_stencil_tile_modes));

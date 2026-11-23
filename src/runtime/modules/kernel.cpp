@@ -1,4 +1,5 @@
 #include "runtime/modules/kernel.hpp"
+#include "runtime/common/com_forward.hpp"
 #include "runtime/common/runtime.hpp"
 #include "runtime/modules/locale.hpp"
 #include "runtime/modules/placement.hpp"
@@ -18,8 +19,10 @@
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
+#include <vector>
 #include <windows.h>
 
+#include <mmdeviceapi.h>
 #include <objbase.h> // after windows.h
 
 // The Win32 functions a console answers differently from the host: libraries that are ours
@@ -27,8 +30,13 @@
 // puts its threads. ERA titles import them from kernelx.dll, GDK titles from API sets.
 namespace xv::runtime::modules {
 namespace {
-// ours and the title's first, then the host's
+std::wstring console_path(const wchar_t *name);
+// ours and the title's first, then the host's; a path on one of the console's drives is
+// the host's for it
 HMODULE WINAPI load_library(const wchar_t *name, HANDLE file, DWORD flags) {
+    const auto path = console_path(name);
+    if (name)
+        name = path.c_str();
     auto module = static_cast<HMODULE>(detail::guest_library(name));
     if (!module)
         module = LoadLibraryExW(name, file, flags);
@@ -107,9 +115,14 @@ std::wstring console_path(const wchar_t *name) {
     };
     std::error_code error;
     for (const auto prefix : {std::wstring_view(L"G:"), std::wstring_view(L"GAME:")})
-        if (drive(prefix))
-            return (package_directory(std::filesystem::current_path(error)) / rest(prefix))
-                .wstring();
+        if (drive(prefix)) {
+            // nothing is above the root of a drive: G:\..\data is G:\data
+            std::filesystem::path inside;
+            for (const auto &part : std::filesystem::path(rest(prefix)).lexically_normal())
+                if (part != L"..")
+                    inside /= part;
+            return (package_directory(std::filesystem::current_path(error)) / inside).wstring();
+        }
     if (drive(L"T:")) {
         const auto folder = save_directory() / "Temp";
         std::filesystem::create_directories(folder, error);
@@ -134,6 +147,52 @@ std::wstring console_path(const wchar_t *name) {
     if (path.size() > 1 && (path[0] == L'\\' || path[0] == L'/') && path[1] != L'\\' &&
         path[1] != L'/')
         return (package_directory(std::filesystem::current_path(error)) / path.substr(1)).wstring();
+    // A title that takes the root of its drive for its package (which it is on the console)
+    // names files of the package from the root of the host's drive.
+    if (path.size() > 3 && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) {
+        const auto package = package_directory(std::filesystem::current_path(error));
+        const auto root = package.root_name().wstring();
+        if (root.size() == 2 && towupper(root[0]) == towupper(path[0]) &&
+            GetFileAttributesW(name) == INVALID_FILE_ATTRIBUTES) {
+            auto inside = (package / path.substr(3)).wstring();
+            if (GetFileAttributesW(inside.c_str()) != INVALID_FILE_ATTRIBUTES)
+                return inside;
+        }
+    }
+    // Any other drive of the console is a folder of its own, kept apart for each title:
+    // nand\<title>\disk_<letter> in the configuration folder. Paths the host handed out
+    // stay the host's: the title's dump, the user's folders, the system's.
+    if (path.size() > 2 && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/') &&
+        iswalpha(path[0]) && !save_directory().empty()) {
+        static const std::vector<std::wstring> hosts = [] {
+            std::vector<std::wstring> folders;
+            std::error_code ignored;
+            folders.push_back(
+                package_directory(std::filesystem::current_path(ignored)).parent_path().wstring());
+            // profiles\<profile>\saves\<title>, in the configuration folder
+            folders.push_back(
+                save_directory().parent_path().parent_path().parent_path().parent_path().wstring());
+            for (const auto *variable : {L"USERPROFILE", L"SystemRoot", L"ProgramData", L"TEMP"})
+                if (const auto *value = _wgetenv(variable); value && *value)
+                    folders.emplace_back(value);
+            return folders;
+        }();
+        std::wstring plain(path);
+        std::replace(plain.begin(), plain.end(), L'/', L'\\');
+        const auto inside = [&](const std::wstring &folder) {
+            return plain.size() >= folder.size() &&
+                   CompareStringOrdinal(plain.data(), static_cast<int>(folder.size()),
+                                        folder.data(), static_cast<int>(folder.size()),
+                                        TRUE) == CSTR_EQUAL;
+        };
+        if (std::none_of(hosts.begin(), hosts.end(), inside)) {
+            const auto disk = std::filesystem::path(hosts[1]) / "nand" /
+                              save_directory().filename() /
+                              (std::wstring(L"disk_") + static_cast<wchar_t>(towlower(path[0])));
+            std::filesystem::create_directories(disk, error);
+            return (disk / path.substr(3)).wstring();
+        }
+    }
     return std::wstring(path);
 }
 // the same for the ANSI functions, whose results stay in the title's code page
@@ -506,9 +565,49 @@ struct ConsoleAudioInfo {
 };
 constexpr GUID console_audio_info{
     0x8b557adc, 0x555e, 0x47a0, {0xb2, 0x23, 0x43, 0x47, 0x7e, 0x48, 0x1d, 0xad}};
+// Another class of the console's device API ({730C5326-...} as {15B673D7-...}), by a
+// title's calls: its first method gives a device (T **), which the title activates an
+// audio client on. The host's default output stands for it.
+struct ConsoleAudioOutput {
+    void **vtable;
+    static HRESULT STDMETHODCALLTYPE query(ConsoleAudioOutput *self, const GUID *, void **object) {
+        *object = self;
+        return S_OK;
+    }
+    static ULONG STDMETHODCALLTYPE reference(ConsoleAudioOutput *) { return 1; }
+    static HRESULT STDMETHODCALLTYPE unknown(ConsoleAudioOutput *) { return E_NOTIMPL; }
+    static HRESULT STDMETHODCALLTYPE device(ConsoleAudioOutput *, IMMDevice **device) {
+        if (!device)
+            return E_POINTER;
+        *device = nullptr;
+        IMMDeviceEnumerator *devices = nullptr;
+        auto result = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                       IID_PPV_ARGS(&devices));
+        if (SUCCEEDED(result)) {
+            result = devices->GetDefaultAudioEndpoint(eRender, eConsole, device);
+            devices->Release();
+        }
+        return result;
+    }
+};
+constexpr GUID console_audio_output{
+    0x15b673d7, 0xbd21, 0x4441, {0xa3, 0x0e, 0x58, 0xea, 0xaa, 0xd3, 0x1e, 0x73}};
 HRESULT WINAPI co_create_instance(const GUID *class_id, IUnknown *outer, DWORD context,
                                   const GUID *iid, void **object) {
-    if (*iid == console_audio_info && object) {
+    if (*iid == console_audio_output && object) {
+        static void *vtable[16];
+        static ConsoleAudioOutput output{[] {
+            for (auto &slot : vtable)
+                slot = reinterpret_cast<void *>(&ConsoleAudioOutput::unknown);
+            vtable[0] = reinterpret_cast<void *>(&ConsoleAudioOutput::query);
+            vtable[1] = vtable[2] = reinterpret_cast<void *>(&ConsoleAudioOutput::reference);
+            vtable[3] = reinterpret_cast<void *>(&ConsoleAudioOutput::device);
+            return vtable;
+        }()};
+        *object = &output;
+        return S_OK;
+    }
+    const auto audio_info = [] {
         static void *vtable[16];
         static ConsoleAudioInfo info{[] {
             for (auto &slot : vtable)
@@ -518,13 +617,35 @@ HRESULT WINAPI co_create_instance(const GUID *class_id, IUnknown *outer, DWORD c
             vtable[8] = reinterpret_cast<void *>(&ConsoleAudioInfo::channels);
             return vtable;
         }()};
-        *object = &info;
+        return &info;
+    };
+    if (*iid == console_audio_info && object) {
+        *object = audio_info();
         return S_OK;
     }
     auto result = CoCreateInstance(*class_id, outer, context, *iid, object);
     // a console title's threads have COM without asking for it
     if (result == CO_E_NOTINITIALIZED && SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED)))
         result = CoCreateInstance(*class_id, outer, context, *iid, object);
+    // the host's device enumerator, which a title may ask for that interface later
+    if (SUCCEEDED(result) && object && *iid == __uuidof(IMMDeviceEnumerator)) {
+        static ConsoleAudioInfo *info;
+        info = audio_info();
+        *object = make_forwarder(static_cast<IUnknown *>(*object), 8,
+                                 +[](Forwarder *self, REFIID wanted, void **out) -> HRESULT {
+                                     if (wanted == console_audio_info) {
+                                         *out = info;
+                                         return S_OK;
+                                     }
+                                     if (wanted != __uuidof(IUnknown) &&
+                                         wanted != __uuidof(IMMDeviceEnumerator))
+                                         return forwarder_host(self)->QueryInterface(wanted, out);
+                                     forwarder_add_ref(self);
+                                     *out = self;
+                                     return S_OK;
+                                 },
+                                 {});
+    }
     if (FAILED(result) || std::getenv("XV_COM_TRACE")) {
         wchar_t text[64] = L"", wanted[64] = L"";
         StringFromGUID2(*class_id, text, 64);

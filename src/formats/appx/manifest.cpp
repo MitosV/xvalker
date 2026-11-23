@@ -105,6 +105,7 @@ nlohmann::json inspect_manifest(std::span<const std::uint8_t> bytes) {
     return {{"name", attribute(identity, "Name")},
             {"dependencies", std::move(dependencies)},
             {"version", attribute(identity, "Version")},
+            {"publisher", attribute(identity, "Publisher")},
             {"architecture", attribute(identity, "ProcessorArchitecture")},
             {"display_name", text(root.child("Properties").child("DisplayName"))},
             {"logo", std::move(logo)},

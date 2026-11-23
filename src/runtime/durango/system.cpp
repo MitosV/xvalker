@@ -1,5 +1,6 @@
 #include "runtime/common/com_forward.hpp"
 #include "runtime/common/runtime.hpp"
+#include "runtime/durango/d3d11x/wrap.hpp"
 #include "runtime/durango/runtime.hpp"
 
 #include <atomic>
@@ -7,7 +8,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <d3d11.h>
 #include <ksmedia.h>
+#include <mfobjects.h>
 #include <mmdeviceapi.h>
 #include <string>
 #include <string_view>
@@ -216,6 +219,168 @@ BOOL WINAPI query_system_hardware_info() {
     return FALSE;
 }
 
+// MFCreateDXGIDeviceManager: the host's manager, whose decoders make their textures and
+// views on the device the title gives it. They are the host's own code and get the host's
+// device, not the object the title has for it.
+HRESULT manager_query(Forwarder *self, REFIID iid, void **object) {
+    if (iid != __uuidof(IUnknown) && iid != __uuidof(IMFDXGIDeviceManager))
+        return forwarder_host(self)->QueryInterface(iid, object);
+    forwarder_add_ref(self);
+    *object = self;
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE reset_device(Forwarder *self, IUnknown *device, UINT token) {
+    return static_cast<IMFDXGIDeviceManager *>(forwarder_host(self))
+        ->ResetDevice(static_cast<IUnknown *>(d3d11x::unwrap(device)), token);
+}
+HRESULT WINAPI create_device_manager(UINT *token, IMFDXGIDeviceManager **manager) {
+    using Create = HRESULT(WINAPI *)(UINT *, IMFDXGIDeviceManager **);
+    static const auto create =
+        reinterpret_cast<Create>(detail::host_export("mfplat.dll", "MFCreateDXGIDeviceManager"));
+    if (!create || !manager)
+        return E_NOTIMPL;
+    IMFDXGIDeviceManager *host = nullptr;
+    const auto result = create(token, &host);
+    if (SUCCEEDED(result))
+        *manager = reinterpret_cast<IMFDXGIDeviceManager *>(make_forwarder(
+            host, 10, &manager_query, {{7, reinterpret_cast<void *>(&reset_device)}}));
+    return result;
+}
+// MFResetDXGIDeviceManagerX(manager, device, token): the console's way to give the manager
+// its device. Media Foundation decodes on threads of its own.
+HRESULT WINAPI reset_device_manager(IMFDXGIDeviceManager *manager, IUnknown *device, UINT token) {
+    if (!manager || !device)
+        return E_INVALIDARG;
+    if (ID3D10Multithread *threads = nullptr;
+        SUCCEEDED(static_cast<IUnknown *>(d3d11x::unwrap(device))->QueryInterface(&threads))) {
+        threads->SetMultithreadProtected(TRUE);
+        threads->Release();
+    }
+    return manager->ResetDevice(device, token);
+}
+
+// MFCreateDxvaSampleRendererX(device, ?, renderer): an object with one method, by a title's
+// calls of it: (context, sample, width, height) draws a decoded video frame over the render
+// target bound at the time. The host's video processor does the conversion from the
+// decoder's format.
+template <class T> void drop(T *&object) {
+    if (object)
+        object->Release();
+    object = nullptr;
+}
+struct SampleRenderer {
+    void *const *vtable;
+    std::atomic<ULONG> references{1};
+    ID3D11VideoProcessorEnumerator *enumerator = nullptr;
+    ID3D11VideoProcessor *processor = nullptr;
+    UINT from_width = 0, from_height = 0, to_width = 0, to_height = 0;
+};
+HRESULT STDMETHODCALLTYPE renderer_query(SampleRenderer *self, REFIID, void **object) {
+    ++self->references; // its one interface, whatever the title calls it
+    *object = self;
+    return S_OK;
+}
+ULONG STDMETHODCALLTYPE renderer_add_ref(SampleRenderer *self) { return ++self->references; }
+ULONG STDMETHODCALLTYPE renderer_release(SampleRenderer *self) {
+    const auto left = --self->references;
+    if (!left) {
+        drop(self->processor);
+        drop(self->enumerator);
+        delete self;
+    }
+    return left;
+}
+HRESULT STDMETHODCALLTYPE renderer_render(SampleRenderer *self, void *title_context,
+                                          IUnknown *sample_or_buffer, UINT, UINT) {
+    auto *const context = static_cast<ID3D11DeviceContext *>(d3d11x::unwrap(title_context));
+    if (!context || !sample_or_buffer)
+        return E_INVALIDARG;
+    IMFMediaBuffer *buffer = nullptr;
+    if (IMFSample *sample = nullptr; SUCCEEDED(sample_or_buffer->QueryInterface(&sample))) {
+        sample->GetBufferByIndex(0, &buffer);
+        sample->Release();
+    } else {
+        sample_or_buffer->QueryInterface(&buffer);
+    }
+    IMFDXGIBuffer *surface = nullptr;
+    ID3D11Texture2D *frame = nullptr, *target = nullptr;
+    ID3D11RenderTargetView *bound = nullptr;
+    ID3D11Resource *resource = nullptr;
+    ID3D11Device *device = nullptr;
+    ID3D11VideoDevice *video = nullptr;
+    ID3D11VideoContext *video_context = nullptr;
+    ID3D11VideoProcessorInputView *input = nullptr;
+    ID3D11VideoProcessorOutputView *output = nullptr;
+    UINT index = 0;
+    auto result = E_FAIL;
+    context->OMGetRenderTargets(1, &bound, nullptr);
+    if (bound)
+        bound->GetResource(&resource);
+    if (buffer && SUCCEEDED(buffer->QueryInterface(&surface)) &&
+        SUCCEEDED(surface->GetResource(IID_PPV_ARGS(&frame))) &&
+        SUCCEEDED(surface->GetSubresourceIndex(&index)) && resource &&
+        SUCCEEDED(resource->QueryInterface(&target))) {
+        frame->GetDevice(&device);
+        D3D11_TEXTURE2D_DESC from, to;
+        frame->GetDesc(&from);
+        target->GetDesc(&to);
+        if (SUCCEEDED(device->QueryInterface(&video)) &&
+            SUCCEEDED(context->QueryInterface(&video_context))) {
+            if (!self->processor || self->from_width != from.Width ||
+                self->from_height != from.Height || self->to_width != to.Width ||
+                self->to_height != to.Height) {
+                drop(self->processor);
+                drop(self->enumerator);
+                const D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{
+                    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                    {30, 1},
+                    from.Width,
+                    from.Height,
+                    {30, 1},
+                    to.Width,
+                    to.Height,
+                    D3D11_VIDEO_USAGE_PLAYBACK_NORMAL};
+                if (SUCCEEDED(video->CreateVideoProcessorEnumerator(&content, &self->enumerator)))
+                    video->CreateVideoProcessor(self->enumerator, 0, &self->processor);
+                self->from_width = from.Width, self->from_height = from.Height;
+                self->to_width = to.Width, self->to_height = to.Height;
+            }
+            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in{};
+            in.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+            in.Texture2D.ArraySlice = index;
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC out{};
+            out.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+            if (self->processor &&
+                SUCCEEDED(
+                    video->CreateVideoProcessorInputView(frame, self->enumerator, &in, &input)) &&
+                SUCCEEDED(video->CreateVideoProcessorOutputView(target, self->enumerator, &out,
+                                                                &output))) {
+                D3D11_VIDEO_PROCESSOR_STREAM stream{};
+                stream.Enable = TRUE;
+                stream.pInputSurface = input;
+                result = video_context->VideoProcessorBlt(self->processor, output, 0, 1, &stream);
+            }
+        }
+    }
+    if (static std::atomic<bool> told{false}; FAILED(result) && !told.exchange(true)) {
+        std::fprintf(stderr, "[Runtime] a video frame was not drawn: 0x%08lx\n",
+                     static_cast<unsigned long>(result));
+        std::fflush(stderr);
+    }
+    drop(output), drop(input), drop(video_context), drop(video), drop(device), drop(target);
+    drop(resource), drop(bound), drop(frame), drop(surface), drop(buffer);
+    return S_OK;
+}
+void *const renderer_vtable[] = {
+    reinterpret_cast<void *>(&renderer_query), reinterpret_cast<void *>(&renderer_add_ref),
+    reinterpret_cast<void *>(&renderer_release), reinterpret_cast<void *>(&renderer_render)};
+HRESULT WINAPI create_sample_renderer(IUnknown *, void *, void **renderer) {
+    if (!renderer)
+        return E_POINTER;
+    *renderer = new SampleRenderer{renderer_vtable};
+    return S_OK;
+}
+
 template <class F> void *erase(F *function) { return reinterpret_cast<void *>(function); }
 } // namespace
 
@@ -230,9 +395,11 @@ void install_system(Registry &registry) {
         registry.add("mmdevapi.dll", name, erase(nothing));
 
     registry.forward("mfplat.dll", "mfplat.dll");
-    registry.add("mfplat.dll", "MFResetDXGIDeviceManagerX", erase(succeeded));
-    for (const auto *name : {"MFCreateDxvaSampleRendererX", "MFCreateDXGISurfaceBufferX",
-                             "MFCreateNV12ToRGB32ConverterX", "MFCreateRGB32ToNV12ConverterX"})
+    registry.add("mfplat.dll", "MFCreateDXGIDeviceManager", erase(create_device_manager));
+    registry.add("mfplat.dll", "MFResetDXGIDeviceManagerX", erase(reset_device_manager));
+    registry.add("mfplat.dll", "MFCreateDxvaSampleRendererX", erase(create_sample_renderer));
+    for (const auto *name : {"MFCreateDXGISurfaceBufferX", "MFCreateNV12ToRGB32ConverterX",
+                             "MFCreateRGB32ToNV12ConverterX"})
         registry.add("mfplat.dll", name, erase(not_implemented));
 
     for (const auto *name : {"ConfigurePMCs", "ConfigureNBPMCs", "ConfigureL2IPMCs"})

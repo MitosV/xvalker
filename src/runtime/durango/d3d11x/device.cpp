@@ -77,8 +77,9 @@ HRESULT make_swap_chain(IDXGIFactory2 *factory, IUnknown *device,
         host.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     else if (host.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
         host.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    if (host.Scaling == DXGI_SCALING_ASPECT_RATIO_STRETCH)
-        host.Scaling = DXGI_SCALING_STRETCH;
+    // The console's screen is the size of the buffers; the title window is whatever size it
+    // is, and without scaling it shows the corner of the picture that fits in it.
+    host.Scaling = DXGI_SCALING_STRETCH;
     if (host.AlphaMode != DXGI_ALPHA_MODE_UNSPECIFIED && host.AlphaMode != DXGI_ALPHA_MODE_IGNORE)
         host.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     const bool flip = host.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL ||
@@ -90,15 +91,23 @@ HRESULT make_swap_chain(IDXGIFactory2 *factory, IUnknown *device,
     host.Flags &= DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH | DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE |
                   DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
                   DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
-    auto *presenter = static_cast<IUnknown *>(d3d11x::unwrap(device));
+    // the title's object for the device, or one of the DXGI interfaces of it
+    auto *presenter = unwrap_forwarder(static_cast<IUnknown *>(d3d11x::unwrap(device)));
     if (ID3D12Device *d3d12 = nullptr;
         presenter && SUCCEEDED(presenter->QueryInterface(IID_PPV_ARGS(&d3d12)))) {
         d3d12->Release();
         if (auto *const queue = modules::d3d12x::direct_queue())
             presenter = queue;
     }
-    const auto result = factory->CreateSwapChainForHwnd(
-        presenter, static_cast<HWND>(window->native()), &host, nullptr, nullptr, swap_chain);
+    auto result = factory->CreateSwapChainForHwnd(presenter, static_cast<HWND>(window->native()),
+                                                  &host, nullptr, nullptr, swap_chain);
+    // A console window takes several swap chains (one per resolution and color space, of
+    // which the title presents one); a host window takes one. The others get no window.
+    if (result == E_ACCESSDENIED && flip) {
+        host.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        host.Scaling = DXGI_SCALING_STRETCH;
+        result = factory->CreateSwapChainForComposition(presenter, &host, nullptr, swap_chain);
+    }
     if (SUCCEEDED(result))
         *swap_chain =
             static_cast<IDXGISwapChain1 *>(d3d11x::wrap(*swap_chain, d3d11x::Kind::swap_chain));
@@ -238,9 +247,13 @@ HRESULT WINAPI create_device(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT flag
         *device = nullptr;
     if (context)
         *context = nullptr;
-    dxgi_inserted = sdk < 0x20000 ? 5 : 0;
-    d3d11x::first_development_kits(dxgi_inserted != 0);
-    modules::early_audio_processor(dxgi_inserted != 0);
+    // the launch kit still passes the desktop's SDK version (7), and its DXGI is the desktop's
+    dxgi_inserted = sdk >= 0x10000 && sdk < 0x20000 ? 5 : 0;
+    d3d11x::first_development_kits(sdk < 0x20000, sdk < 0x10000,
+                                   sdk < 0x10005   ? 2
+                                   : sdk < 0x1000b ? 1
+                                                   : 0);
+    modules::early_audio_processor(sdk < 0x20000);
     const auto backend = graphics::selected_backend();
     if (!graphics::backend_renders_titles(backend)) {
         std::fprintf(stderr,
@@ -252,7 +265,8 @@ HRESULT WINAPI create_device(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT flag
     // Console-only flag bits and the debug layer, which may not be installed, are dropped.
     const UINT host_flags =
         flags & (D3D11_CREATE_DEVICE_SINGLETHREADED | D3D11_CREATE_DEVICE_BGRA_SUPPORT |
-                 D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS);
+                 D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS |
+                 D3D11_CREATE_DEVICE_VIDEO_SUPPORT);
     ID3D11Device1 *latest = nullptr;
     bool debug_layer = false;
     const bool vulkan = backend == graphics::Backend::vulkan;

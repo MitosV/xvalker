@@ -125,6 +125,15 @@ blocks they jump over are guarded by it; a branch back makes a `for` loop from i
 itself. The instruction table (`console_shader_rdna_ops.inc`) was read off LLVM's
 disassembly of the shaders of two titles, so it has the instructions those use and no others.
 
+A straight-line pixel shader can translate `v_mov_b32_dpp` with DPP8 when both groups of
+four lanes use the same quad-local selection and the shader leaves EXEC unchanged.
+`QuadReadLaneAt` reads the selected lane's register as a 32-bit word. `IsHelperLane`
+supplies zero for an inactive source. On a device with Shader Model 6.6 and wave
+operations, the host uses DXIL for both stages of a vertex/pixel pipeline that needs
+this operation.
+The runtime loads `dxcompiler.dll` next to the executable or from the system directory.
+The ordinary FXC path supplies the existing stand-in if the pair cannot be made in DXIL.
+
 State on the first title it was run on (82 shaders up to its title screen):
 46 are translated and all of those compile; the title screen is drawn right. On a second
 title, 2004 shaders in its first four minutes: 1966 are translated and all of those compile.

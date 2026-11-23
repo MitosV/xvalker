@@ -96,9 +96,32 @@ LONG WINAPI thread_named(EXCEPTION_POINTERS *info) {
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
+// three looks 5 seconds apart, to tell a thread that waits from one that spins
+void watch() {
+    std::thread([] {
+        int reported = 0;
+        for (;;) {
+            Sleep(1000);
+            const auto stalled = now() - last_frame.load();
+            if (stalled < 5000) {
+                reported = 0;
+            } else if (reported < 3 && stalled > 5000ll * (reported + 1)) {
+                std::fprintf(stderr, "[Runtime] no frame for %lld seconds, the threads:\n",
+                             static_cast<long long>(stalled / 1000));
+                dump_threads();
+                ++reported;
+            }
+        }
+    }).detach();
+}
+// The watch starts with the process, so that a title that never presents is seen too.
 const bool names_kept = [] {
     if (std::getenv("XV_WATCHDOG") || std::getenv("XV_THREAD_DUMP"))
         AddVectoredExceptionHandler(1, &thread_named);
+    if (std::getenv("XV_WATCHDOG")) {
+        last_frame = now();
+        watch();
+    }
     return true;
 }();
 } // namespace
@@ -111,25 +134,6 @@ void frame_watchdog() {
         std::fprintf(stderr, "[Runtime] the threads at frame %s:\n", dump_at);
         dump_threads();
     }
-    static const bool enabled = std::getenv("XV_WATCHDOG") != nullptr;
-    if (!enabled)
-        return;
-    if (last_frame.exchange(now()) == 0)
-        std::thread([] {
-            // three looks 5 seconds apart, to tell a thread that waits from one that spins
-            int reported = 0;
-            for (;;) {
-                Sleep(1000);
-                const auto stalled = now() - last_frame.load();
-                if (stalled < 5000) {
-                    reported = 0;
-                } else if (reported < 3 && stalled > 5000ll * (reported + 1)) {
-                    std::fprintf(stderr, "[Runtime] no frame for %lld seconds, the threads:\n",
-                                 static_cast<long long>(stalled / 1000));
-                    dump_threads();
-                    ++reported;
-                }
-            }
-        }).detach();
+    last_frame = now();
 }
 } // namespace xv::runtime::modules

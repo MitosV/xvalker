@@ -3,6 +3,7 @@
 #include "runtime/common/runtime.hpp"
 #include "runtime/modules/console_shader_rdna.hpp"
 #include "runtime/modules/inflate.hpp"
+#include "runtime/modules/system.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -26,14 +27,17 @@
 #include <windows.h>
 #include <xmmintrin.h>
 
-#include <unknwn.h>
+#include <objbase.h>
+
+#include <dxcapi.h>
+#include <wrl/client.h>
 
 #include <dxcapi.h>
 
 namespace xv::runtime::modules {
 namespace {
 // Bumped whenever what is made for a shader changes: the cache keeps one file per version.
-constexpr int translator_version = 16;
+constexpr int translator_version = 17;
 
 using Bytes = std::span<const std::uint8_t>;
 std::uint32_t word(Bytes bytes, std::size_t at) {
@@ -234,7 +238,8 @@ class Inflate {
 };
 
 // The XDAT block of the DXIL part: after the program header, a table of sections as (type,
-// offset, size). Section 0x0d is the zlib stream with the code.
+// offset, size). Section 0x0d is the zlib stream with the code. An Xbox One shader has it in
+// section 0, after 8 bytes: what is in it starts with its size and has 5 at 0x18.
 std::vector<std::uint8_t> code_container(Bytes container) {
     const auto dxil = part(container, "DXIL");
     constexpr std::size_t xdat = 24;
@@ -245,7 +250,17 @@ std::vector<std::uint8_t> code_container(Bytes container) {
          entry += 12) {
         const auto type = word(block, entry), offset = word(block, entry + 4),
                    size = word(block, entry + 8);
-        if (!type || type > 0xff || offset > block.size() || size > block.size() - offset)
+        if (type > 0xff || offset > block.size() || size > block.size() - offset)
+            break;
+        // that one's place is counted from the start of the part
+        if (!type && size > 8 && offset <= dxil.size() && size <= dxil.size() - offset) {
+            std::vector<std::uint8_t> out;
+            if (Inflate(dxil.subspan(offset + 8, size - 8)).run(out) && out.size() >= 0x1e0 &&
+                word(out, 0) == out.size() && word(out, 0x18) == 5)
+                return out;
+            return {};
+        }
+        if (!type)
             break;
         if (type != 0x0d)
             continue;
@@ -380,7 +395,8 @@ std::string stand_in(ShaderStage stage, Bytes container) {
 // `why` says what stopped it
 std::optional<std::string> translated_source(ShaderStage stage, Bytes container,
                                              std::string *why = nullptr,
-                                             std::uint32_t *at = nullptr) {
+                                             std::uint32_t *at = nullptr,
+                                             bool *needs_sm6 = nullptr) {
     if (stage != ShaderStage::vertex && stage != ShaderStage::pixel &&
         stage != ShaderStage::compute)
         return std::nullopt;
@@ -390,7 +406,7 @@ std::optional<std::string> translated_source(ShaderStage stage, Bytes container,
     shader.root_signature = part(container, "RTS0");
     shader.inputs = signature(container, "ISG1");
     shader.outputs = signature(container, "OSG1");
-    return rdna::translate(stage, shader, why, at);
+    return rdna::translate(stage, shader, why, at, needs_sm6);
 }
 
 using Compile = HRESULT(WINAPI *)(const void *, SIZE_T, const char *, const void *, void *,
@@ -556,13 +572,41 @@ std::vector<std::uint8_t> compile_now(ShaderStage stage, const std::string &sour
         errors->Release();
     return bytes;
 }
+std::vector<std::uint8_t> compile_sm6(ShaderStage stage, const std::string &source) {
+    using Microsoft::WRL::ComPtr;
+    ComPtr<IDxcCompiler3> compiler;
+    if (FAILED(host_dxc_create_instance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))))
+        return {};
+    const wchar_t *const profile = stage == ShaderStage::vertex ? L"vs_6_0" : L"ps_6_6";
+    const wchar_t *args[] = {L"-E", L"main", L"-T", profile};
+    const DxcBuffer input{source.data(), source.size(), DXC_CP_UTF8};
+    ComPtr<IDxcResult> result;
+    if (FAILED(compiler->Compile(&input, args, static_cast<UINT32>(std::size(args)), nullptr,
+                                 IID_PPV_ARGS(&result))))
+        return {};
+    HRESULT status = E_FAIL;
+    ComPtr<IDxcBlob> code;
+    if (FAILED(result->GetStatus(&status)) || FAILED(status) ||
+        FAILED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&code), nullptr)) || !code) {
+        ComPtr<IDxcBlobUtf8> errors;
+        if (static std::atomic<int> shown{0};
+            shown++ < 4 &&
+            SUCCEEDED(result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr)) && errors)
+            std::fprintf(stderr, "[Runtime] a Shader Model 6 console shader did not compile: %s\n",
+                         errors->GetStringPointer());
+        return {};
+    }
+    const auto *bytes = static_cast<const std::uint8_t *>(code->GetBufferPointer());
+    return {bytes, bytes + code->GetBufferSize()};
+}
+
 void write_file(const std::filesystem::path &path, Bytes bytes);
 // The host's compiler takes minutes over some of the largest shaders, and the title waits
 // for each of its shaders. So it is given `seconds`: a shader that takes longer is left to
 // finish on its own and goes to `keep`, the shader cache, for the next run; this run gets
 // nothing for it. XV_SHADER_SECONDS changes how long that is.
 std::vector<std::uint8_t> compile(ShaderStage stage, const std::string &source,
-                                  const std::filesystem::path &keep = {}) {
+                                  const std::filesystem::path &keep = {}, bool sm6 = false) {
     static const int seconds = [] {
         const auto *const text = std::getenv("XV_SHADER_SECONDS");
         return text ? std::max(std::atoi(text), 1) : 20;
@@ -574,8 +618,8 @@ std::vector<std::uint8_t> compile(ShaderStage stage, const std::string &source,
         std::vector<std::uint8_t> bytes;
     };
     const auto job = std::make_shared<Job>();
-    std::thread([job, stage, source, keep] {
-        auto bytes = compile_now(stage, source, true);
+    std::thread([job, stage, source, keep, sm6] {
+        auto bytes = sm6 ? compile_sm6(stage, source) : compile_now(stage, source, true);
         const std::lock_guard lock(job->mutex);
         if (job->abandoned && !bytes.empty() && !keep.empty())
             write_file(keep, bytes);
@@ -746,9 +790,16 @@ bool console_only_shader(Bytes container) {
     const auto dxil = part(container, "DXIL");
     if (dxil.size() < 28 || std::memcmp(dxil.data() + 24, "XDAT", 4))
         return false;
+    return !shader_has_dxil(container);
+}
+
+bool shader_has_dxil(Bytes container) {
+    const auto dxil = part(container, "DXIL");
+    if (dxil.size() < 24)
+        return false;
     const std::size_t bitcode = 8 + std::size_t{word(dxil, 16)};
     static constexpr std::uint8_t magic[] = {0x42, 0x43, 0xc0, 0xde};
-    return bitcode + 4 > dxil.size() || std::memcmp(dxil.data() + bitcode, magic, 4) != 0;
+    return bitcode + 4 <= dxil.size() && !std::memcmp(dxil.data() + bitcode, magic, 4);
 }
 
 std::vector<std::uint32_t> console_shader_code(Bytes container) {
@@ -778,7 +829,8 @@ std::vector<std::uint32_t> console_shader_code(Bytes container) {
 }
 
 namespace {
-std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes container) {
+std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes container,
+                                               HostShaderModel model) {
     const char letter = "vpc123"[static_cast<int>(stage)];
     const auto hash = hash_name(container);
     // XV_SHADER_STAND_INS: no translation, to tell what a translated shader breaks; with a
@@ -786,7 +838,10 @@ std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes containe
     static const char *const stand_ins = std::getenv("XV_SHADER_STAND_INS");
     const char stage_letter = "vpc123"[static_cast<int>(stage)];
     const bool stand_ins_only = stand_ins && !std::strchr(stand_ins, stage_letter);
-    const auto name = hash + "-" + letter + "-v" + std::to_string(translator_version) +
+    const char *const model_name = model == HostShaderModel::sm6         ? "-sm6"
+                                   : model == HostShaderModel::automatic ? "-auto"
+                                                                         : "";
+    const auto name = hash + "-" + letter + "-v" + std::to_string(translator_version) + model_name +
                       (stand_ins_only ? "-stand-in" : "") + ".dxbc";
     // one thread makes a shader, and the others that want the same one wait for it: titles
     // make their pipelines on many threads, and the host's compiler is slow
@@ -817,7 +872,16 @@ std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes containe
     }
     if (shader.empty()) {
         std::string why = "stand-ins asked for";
-        auto source = stand_ins_only ? std::nullopt : translated_source(stage, container, &why);
+        bool needs_sm6 = false;
+        auto source = stand_ins_only
+                          ? std::nullopt
+                          : translated_source(stage, container, &why, nullptr, &needs_sm6);
+        const bool sm6 =
+            model == HostShaderModel::sm6 || (model == HostShaderModel::automatic && needs_sm6);
+        if (needs_sm6 && !sm6) {
+            source.reset();
+            why = "the pipeline needs Shader Model 5 shaders";
+        }
         // XV_SHADER_SKIP=<text>[,<text>...]: a stand-in for the shaders whose HLSL has any
         // of these in it, to find which kind of shader breaks something
         if (const auto *const skip = std::getenv("XV_SHADER_SKIP"); skip && source) {
@@ -837,11 +901,12 @@ std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes containe
         }
         const bool kept = !folder.empty() && !asking;
         if (source)
-            shader = compile(stage, *source, kept ? folder / name : std::filesystem::path{});
+            shader = compile(stage, *source, kept ? folder / name : std::filesystem::path{}, sm6);
         const bool done = !shader.empty();
-        ++(done ? translated : stood_in);
+        if (done || model != HostShaderModel::sm6)
+            ++(done ? translated : stood_in);
         const std::lock_guard lock(mutex);
-        if (!done) {
+        if (!done && model != HostShaderModel::sm6) {
             if (asking)
                 ++reasons[std::string(1, letter) + ": " + (source ? "the host's compiler" : why)];
             const auto text = stand_in(stage, container);
@@ -849,7 +914,7 @@ std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes containe
                 write_file(std::filesystem::path(dump) / (hash + "-" + letter + ".stand-in.hlsl"),
                            {reinterpret_cast<const std::uint8_t *>(text.data()), text.size()});
             shader = compile(stage, text);
-        } else if (kept) {
+        } else if (done && kept) {
             // only what was translated is kept: a stand-in is made again, in case the next
             // version translates the shader
             write_file(folder / name, shader);
@@ -872,7 +937,11 @@ std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes containe
 }
 } // namespace
 
-std::span<const std::uint8_t> host_shader(ShaderStage stage, Bytes container) {
-    return make_host_shader(stage, container);
+std::span<const std::uint8_t> host_shader(ShaderStage stage, Bytes container,
+                                          HostShaderModel model) {
+    if (model != HostShaderModel::sm5 && stage != ShaderStage::vertex &&
+        stage != ShaderStage::pixel)
+        return {};
+    return make_host_shader(stage, container, model);
 }
 } // namespace xv::runtime::modules

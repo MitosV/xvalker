@@ -12,6 +12,8 @@ IInspectable *input_class(std::wstring_view name);
 void *gamepad_list();
 // The same gamepad as the IController that Controller::Controllers lists.
 void *controller_list();
+// and alone, with a reference
+void *controller();
 // An interface asked of one of the gamepad's facets: IGamepad is the gamepad itself, and the
 // interface titles ask for to leave a controller out is not there. False for any other.
 bool gamepad_interface(std::wstring_view name, const GUID &iid, void **object, long &result);

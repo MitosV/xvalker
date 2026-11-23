@@ -589,10 +589,37 @@ struct Start {
     // DllMain of every title DLL, in load order, and what to pass it
     std::vector<std::pair<void *, void *>> libraries;
 };
+// The title's DLLs whose entry point has run. The system tells a DLL of every thread that
+// starts and ends, which is how a garbage collector gets to know the threads it has to
+// stop; these DLLs are mapped here, so the telling is ours to do. The list is replaced, not
+// changed: a thread that starts reads it without a lock.
+using DllEntry = BOOL(WINAPI *)(void *, DWORD, void *);
+struct Attached {
+    DllEntry entry;
+    void *base;
+};
+std::atomic<const std::vector<Attached> *> attached{nullptr};
+void attach(std::uint64_t entry, void *base) {
+    const auto function = reinterpret_cast<DllEntry>(entry);
+    function(base, DLL_PROCESS_ATTACH, nullptr);
+    static std::mutex mutex;
+    const std::lock_guard lock(mutex);
+    const auto *const before = attached.load();
+    auto *const after = before ? new std::vector<Attached>(*before) : new std::vector<Attached>;
+    after->push_back({function, base});
+    attached = after; // the one before stays: a thread may be reading it
+}
+void NTAPI on_thread(void *, DWORD reason, void *) {
+    if (reason != DLL_THREAD_ATTACH && reason != DLL_THREAD_DETACH)
+        return;
+    if (const auto *const libraries = attached.load())
+        for (const auto &library : *libraries)
+            library.entry(library.base, reason, nullptr);
+}
 DWORD run_guest(const Start &start) {
+    start_static_tls();
     for (const auto &[entry, base] : start.libraries)
-        reinterpret_cast<BOOL(WINAPI *)(void *, DWORD, void *)>(entry)(base, DLL_PROCESS_ATTACH,
-                                                                       nullptr);
+        attach(reinterpret_cast<std::uint64_t>(entry), base);
     return reinterpret_cast<DWORD (*)()>(start.entry)();
 }
 #ifdef _MSC_VER
@@ -726,6 +753,15 @@ struct Stubs {
 };
 } // namespace
 
+#ifdef _MSC_VER
+// a TLS callback of this executable: the system runs it in every thread that starts or ends
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#pragma comment(linker, "/INCLUDE:xv_thread_callback")
+#pragma const_seg(".CRT$XLX")
+extern "C" const PIMAGE_TLS_CALLBACK xv_thread_callback = &on_thread;
+#pragma const_seg()
+#endif
+
 std::uint64_t detail::guest_offset(const void *address) {
     return guest && is_guest(address) ? reinterpret_cast<std::uint64_t>(address) - guest->base : 0;
 }
@@ -776,8 +812,7 @@ const TitleModule *load_title(std::string_view module, const std::filesystem::pa
         std::fprintf(stderr, "[Runtime] loaded the title's %s\n", added.name.c_str());
         std::fflush(stderr);
         if (added.entry)
-            reinterpret_cast<BOOL(WINAPI *)(void *, DWORD, void *)>(added.entry)(
-                reinterpret_cast<void *>(added.base), DLL_PROCESS_ATTACH, nullptr);
+            attach(added.entry, reinterpret_cast<void *>(added.base));
     }
     return library;
 }

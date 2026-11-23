@@ -30,6 +30,7 @@ enum class Inert : std::uint8_t {
     one64,          // same, 8 bytes
     string,         // HRESULT get(HSTRING *result): the text in `result`
     title_string,   // same, the title_info() named `result`
+    title_version,  // HRESULT get(PackageVersion *result): the package's
     shared,         // HRESULT get(T **result): the one object of type `result` there is
     shared2,        // HRESULT get(key, T **result): likewise, whatever the key
     shared_list,    // HRESULT get(IVectorView<T> **): a view with that one object
@@ -38,13 +39,18 @@ enum class Inert : std::uint8_t {
     one_item,       // HRESULT get(IVectorView<T> **): a view with one inert object of type `result`
     no_items,       // IVectorView::GetMany of an empty collection
     event_add,      // HRESULT add(handler, EventRegistrationToken *token); never raised
-    controllers,    // HRESULT get(IVectorView<IController> **): the one gamepad
+    controllers,    // HRESULT get(IVectorView<IController> **): the one gamepad; in
+                    // argument `argument` when that is set
     object_at,      // HRESULT make(..., T **) returning an inert `result` in argument `argument`
     vector,         // HRESULT get(IVector<T> **): a vector of the object's own, empty at first
     zero_operation_at,  // HRESULT start(..., IAsyncOperation<enum> **), finished at once with 0;
                         // result in `argument`
     null_at,            // HRESULT get(..., T **): nothing, in argument `argument`
     true8_at,           // HRESULT get(..., bool *): true, in argument `argument`
+    never,              // HRESULT get(DateTime *result): the latest time there is
+    zero32_at,          // HRESULT get(..., T *): 4 bytes of zero, in argument `argument`
+    one32_at,           // the same, 1
+    controller_at,      // HRESULT get(..., IController **): the one gamepad, in `argument`
     list_operation_at,  // like list_operation, with the result in argument `argument`
     failed_action_at,   // HRESULT start(..., IAsyncAction **) that fails with `error` at once
     failed_progress_at, // likewise, IAsyncOperationWithProgress<T, P> **

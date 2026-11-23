@@ -63,6 +63,16 @@ bool Registry::has(std::string_view module) const {
     return entry != entries_.end() && entry->first.first == name;
 }
 
+void Registry::alias(std::string_view other, std::string_view module) {
+    const auto name = lower(module);
+    std::vector<std::pair<std::string, void *>> found;
+    for (auto entry = entries_.lower_bound({name, std::string()});
+         entry != entries_.end() && entry->first.first == name; ++entry)
+        found.emplace_back(entry->first.second, entry->second);
+    for (const auto &[symbol, function] : found)
+        add(other, symbol, function);
+}
+
 void Registry::forward(std::string_view module, std::string_view host_module) {
     if (module.empty() || host_module.empty())
         throw std::invalid_argument("Registry forwards need a module and a host module");

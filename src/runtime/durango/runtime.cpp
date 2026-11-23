@@ -23,8 +23,16 @@ void install(Registry &registry) {
     // ERA titles are WinRT applications and use more of these than the GDK allows
     registry.forward("combase.dll", "combase.dll");
     registry.forward("ws2_32.dll", "ws2_32.dll");
+    registry.forward("oleaut32.dll", "oleaut32.dll");
+    // the same functions by their API sets, which the title's own WinRT DLLs import
+    for (const auto *set :
+         {"api-ms-win-core-winrt-string-l1-1-0.dll", "api-ms-win-core-winrt-l1-1-0.dll",
+          "api-ms-win-core-winrt-error-l1-1-0.dll", "api-ms-win-core-winrt-error-l1-1-1.dll",
+          "api-ms-win-core-com-l1-1-0.dll", "api-ms-win-core-com-l1-1-1.dll"})
+        registry.forward(set, "combase.dll");
     // the shader compiler is the desktop one
     registry.forward("d3dcompiler_47.dll", "d3dcompiler_47.dll");
+    registry.forward("d3dcompiler_46.dll", "d3dcompiler_47.dll");
     install_kernelx(registry);
     // what an Xbox One GDK title has in common with a Series one
     modules::install_kernel(registry, Target::durango);
@@ -40,6 +48,8 @@ void install(Registry &registry) {
     modules::install_xg(registry, "xg_x.dll");
     install_winrt(registry);
     install_d3d11x(registry);
+    // what the first kits called d3d11_x.dll
+    registry.alias("d3d11.dll", "d3d11_x.dll");
     for (const auto *name :
          {"EtxRegister", "EtxUnregister", "EtxEventWrite", "EtxFillCommonFields_v7"})
         registry.add("etwplus.dll", name, reinterpret_cast<void *>(&ignored));

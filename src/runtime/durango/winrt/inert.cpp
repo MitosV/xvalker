@@ -49,6 +49,10 @@ constexpr wchar_t product[] = L"Windows.Xbox.ApplicationModel.Store.Product";
 constexpr auto product_statics = guid("76efb705-bdd4-4f6a-8d89-a9511d40afe7");
 constexpr wchar_t display_info[] = L"Windows.Xbox.System.UserDisplayInfo";
 constexpr wchar_t local_folder[] = L"Windows.Storage.StorageFolder";
+constexpr wchar_t web_socket[] = L"Windows.Networking.Sockets.MessageWebSocket";
+constexpr wchar_t web_control[] = L"Windows.Networking.Sockets.MessageWebSocketControl";
+constexpr wchar_t package_id[] = L"Windows.ApplicationModel.PackageId";
+constexpr wchar_t package_folder[] = L"Windows.Storage.StorageFolder.InstalledLocation";
 constexpr auto storage_item = guid("4207a996-ca2f-42f7-bde8-8b10457a7f30");
 constexpr wchar_t audio_device[] = L"Windows.Xbox.System.AudioDeviceInfo";
 
@@ -99,12 +103,20 @@ constexpr Row rows[] = {
     {transport, game_transport_controls, 22, {Inert::accept}},
     {transport, game_transport_controls, 24, {Inert::accept}},
     {transport, game_transport_controls, 25, {Inert::event_add}}, // button pressed
+    {transport, game_transport_controls, 27, {Inert::event_add}}, // property changed
+    {transport, game_transport_controls, 28, {Inert::accept}},
 
     // public interfaces ICurrentApp and ILicenseInformation: a full license that never changes
     {store, current_app, 6, {Inert::object, license}},
     {license, direct, 7, {Inert::true8}},      // IsActive
     {license, direct, 8, {Inert::zero8}},      // IsTrial
+    {license, direct, 9, {Inert::never}},      // ExpirationDate
     {license, direct, 10, {Inert::event_add}}, // LicenseChanged
+    // the console's own interface of it: the user the license is for
+    {license,
+     guid("aa98c583-a3c8-4f51-a5bc-463ae0c23eaa"),
+     6,
+     {Inert::console_string, L"xbox_user_id"}},
 
     // one user, signed in from the start and for good
     {user, user_statics, 6, {Inert::shared_list, user}}, // Users
@@ -212,6 +224,15 @@ constexpr Row rows[] = {
      guid("7400624f-144b-47fc-9f3b-1dcafb482873"),
      6,
      {Inert::controllers}},
+    {L"Windows.Xbox.Input.Controller", // GetControllerById(id, IController **)
+     guid("7400624f-144b-47fc-9f3b-1dcafb482873"),
+     15,
+     {Inert::controller_at, nullptr, 2}},
+    // GetControllersOrderedLeftToRight(filter, IVectorView<IController> **)
+    {L"Windows.Xbox.Input.Controller",
+     guid("7400624f-144b-47fc-9f3b-1dcafb482873"),
+     17,
+     {Inert::controllers, nullptr, 2}},
     {L"Windows.Xbox.Input.Controller", // ControllerAdded, ControllerRemoved
      guid("7400624f-144b-47fc-9f3b-1dcafb482873"),
      7,
@@ -271,14 +292,20 @@ constexpr Row rows[] = {
     // IKinectSensorStatics::GetDefault: a sensor that is never available, as with none plugged
     // in. IKinectSensor::Open succeeds all the same.
     {kinect, guid("c421d46b-5084-45d6-bdf0-57151f81d0d9"), 6, {Inert::shared, kinect}},
-    // a console interface of CoreApplication with one flag: its setter
+    // a console interface of CoreApplication with one flag: its getter and its setter
+    {L"Windows.ApplicationModel.Core.CoreApplication",
+     guid("42a6a529-3cc6-4867-b5b7-6d1faf5325f9"),
+     6,
+     {Inert::zero8}},
     {L"Windows.ApplicationModel.Core.CoreApplication",
      guid("42a6a529-3cc6-4867-b5b7-6d1faf5325f9"),
      7,
      {Inert::accept}},
     {kinect, direct, 8, {Inert::accept}},
+    {kinect, direct, 10, {Inert::true8}}, // IsOpen
     {kinect, direct, 11, {Inert::zero8}}, // IsAvailable
     {kinect, direct, 14, {Inert::object, L"Windows.Kinect.BodyFrameSource"}},
+    {L"Windows.Kinect.BodyFrameSource", direct, 9, {Inert::number32, nullptr, 6}}, // BodyCount
     {L"Windows.Kinect.BodyFrameSource",
      direct,
      10,
@@ -334,6 +361,20 @@ constexpr Row rows[] = {
      guid("4e534bdf-2960-4878-97a4-9624deb72f2d"),
      6,
      {Inert::shared, L"Windows.ApplicationModel.Package"}},
+    // IPackage::Id and the public IPackageId, from the manifest's identity
+    {L"Windows.ApplicationModel.Package", direct, 6, {Inert::shared, package_id}},
+    {package_id, direct, 6, {Inert::title_string, L"package_name"}},
+    {package_id, direct, 7, {Inert::title_version}},
+    {package_id, direct, 8, {Inert::number32, nullptr, 9}}, // ProcessorArchitecture: x64
+    {package_id, direct, 9, {Inert::zero64}},               // ResourceId: none
+    {package_id, direct, 10, {Inert::title_string, L"package_publisher"}},
+    {package_id, direct, 11, {Inert::title_string, L"package_publisher_id"}},
+    {package_id, direct, 12, {Inert::title_string, L"package_full_name"}},
+    {package_id, direct, 13, {Inert::title_string, L"package_family_name"}},
+    // IPackage::InstalledLocation: the folder the title was unpacked in
+    {L"Windows.ApplicationModel.Package", direct, 7, {Inert::shared, package_folder}},
+    {package_folder, storage_item, 6, {Inert::console_string, L"package_folder_name"}},
+    {package_folder, storage_item, 7, {Inert::console_string, L"package_folder"}},
     // PackageTransferWatcher: the whole package is on disk, nothing is being transferred
     {L"Windows.Xbox.Management.Deployment.PackageTransferWatcher",
      guid("a306e506-12f9-460a-b0ae-50ba328c786c"),
@@ -664,6 +705,29 @@ constexpr Row rows[] = {
     {L"Windows.Storage.ApplicationData", direct, 6, {Inert::shared, local_folder}},
     {local_folder, storage_item, 6, {Inert::console_string, L"local_folder_name"}},
     {local_folder, storage_item, 7, {Inert::console_string, L"local_folder"}},
+    // public IMessageWebSocket and IWebSocket: a socket that is made and set up, and whose
+    // connection fails, there being no network
+    {web_socket, guid("33727d08-34d5-4746-ad7b-8dde5bc2ef88"), 6, {Inert::object, web_control}},
+    {web_socket, guid("33727d08-34d5-4746-ad7b-8dde5bc2ef88"), 7, {Inert::object, web_control}},
+    {web_socket, guid("33727d08-34d5-4746-ad7b-8dde5bc2ef88"), 8, {Inert::event_add}},
+    {web_socket, guid("33727d08-34d5-4746-ad7b-8dde5bc2ef88"), 9, {Inert::accept}},
+    {web_socket, guid("f877396f-99b1-4e18-bc08-850c9adf156e"), 6, {Inert::zero64}},
+    {web_socket,
+     guid("f877396f-99b1-4e18-bc08-850c9adf156e"),
+     7,
+     {Inert::failed_action_at, nullptr, 2, static_cast<long>(0x800704d0)}},
+    {web_socket, guid("f877396f-99b1-4e18-bc08-850c9adf156e"), 8, {Inert::accept}},
+    {web_socket, guid("f877396f-99b1-4e18-bc08-850c9adf156e"), 9, {Inert::event_add}},
+    {web_socket, guid("f877396f-99b1-4e18-bc08-850c9adf156e"), 10, {Inert::accept}},
+    {web_socket, guid("f877396f-99b1-4e18-bc08-850c9adf156e"), 11, {Inert::accept}},
+    {web_control, direct, 6, {Inert::zero32}},
+    {web_control, direct, 7, {Inert::accept}},
+    {web_control, direct, 8, {Inert::zero32}},
+    {web_control, direct, 9, {Inert::accept}},
+    {web_control, guid("8118388a-11ab-4e11-8ea4-0e73e8bb0ef2"), 6, {Inert::zero32}},
+    {web_control, guid("8118388a-11ab-4e11-8ea4-0e73e8bb0ef2"), 7, {Inert::accept}},
+    {web_control, guid("8118388a-11ab-4e11-8ea4-0e73e8bb0ef2"), 8, {Inert::zero32}},
+    {web_control, guid("8118388a-11ab-4e11-8ea4-0e73e8bb0ef2"), 9, {Inert::accept}},
     // public IKeyboardCapabilities: KeyboardPresent, the host's keyboard is there
     {L"Windows.Devices.Input.KeyboardCapabilities",
      guid("3a3f9b56-6798-4bbc-833e-0f34b17c65ff"),
@@ -713,6 +777,18 @@ constexpr Row rows[] = {
     // IsChunkInstalled(chunk, bool *): the whole package is there
     {transfer_manager, direct, 7, {Inert::true8_at, nullptr, 2}},
     {transfer_manager, direct, 8, {Inert::event_add}},
+    // FindChunkFromFile: the first, which a title counts from 1
+    {transfer_manager, direct, 9, {Inert::one32_at, nullptr, 2}},
+    // IPackageTransferManagerForChunkSpecifiers::GetInstallationState, by chunks and by
+    // specifiers: what is asked about is installed
+    {transfer_manager,
+     guid("96130573-d1ad-468c-aa25-9967781fb2f3"),
+     7,
+     {Inert::zero32_at, nullptr, 2}},
+    {transfer_manager,
+     guid("96130573-d1ad-468c-aa25-9967781fb2f3"),
+     8,
+     {Inert::zero32_at, nullptr, 2}},
     {transfer_manager, direct, 10, {Inert::zero32}}, // read as 4 bytes; zero: nothing in transfer
     // ISpeechRecognizerFactory::Create(language, SpeechRecognizer **)
     {L"Windows.Xbox.Speech.Recognition.SpeechRecognizerFactory",
@@ -743,6 +819,8 @@ constexpr Row rows[] = {
      {Inert::empty_list}},
     {speech_recognizer, direct, 14, {Inert::accept}}, // (bool)
     {speech_recognizer, direct, 17, {Inert::event_add}},
+    // the same event through the recognizer's interface by name
+    {speech_recognizer, guid("3a3aa19c-f4e9-4985-a53c-dbcc22795ca7"), 17, {Inert::event_add}},
     {speech_recognizer, direct, 21, {Inert::event_add}},
     {speech_recognizer, direct, 23, {Inert::event_add}},
     {speech_recognizer, direct, 25, {Inert::event_add}},
@@ -757,15 +835,67 @@ constexpr Row rows[] = {
     // KinectSensor's method 9, by a title's call of it (image+0x9fd9d4): no argument, and
     // only the HRESULT is looked at. There is no sensor, and nothing comes of it.
     {L"Windows.Kinect.KinectSensor", direct, 9, {Inert::accept}},
-    // DisplayConfiguration's statics, method 6 by the title's call of it (image+0x8a02ccd):
-    // (T **), an object
+    // The public IKinectSensor::BodyIndexFrameSource and what a title asks of it: the size
+    // of the frames it would give, a reader that never has one
+    {L"Windows.Kinect.KinectSensor",
+     direct,
+     15,
+     {Inert::object, L"Windows.Kinect.BodyIndexFrameSource"}},
+    {L"Windows.Kinect.BodyIndexFrameSource", direct, 6, {Inert::event_add}},
+    {L"Windows.Kinect.BodyIndexFrameSource", direct, 8, {Inert::zero8}}, // IsActive
+    {L"Windows.Kinect.BodyIndexFrameSource",
+     direct,
+     9,
+     {Inert::object, L"Windows.Kinect.BodyIndexFrameReader"}},
+    {L"Windows.Kinect.BodyIndexFrameSource",
+     direct,
+     10,
+     {Inert::object, L"Windows.Kinect.FrameDescription"}},
+    {L"Windows.Kinect.BodyIndexFrameReader", direct, 6, {Inert::event_add}},
+    {L"Windows.Kinect.BodyIndexFrameReader", direct, 8, {Inert::zero64}},             // no frame
+    {L"Windows.Kinect.FrameDescription", direct, 6, {Inert::number32, nullptr, 512}}, // Width
+    {L"Windows.Kinect.FrameDescription", direct, 7, {Inert::number32, nullptr, 424}}, // Height
+    {L"Windows.Kinect.FrameDescription", direct, 11, {Inert::number32, nullptr, 512 * 424}},
+    {L"Windows.Kinect.FrameDescription", direct, 12, {Inert::number32, nullptr, 1}},
+    {L"Windows.Kinect.KinectSensor", direct, 22, {Inert::zero32}}, // KinectCapabilities: none
+    // IConfigurationStatics::MarketplaceId
+    {L"Windows.Xbox.ApplicationModel.Store.Configuration",
+     guid("9d50b2e8-eeb6-4ced-b9f1-3eb95b3c1e0f"),
+     6,
+     {Inert::string, L"US"}},
+    // public IRatedContentRestrictions and IRatedContentDescriptionFactory: nothing is
+    // restricted, and that never changes
+    {L"Windows.Media.ContentRestrictions.RatedContentRestrictions",
+     guid("3f7f23cb-ba07-4401-a49d-8b9222205723"),
+     7,
+     {Inert::zero_operation_at, nullptr, 2}}, // GetRestrictionLevelAsync: Allow
+    {L"Windows.Media.ContentRestrictions.RatedContentRestrictions",
+     guid("3f7f23cb-ba07-4401-a49d-8b9222205723"),
+     9,
+     {Inert::event_add}},
+    {L"Windows.Media.ContentRestrictions.RatedContentDescription",
+     guid("2e38df62-9b90-4fa6-89c1-4b8d2ffb3573"),
+     6,
+     {Inert::object_at, L"Windows.Media.ContentRestrictions.RatedContentDescription", 4}},
+    // the description's setters: Id, Title, Image, Category, Ratings
+    {L"Windows.Media.ContentRestrictions.RatedContentDescription", direct, 7, {Inert::accept}},
+    {L"Windows.Media.ContentRestrictions.RatedContentDescription", direct, 9, {Inert::accept}},
+    {L"Windows.Media.ContentRestrictions.RatedContentDescription", direct, 11, {Inert::accept}},
+    {L"Windows.Media.ContentRestrictions.RatedContentDescription", direct, 13, {Inert::accept}},
+    {L"Windows.Media.ContentRestrictions.RatedContentDescription", direct, 15, {Inert::accept}},
+    // Body's statics, the public IBodyStatics: JointCount
+    {L"Windows.Kinect.Body",
+     guid("38d92488-eecf-4e85-a03a-545fbfa362a9"),
+     6,
+     {Inert::number32, nullptr, 25}},
+    // IDisplayConfigurationStatics2::TrySetHdrModeAsync, by a title's symbols: an operation
+    // that gives an HdrModeInfo. A title waits for it before it creates its device.
     {L"Windows.Xbox.Graphics.Display.DisplayConfiguration",
      guid("081b331e-db52-49ed-ba5f-2c656b14b232"),
      6,
-     {Inert::object, L"Windows.Xbox.Graphics.Display.DisplayConfiguration"}},
-    // its first method, by the title's call (image+0x8a03c80): one argument the title was
-    // itself given, and only the HRESULT is looked at
-    {L"Windows.Xbox.Graphics.Display.DisplayConfiguration", direct, 6, {Inert::accept}},
+     {Inert::operation, L"Windows.Xbox.Graphics.Display.HdrModeInfo"}},
+    // its first property, a bool (image+0x3afef1): the display is not in an HDR mode
+    {L"Windows.Xbox.Graphics.Display.HdrModeInfo", direct, 6, {Inert::zero8}},
     // IAppModelUtil's first method, by the dashboard's call of it (dashboard.dll+0x1f1fe51):
     // (bool), and only the HRESULT is looked at
     {L"Windows.Xbox.System.Internal.Interop.AppModelUtil",

@@ -157,18 +157,23 @@ class Dispatcher : public Class<Dispatcher, ICoreDispatcher> {
 };
 
 // ICoreWindow as the console has it, which is not the desktop one: the bounds are the first
-// method, the dispatcher the second and Activate the sixth. What the others are is not
-// known yet.
+// method, the dispatcher the second and Activate the sixth. Events follow the key states in
+// pairs, add then remove: Activated (15), CharacterReceived, Closed, InputEnabled, KeyDown,
+// KeyUp, PointerMoved, PointerEntered, PointerExited, SizeChanged and VisibilityChanged (35).
+// What comes after those is not known yet.
 struct IConsoleWindow : IInspectable {
     virtual HRESULT STDMETHODCALLTYPE get_Bounds(Rect *value) = 0;                 // 6
     virtual HRESULT STDMETHODCALLTYPE get_Dispatcher(ICoreDispatcher **value) = 0; // 7
-    virtual HRESULT STDMETHODCALLTYPE unknown8(void *, void *) = 0;
-    virtual HRESULT STDMETHODCALLTYPE unknown9(void *, void *) = 0;
-    virtual HRESULT STDMETHODCALLTYPE unknown10(void *, void *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_IsInputEnabled(boolean *value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_IsInputEnabled(boolean value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Visible(boolean *value) = 0;
     virtual HRESULT STDMETHODCALLTYPE Activate() = 0; // 11
+    virtual HRESULT STDMETHODCALLTYPE Close() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetAsyncKeyState(int key, CoreVirtualKeyStates *state) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetKeyState(int key, CoreVirtualKeyStates *state) = 0;
     // clang-format off
 #define XV_UNKNOWN(Index) virtual HRESULT STDMETHODCALLTYPE unknown##Index(void *, void *) = 0;
-    XV_UNKNOWN(12) XV_UNKNOWN(13) XV_UNKNOWN(14) XV_UNKNOWN(15) XV_UNKNOWN(16) XV_UNKNOWN(17)
+    XV_UNKNOWN(15) XV_UNKNOWN(16) XV_UNKNOWN(17)
     XV_UNKNOWN(18) XV_UNKNOWN(19) XV_UNKNOWN(20) XV_UNKNOWN(21) XV_UNKNOWN(22) XV_UNKNOWN(23)
     XV_UNKNOWN(24) XV_UNKNOWN(25) XV_UNKNOWN(26) XV_UNKNOWN(27) XV_UNKNOWN(28) XV_UNKNOWN(29)
     XV_UNKNOWN(30) XV_UNKNOWN(31) XV_UNKNOWN(32) XV_UNKNOWN(33) XV_UNKNOWN(34) XV_UNKNOWN(35)
@@ -231,28 +236,55 @@ class Window final : public IConsoleWindow {
     }
     // The host window stays hidden until the title presents its first frame.
     STDMETHODIMP Activate() override { return S_OK; }
+    STDMETHODIMP get_IsInputEnabled(boolean *value) override {
+        *value = true;
+        return S_OK;
+    }
+    STDMETHODIMP put_IsInputEnabled(boolean) override { return S_OK; }
+    STDMETHODIMP get_Visible(boolean *value) override {
+        *value = true;
+        return S_OK;
+    }
+    STDMETHODIMP Close() override { return S_OK; }
+    // the host's keyboard, while the title's window is the one typed into
+    STDMETHODIMP GetAsyncKeyState(int key, CoreVirtualKeyStates *state) override {
+        if (!state)
+            return E_POINTER;
+        *state = CoreVirtualKeyStates_None;
+        if (GetForegroundWindow() != static_cast<HWND>(host_.native()))
+            return S_OK;
+        if (::GetAsyncKeyState(key) & 0x8000)
+            *state = CoreVirtualKeyStates_Down;
+        if (::GetKeyState(key) & 1)
+            *state = static_cast<CoreVirtualKeyStates>(*state | CoreVirtualKeyStates_Locked);
+        return S_OK;
+    }
+    STDMETHODIMP GetKeyState(int key, CoreVirtualKeyStates *state) override {
+        return GetAsyncKeyState(key, state);
+    }
     // clang-format off
 #define XV_UNKNOWN(Index)                                                                          \
     STDMETHODIMP unknown##Index(void *first, void *second) override {                              \
         return unknown_method(name, "console ICoreWindow", Index, first, second,                   \
                               _ReturnAddress());                                                   \
     }
-    XV_UNKNOWN(8) XV_UNKNOWN(9) XV_UNKNOWN(10)
-    XV_UNKNOWN(12) XV_UNKNOWN(13) XV_UNKNOWN(14) XV_UNKNOWN(16) XV_UNKNOWN(18)
-    XV_UNKNOWN(20) XV_UNKNOWN(21) XV_UNKNOWN(22) XV_UNKNOWN(24) XV_UNKNOWN(26)
-    XV_UNKNOWN(28) XV_UNKNOWN(29) XV_UNKNOWN(30) XV_UNKNOWN(32)
-    XV_UNKNOWN(34) XV_UNKNOWN(36) XV_UNKNOWN(38) XV_UNKNOWN(39)
+    XV_UNKNOWN(38) XV_UNKNOWN(39)
     XV_UNKNOWN(41) XV_UNKNOWN(43) XV_UNKNOWN(44) XV_UNKNOWN(45)
     XV_UNKNOWN(46) XV_UNKNOWN(47)
 #undef XV_UNKNOWN
-    // Event registrations (handler, token). Which events they are is not known yet, so
-    // nothing raises them.
+#define XV_REMOVE(Index) STDMETHODIMP unknown##Index(void *, void *) override { return S_OK; }
+    XV_REMOVE(16) XV_REMOVE(18) XV_REMOVE(20) XV_REMOVE(22) XV_REMOVE(24) XV_REMOVE(26)
+    XV_REMOVE(28) XV_REMOVE(30) XV_REMOVE(32) XV_REMOVE(34) XV_REMOVE(36)
+#undef XV_REMOVE
+    // Event registrations (handler, token) that nothing raises: there is no keyboard event,
+    // pointer or resize to tell a title of
 #define XV_EVENT(Index)                                                                            \
     STDMETHODIMP unknown##Index(void *, void *token) override {                                    \
         *static_cast<std::int64_t *>(token) = ++tokens_;                                           \
         return S_OK;                                                                               \
     }
-    XV_EVENT(17) XV_EVENT(19) XV_EVENT(23) XV_EVENT(25) XV_EVENT(27) XV_EVENT(31) XV_EVENT(33) XV_EVENT(37)
+    XV_EVENT(17) XV_EVENT(19) XV_EVENT(21) XV_EVENT(23) XV_EVENT(25) XV_EVENT(27) XV_EVENT(29)
+    XV_EVENT(31) XV_EVENT(33) XV_EVENT(37)
     XV_EVENT(40) XV_EVENT(42)
 #undef XV_EVENT
         // clang-format on
@@ -417,7 +449,7 @@ IConsoleImmersiveApplication : IInspectable {
 };
 
 class Application : public Class<Application, IActivationFactory, ICoreApplication,
-                                 IConsoleImmersiveApplication> {
+                                 IConsoleImmersiveApplication, ICoreApplicationExit> {
   public:
     static constexpr wchar_t name[] = L"Windows.ApplicationModel.Core.CoreApplication";
     STDMETHODIMP ActivateInstance(IInspectable **instance) override {
@@ -493,11 +525,24 @@ class Application : public Class<Application, IActivationFactory, ICoreApplicati
         }
         return view_.CopyTo(value);
     }
+    STDMETHODIMP Exit() override {
+        step("CoreApplication: the title asked to exit");
+        exiting_.InvokeAll(nullptr, nullptr);
+        ExitProcess(0);
+    }
+    STDMETHODIMP add_Exiting(IEventHandler<IInspectable *> *handler,
+                             EventRegistrationToken *token) override {
+        return exiting_.Add(handler, token);
+    }
+    STDMETHODIMP remove_Exiting(EventRegistrationToken token) override {
+        return exiting_.Remove(token);
+    }
 
   private:
     ComPtr<View> view_;
     EventSource<IEventHandler<SuspendingEventArgs *>> suspending_;
     EventSource<IEventHandler<IInspectable *>> resuming_;
+    EventSource<IEventHandler<IInspectable *>> exiting_;
 };
 } // namespace
 

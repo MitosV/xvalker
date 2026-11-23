@@ -1202,8 +1202,82 @@ void STDMETHODCALLTYPE create_cbv(ID3D12Device *self, const D3D12_CONSTANT_BUFFE
         self, desc ? &host : nullptr, host_handle(handle));
     mark_host(handle);
 }
+// What a view without a format reads a typeless texture as: the console takes the number
+// format from elsewhere, the host wants it in the view. `srgb` picks the gamma twin.
+DXGI_FORMAT typed_format(DXGI_FORMAT format, bool srgb = false) {
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+        return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case DXGI_FORMAT_R32G32B32_TYPELESS:
+        return DXGI_FORMAT_R32G32B32_FLOAT;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R32G32_TYPELESS:
+        return DXGI_FORMAT_R32G32_FLOAT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        return srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_R16G16_TYPELESS:
+        return DXGI_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R32_TYPELESS:
+        return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R8G8_TYPELESS:
+        return DXGI_FORMAT_R8G8_UNORM;
+    case DXGI_FORMAT_R16_TYPELESS:
+        return DXGI_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_R8_TYPELESS:
+        return DXGI_FORMAT_R8_UNORM;
+    case DXGI_FORMAT_BC1_TYPELESS:
+        return srgb ? DXGI_FORMAT_BC1_UNORM_SRGB : DXGI_FORMAT_BC1_UNORM;
+    case DXGI_FORMAT_BC2_TYPELESS:
+        return srgb ? DXGI_FORMAT_BC2_UNORM_SRGB : DXGI_FORMAT_BC2_UNORM;
+    case DXGI_FORMAT_BC3_TYPELESS:
+        return srgb ? DXGI_FORMAT_BC3_UNORM_SRGB : DXGI_FORMAT_BC3_UNORM;
+    case DXGI_FORMAT_BC4_TYPELESS:
+        return DXGI_FORMAT_BC4_UNORM;
+    case DXGI_FORMAT_BC5_TYPELESS:
+        return DXGI_FORMAT_BC5_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        return srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+        return srgb ? DXGI_FORMAT_B8G8R8X8_UNORM_SRGB : DXGI_FORMAT_B8G8R8X8_UNORM;
+    case DXGI_FORMAT_BC6H_TYPELESS:
+        return DXGI_FORMAT_BC6H_UF16;
+    case DXGI_FORMAT_BC7_TYPELESS:
+        return srgb ? DXGI_FORMAT_BC7_UNORM_SRGB : DXGI_FORMAT_BC7_UNORM;
+    default:
+        return format;
+    }
+}
 void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, const void *desc,
                                   Handle handle) {
+    // The console views a multisampled texture as a plain one and a typeless one without a
+    // format; the host removes the device over either
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    if (resource && desc) {
+        std::memcpy(&view, desc, sizeof view);
+        const auto of = resource->GetDesc();
+        if (of.SampleDesc.Count > 1 && view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+            desc = &view;
+        } else if (of.SampleDesc.Count > 1 &&
+                   view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
+            const auto slices = view.Texture2DArray;
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+            view.Texture2DMSArray = {slices.FirstArraySlice, slices.ArraySize};
+            desc = &view;
+        }
+        if (view.Format == DXGI_FORMAT_UNKNOWN && of.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+            typed_format(of.Format) != of.Format) {
+            view.Format = typed_format(of.Format);
+            desc = &view;
+        }
+    }
     original<void(STDMETHODCALLTYPE *)(void *, void *, const void *, Handle)>(self, 18)(
         self, resource, desc, host_handle(handle));
     mark_host(handle);
@@ -1213,6 +1287,68 @@ void STDMETHODCALLTYPE create_uav(ID3D12Device *self, ID3D12Resource *resource,
     original<void(STDMETHODCALLTYPE *)(void *, void *, void *, const void *, Handle)>(self, 19)(
         self, resource, counter, desc, host_handle(handle));
     mark_host(handle);
+}
+// Xbox One's CreatePlacedShaderResourceViewX (46) and CreatePlacedUnorderedAccessViewX (47):
+// the console's descriptions begin as the host's do and go on with where the memory is and
+// how the hardware reads it, which the host's resource already says
+void STDMETHODCALLTYPE create_placed_srv(ID3D12Device *self, ID3D12Resource *resource,
+                                         const void *desc, Handle handle) {
+    if (!resource)
+        return;
+    // the number format after the host's fields and the memory's address: 9 is sRGB
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    if (desc) {
+        std::memcpy(&view, desc, sizeof view);
+        std::uint32_t number = 0;
+        std::memcpy(&number, static_cast<const std::uint8_t *>(desc) + sizeof view + 12,
+                    sizeof number);
+        const auto of = resource->GetDesc();
+        if (view.Format == DXGI_FORMAT_UNKNOWN && of.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+            view.Format = typed_format(of.Format, number == 9);
+    }
+    create_srv(self, resource, desc ? &view : nullptr, handle);
+}
+void STDMETHODCALLTYPE create_placed_uav(ID3D12Device *self, ID3D12Resource *resource,
+                                         const void *desc, Handle handle) {
+    if (resource)
+        create_uav(self, resource, nullptr, desc, handle);
+}
+// GetDefaultMSAAParametersX (59): the standard pattern of the sample count, in sixteenths of
+// a pixel from its centre, the same for the four pixels of a quad
+HRESULT STDMETHODCALLTYPE default_msaa_parameters(void *, const DXGI_SAMPLE_DESC *samples,
+                                                  std::int8_t (*locations)[16][2],
+                                                  std::uint8_t *priorities,
+                                                  std::uint32_t *parameters) {
+    if (!samples || !std::has_single_bit(samples->Count) || samples->Count > 16)
+        return E_INVALIDARG;
+    static constexpr std::int8_t one[][2]{{0, 0}};
+    static constexpr std::int8_t two[][2]{{4, 4}, {-4, -4}};
+    static constexpr std::int8_t four[][2]{{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
+    static constexpr std::int8_t eight[][2]{{1, -3}, {-1, 3},  {5, 1}, {-3, -5},
+                                            {-5, 5}, {-7, -1}, {3, 7}, {7, -7}};
+    static constexpr std::int8_t sixteen[][2]{
+        {1, 1},  {-1, -3}, {-3, 2},  {4, -1}, {-5, -2}, {2, 5},  {5, 3}, {3, -5},
+        {-2, 6}, {0, -7},  {-4, -6}, {-6, 4}, {-8, 0},  {7, -4}, {6, 7}, {-7, -8}};
+    const std::int8_t(*const pattern)[2] = samples->Count == 1   ? one
+                                           : samples->Count == 2 ? two
+                                           : samples->Count == 4 ? four
+                                           : samples->Count == 8 ? eight
+                                                                 : sixteen;
+    if (locations)
+        for (int pixel = 0; pixel < 4; ++pixel) {
+            std::memset(locations[pixel], 0, sizeof locations[pixel]);
+            std::memcpy(locations[pixel], pattern, samples->Count * 2);
+        }
+    if (priorities)
+        for (std::uint8_t i = 0; i < 16; ++i)
+            priorities[i] = static_cast<std::uint8_t>(i % samples->Count);
+    if (parameters) {
+        // every sample is a colour sample the pixel shader sees
+        const auto log2 = static_cast<std::uint32_t>(std::countr_zero(samples->Count));
+        parameters[0] = log2 | 8u << 3 | log2 << 7;
+        parameters[1] = log2 | log2 << 3 | log2 << 6 | log2 << 9;
+    }
+    return S_OK;
 }
 // the resource behind each render target view, for XV_D3D_PROBE
 std::mutex target_mutex;
@@ -1343,7 +1479,33 @@ HRESULT STDMETHODCALLTYPE create_descriptor_heap(ID3D12Device *self,
                                                  void **heap) {
     using Create =
         HRESULT(STDMETHODCALLTYPE *)(void *, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **);
+    // The Series console's sampler heap without a bound (type 4) is a sampler heap here, as
+    // large as the host makes one: 2048 samplers, which is more than titles keep
+    D3D12_DESCRIPTOR_HEAP_DESC changed{};
+    if (desc && static_cast<int>(desc->Type) == 4) {
+        changed = *desc;
+        changed.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        changed.NumDescriptors = std::min(changed.NumDescriptors, 2048u);
+        desc = &changed;
+    }
+    // and a heap of target views is never one shaders see, whatever the title says of it
+    if (desc &&
+        (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV ||
+         desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV) &&
+        desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
+        changed = *desc;
+        changed.Flags &= ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        desc = &changed;
+    }
     const auto result = original<Create>(self, 14)(self, desc, iid, heap);
+    if (FAILED(result) && desc) {
+        std::fprintf(stderr,
+                     "[Runtime] CreateDescriptorHeap type %d, %u descriptors, flags 0x%x, node "
+                     "0x%x: 0x%08lx%c",
+                     desc->Type, desc->NumDescriptors, desc->Flags, desc->NodeMask,
+                     static_cast<unsigned long>(result), 10);
+        std::fflush(stderr);
+    }
     if (FAILED(result) || !heap || !*heap || !desc)
         return result;
     auto *const host_heap_object = static_cast<ID3D12DescriptorHeap *>(*heap);
@@ -1504,16 +1666,56 @@ void describe_shader(const char *stage, const D3D12_SHADER_BYTECODE &code) {
 }
 // A shader of the title's with only console GPU code is given to the host as the shader
 // made for it (see console_shader.hpp)
-bool host_bytecode(modules::ShaderStage stage, D3D12_SHADER_BYTECODE &code) {
-    const std::span<const std::uint8_t> container(
-        static_cast<const std::uint8_t *>(code.pShaderBytecode), code.BytecodeLength);
+std::span<const std::uint8_t> shader_bytes(const D3D12_SHADER_BYTECODE &code) {
+    if (!code.pShaderBytecode)
+        return {};
+    return {static_cast<const std::uint8_t *>(code.pShaderBytecode), code.BytecodeLength};
+}
+bool host_bytecode(modules::ShaderStage stage, D3D12_SHADER_BYTECODE &code,
+                   modules::HostShaderModel model = modules::HostShaderModel::sm5) {
+    const auto container = shader_bytes(code);
     if (!code.pShaderBytecode || !modules::console_only_shader(container))
         return false;
-    const auto made = modules::host_shader(stage, container);
+    const auto made = modules::host_shader(stage, container, model);
     if (made.empty())
         return false;
     code = {made.data(), made.size()};
     return true;
+}
+
+bool host_graphics_pair(ID3D12Device *device, D3D12_SHADER_BYTECODE &vs, D3D12_SHADER_BYTECODE &ps,
+                        bool allow_sm6) {
+    using modules::HostShaderModel;
+    using modules::ShaderStage;
+    if (allow_sm6 && vs.pShaderBytecode && ps.pShaderBytecode) {
+        auto pixel = ps;
+        if (host_bytecode(ShaderStage::pixel, pixel, HostShaderModel::automatic)) {
+            if (!modules::shader_has_dxil(shader_bytes(pixel))) {
+                ps = pixel;
+                host_bytecode(ShaderStage::vertex, vs);
+                return true;
+            }
+            // A graphics pipeline cannot mix DXBC and DXIL on all supported drivers.
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 options{};
+            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+            auto vertex = vs;
+            if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options,
+                                                      sizeof options)) &&
+                options.WaveOps &&
+                SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model,
+                                                      sizeof model)) &&
+                model.HighestShaderModel >= D3D_SHADER_MODEL_6_6 &&
+                (modules::shader_has_dxil(shader_bytes(vertex)) ||
+                 host_bytecode(ShaderStage::vertex, vertex, HostShaderModel::sm6))) {
+                vs = vertex;
+                ps = pixel;
+                return true;
+            }
+        }
+    }
+    const bool vertex = host_bytecode(ShaderStage::vertex, vs);
+    const bool pixel = host_bytecode(ShaderStage::pixel, ps);
+    return vertex || pixel;
 }
 // A pipeline without a root signature has it in its shaders, and the shader made for the
 // host does not carry it. On the host a pipeline is bound to the root signature it was made
@@ -1659,18 +1861,31 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
                                                 REFIID, void **);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC host{};
     ID3D12RootSignature *from_shader = nullptr;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
     if (desc) {
         host = *desc;
         host.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+        // The console's R10G10B10_SNORM_A2_UNORM (189), what packed normals are in, is no
+        // vertex format of the host's: its bits are read unsigned there
+        if (host.InputLayout.pInputElementDescs) {
+            elements.assign(host.InputLayout.pInputElementDescs,
+                            host.InputLayout.pInputElementDescs + host.InputLayout.NumElements);
+            for (auto &element : elements)
+                if (element.Format == static_cast<DXGI_FORMAT>(189))
+                    element.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+            host.InputLayout.pInputElementDescs = elements.data();
+        }
         host.PrimitiveTopologyType = host_topology_type(host.PrimitiveTopologyType);
         const auto geometry = host.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
                                   ? modules::ShaderStage::geometry_points
                               : host.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
                                   ? modules::ShaderStage::geometry_lines
                                   : modules::ShaderStage::geometry_triangles;
-        const bool made = host_bytecode(modules::ShaderStage::vertex, host.VS) |
-                          host_bytecode(modules::ShaderStage::pixel, host.PS) |
-                          host_bytecode(geometry, host.GS);
+        const bool simple = desc->PrimitiveTopologyType != rectangle_type &&
+                            !host.GS.pShaderBytecode && !host.HS.pShaderBytecode &&
+                            !host.DS.pShaderBytecode;
+        const bool pair = host_graphics_pair(self, host.VS, host.PS, simple);
+        const bool made = host_bytecode(geometry, host.GS) || pair;
         if (made && !host.pRootSignature)
             host.pRootSignature = from_shader =
                 shader_root_signature(self, true, {desc->VS, desc->PS, desc->GS});
@@ -1976,6 +2191,14 @@ HRESULT STDMETHODCALLTYPE create_command_queue(ID3D12Device *self,
     using Create =
         HRESULT(STDMETHODCALLTYPE *)(void *, const D3D12_COMMAND_QUEUE_DESC *, REFIID, void **);
     const auto result = original<Create>(self, 8)(self, desc, iid, queue);
+    if (FAILED(result) && desc) {
+        std::fprintf(stderr,
+                     "[Runtime] CreateCommandQueue type %d priority %d flags 0x%x node 0x%x: "
+                     "0x%08lx%c",
+                     desc->Type, desc->Priority, desc->Flags, desc->NodeMask,
+                     static_cast<unsigned long>(result), 10);
+        std::fflush(stderr);
+    }
     auto *const host =
         SUCCEEDED(result) && queue ? static_cast<ID3D12CommandQueue *>(*queue) : nullptr;
     if (host)
@@ -1987,6 +2210,18 @@ HRESULT STDMETHODCALLTYPE create_command_queue(ID3D12Device *self,
             first_direct_queue.load()->AddRef();
     }
     return result;
+}
+// CreateCommandQueueX (48): the type, the flags, and which engine and queue of the hardware.
+// The copy engine's queue (type 16) is a direct queue here, whose lists take any transition.
+HRESULT STDMETHODCALLTYPE create_command_queue_x(ID3D12Device *self, const UINT *desc, REFIID iid,
+                                                 void **queue) {
+    if (!desc)
+        return E_INVALIDARG;
+    const D3D12_COMMAND_QUEUE_DESC host{desc[0] == 16
+                                            ? D3D12_COMMAND_LIST_TYPE_DIRECT
+                                            : static_cast<D3D12_COMMAND_LIST_TYPE>(desc[0]),
+                                        0, static_cast<D3D12_COMMAND_QUEUE_FLAGS>(desc[1] & 1), 0};
+    return create_command_queue(self, &host, iid, queue);
 }
 // What the host insists on where the console takes anything: a resource of an upload heap
 // starts as one to read from and one of a readback heap as one to copy to, and only a depth
@@ -2257,10 +2492,14 @@ HRESULT STDMETHODCALLTYPE close_list(void *self) {
 }
 // ResourceBarrier: transitions name states the console's way. GENERIC_READ is 0x8c3 there,
 // and bit 0x400000 goes with the states shaders read in; on the host that bit is a ray
-// tracing acceleration structure, which is no state to be combined with another.
+// tracing acceleration structure, which is no state to be combined with another. Xbox One
+// has more of its own from there up (what stays compressed or expanded across the
+// transition), where the host has video and shading rate states.
 D3D12_RESOURCE_STATES host_state(D3D12_RESOURCE_STATES state) {
     if (state == static_cast<D3D12_RESOURCE_STATES>(0x8c3))
         return D3D12_RESOURCE_STATE_GENERIC_READ;
+    if (console == Target::durango)
+        return state & ~static_cast<D3D12_RESOURCE_STATES>(0x0fd00000);
     constexpr auto structure = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
     state &= ~static_cast<D3D12_RESOURCE_STATES>(0x100000);
     return state & structure && state != structure ? state & ~structure : state;
@@ -2766,23 +3005,10 @@ void STDMETHODCALLTYPE set_index_buffer(void *self, const D3D12_INDEX_BUFFER_VIE
 // buffer or not. An address that is memory of the title's and in no buffer here is copied
 // into a buffer of ours, which is what the host is given: 64 KiB of it, or as much as is
 // there. The copies go round a ring, which a frame does not come near filling.
-std::uint64_t root_address(std::uint64_t address) {
-    if (!address)
-        return 0;
-    {
-        const std::lock_guard lock(buffer_mutex);
-        auto found = mapped_at.upper_bound(address);
-        if (found != mapped_at.begin() && address < std::prev(found)->second.end)
-            return std::prev(found)->second.gpu + (address - std::prev(found)->first);
-        auto buffer = buffers_at.upper_bound(address);
-        if (buffer != buffers_at.begin() && address < std::prev(buffer)->second.end)
-            return address;
-    }
-    MEMORY_BASIC_INFORMATION info{};
-    if (!VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof info) ||
-        info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
-        return address;
-    constexpr std::uint64_t ring_size = 256ull << 20, most = 64 << 10;
+constexpr std::uint64_t most_copied = 64 << 10;
+// the GPU address of a copy of `bytes` (most_copied at most) at `source`, 0 if there is no ring
+std::uint64_t ring_copy(const void *source, std::uint64_t bytes) {
+    constexpr std::uint64_t ring_size = 256ull << 20, most = most_copied;
     static std::mutex mutex;
     static ID3D12Resource *ring = nullptr;
     static std::uint8_t *memory = nullptr;
@@ -2804,28 +3030,76 @@ std::uint64_t root_address(std::uint64_t address) {
                                                    IID_PPV_ARGS(&ring))) ||
             FAILED(ring->Map(0, nullptr, &mapped))) {
             ring = nullptr;
-            return address;
+            return 0;
         }
         memory = static_cast<std::uint8_t *>(mapped);
-        std::fprintf(stderr, "[Runtime] root descriptors on memory that is no buffer are copied "
-                             "into one of the host's\n");
+        std::fprintf(stderr, "[Runtime] root descriptors the host cannot take where they are are "
+                             "copied into a buffer of its own\n");
         std::fflush(stderr);
     }
-    const auto region_end = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
-    const auto bytes = std::min(most, region_end - address);
+    bytes = std::min(bytes, most);
     if (next + most > ring_size)
         next = 0;
     const auto at = next;
     next += (bytes + 255) & ~255ull;
-    std::memcpy(memory + at, reinterpret_cast<const void *>(address), bytes);
+    std::memcpy(memory + at, source, bytes);
     return ring->GetGPUVirtualAddress() + at;
+}
+std::uint64_t root_address(std::uint64_t address) {
+    if (!address)
+        return 0;
+    {
+        const std::lock_guard lock(buffer_mutex);
+        auto found = mapped_at.upper_bound(address);
+        if (found != mapped_at.begin() && address < std::prev(found)->second.end)
+            return std::prev(found)->second.gpu + (address - std::prev(found)->first);
+        auto buffer = buffers_at.upper_bound(address);
+        if (buffer != buffers_at.begin() && address < std::prev(buffer)->second.end)
+            return address;
+    }
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof info) ||
+        info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        return address;
+    const auto region_end = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+    const auto copy = ring_copy(reinterpret_cast<const void *>(address), region_end - address);
+    return copy ? copy : address;
+}
+// A constant buffer starts anywhere on the console and on a multiple of 256 bytes on the
+// host, which turns the whole list down for one that does not. What a buffer the CPU can
+// read holds from such an address on is copied to where the host takes it.
+std::uint64_t root_constants(std::uint64_t address) {
+    const auto host = root_address(address);
+    // only Xbox One titles have been seen to need it, and a Series title that binds its
+    // constants this way for every draw would have 64 KiB copied each time
+    if (!(host & 255) || console != Target::durango)
+        return host;
+    ID3D12Resource *buffer = nullptr;
+    std::uint64_t start = 0, end = 0;
+    {
+        const std::lock_guard lock(buffer_mutex);
+        const auto found = buffers_at.upper_bound(host);
+        if (found == buffers_at.begin() || host >= std::prev(found)->second.end)
+            return host;
+        start = std::prev(found)->first;
+        end = std::prev(found)->second.end;
+        buffer = std::prev(found)->second.resource;
+    }
+    void *memory = nullptr;
+    const D3D12_RANGE nothing_read{0, 0};
+    if (FAILED(buffer->Map(0, &nothing_read, &memory)) || !memory)
+        return host;
+    const auto copy =
+        ring_copy(static_cast<const std::uint8_t *>(memory) + (host - start), end - host);
+    buffer->Unmap(0, &nothing_read);
+    return copy ? copy : host;
 }
 void STDMETHODCALLTYPE set_graphics_root_cbv(void *self, UINT index, std::uint64_t address) {
     trace_address("SetGraphicsRootConstantBufferView", address);
-    host_of(self)->SetGraphicsRootConstantBufferView(index, root_address(address));
+    host_of(self)->SetGraphicsRootConstantBufferView(index, root_constants(address));
 }
 void STDMETHODCALLTYPE set_compute_root_cbv(void *self, UINT index, std::uint64_t address) {
-    host_of(self)->SetComputeRootConstantBufferView(index, root_address(address));
+    host_of(self)->SetComputeRootConstantBufferView(index, root_constants(address));
 }
 void STDMETHODCALLTYPE set_compute_root_srv(void *self, UINT index, std::uint64_t address) {
     host_of(self)->SetComputeRootShaderResourceView(index, root_address(address));
@@ -3179,7 +3453,7 @@ void *make_list_proxy(List *host) {
 
 // ID3D12XboxDmaCommandList (a list of type 16): the console's hardware copies, fills and
 // (de)compresses memory by itself, in the order of a queue. The slots are the ones of the
-// console header's table. Resources are copied on a host copy list of ours; what works on
+// console header's table. Resources are copied on a host list of ours; what works on
 // memory by address is done by the CPU when it is recorded, since on the console a GPU
 // address is the title's own memory. The compression formats are not known: those say so.
 constexpr UINT dma_list_type = 16;
@@ -3285,10 +3559,10 @@ const std::array<Slot, dma_slots> dma_vtable = [] {
 }();
 HRESULT make_dma_list(ID3D12Device *device, void **list) {
     auto *const proxy = new DmaProxy{};
-    auto result = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY,
+    auto result = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                  IID_PPV_ARGS(&proxy->allocator));
     if (SUCCEEDED(result))
-        result = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, proxy->allocator,
+        result = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, proxy->allocator,
                                            nullptr, IID_PPV_ARGS(&proxy->host));
     if (FAILED(result)) {
         delete proxy;
@@ -3476,6 +3750,14 @@ void STDMETHODCALLTYPE execute_command_lists(ID3D12CommandQueue *self, UINT coun
         CloseHandle(event);
     }
 }
+// CreateCommandAllocator (9): the console's copy engine has a list type of its own (16),
+// which is a direct list here, as its queue is
+HRESULT STDMETHODCALLTYPE create_command_allocator(ID3D12Device *self, UINT type, REFIID iid,
+                                                   void **allocator) {
+    using Create = HRESULT(STDMETHODCALLTYPE *)(void *, UINT, REFIID, void **);
+    return original<Create>(self, 9)(self, type == 16 ? D3D12_COMMAND_LIST_TYPE_DIRECT : type, iid,
+                                     allocator);
+}
 // CreateCommandList (12), the desktop's way: a proxy as well
 HRESULT STDMETHODCALLTYPE create_command_list_desktop(ID3D12Device *self, UINT node,
                                                       D3D12_COMMAND_LIST_TYPE type,
@@ -3551,6 +3833,16 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline_x(ID3D12Device *self,
 // what only the console's driver and debugger have a use for: driver hints, hang and debug
 // callbacks, debug flags, memory priority, UnregisterPagePoolX
 HRESULT STDMETHODCALLTYPE ignored_device_method(void *) { return S_OK; }
+// GetGpuHardwareConfigurationX (68): the GPU's clock and which console it is: the first
+// Xbox One, or the Series X
+void STDMETHODCALLTYPE gpu_hardware_configuration(void *, std::uint64_t *configuration) {
+    if (!configuration)
+        return;
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    configuration[0] = static_cast<std::uint64_t>(frequency.QuadPart);
+    configuration[1] = console == Target::scarlett ? 5 : 0;
+}
 constexpr std::size_t host_device_slots = 44, device_slots = 128;
 template <std::size_t... Index>
 std::vector<std::pair<std::size_t, Slot>> unknown_device_methods(std::index_sequence<Index...>) {
@@ -3751,6 +4043,8 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
     // the title's vertex, pixel and compute shaders, and whether any had to be made for the
     // host: such a pipeline needs a root signature of its own, as in create_graphics_pipeline
     D3D12_SHADER_BYTECODE shaders[3] = {};
+    std::size_t shader_at[3] = {};
+    bool simple_graphics = true;
     bool made = false;
     std::size_t signature_at = 0; // where in the stream the root signature's pointer is
     ID3D12RootSignature *from_shader = nullptr;
@@ -3772,6 +4066,7 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
             if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY && size >= 8) {
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE topology;
                 std::memcpy(&topology, stream.data() + stream.size() - size + 4, 4);
+                simple_graphics &= topology != rectangle_type;
                 topology = host_topology_type(topology);
                 std::memcpy(stream.data() + stream.size() - size + 4, &topology, 4);
             }
@@ -3779,20 +4074,24 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
                 ++type;
                 std::memcpy(stream.data() + stream.size() - size, &type, 4);
             }
-            auto *const value = stream.data() + stream.size() - size + 8;
+            const auto value_at = stream.size() - size + 8;
             const int shader = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS   ? 0
                                : type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS ? 1
                                : type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS ? 2
                                                                                 : -1;
             if (shader >= 0 && size >= 8 + sizeof(D3D12_SHADER_BYTECODE)) {
-                static constexpr modules::ShaderStage stages[] = {modules::ShaderStage::vertex,
-                                                                  modules::ShaderStage::pixel,
-                                                                  modules::ShaderStage::compute};
-                D3D12_SHADER_BYTECODE code;
-                std::memcpy(&code, value, sizeof code);
-                shaders[shader] = code;
-                made |= host_bytecode(stages[shader], code);
-                std::memcpy(value, &code, sizeof code);
+                shader_at[shader] = value_at;
+                std::memcpy(&shaders[shader], stream.data() + value_at, sizeof shaders[shader]);
+            }
+            if ((type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS ||
+                 type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS ||
+                 type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS ||
+                 type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS ||
+                 type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) &&
+                size >= 8 + sizeof(D3D12_SHADER_BYTECODE)) {
+                D3D12_SHADER_BYTECODE other{};
+                std::memcpy(&other, stream.data() + value_at, sizeof other);
+                simple_graphics &= !other.pShaderBytecode;
             }
             if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE && size >= 16)
                 signature_at = stream.size() - size + 8;
@@ -3801,6 +4100,13 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
                 std::memset(stream.data() + stream.size() - size + 4, 0, 4);
             at += size;
         }
+        D3D12_SHADER_BYTECODE vertex = shaders[0], pixel = shaders[1], compute = shaders[2];
+        made = host_graphics_pair(self, vertex, pixel, simple_graphics && !compute.pShaderBytecode);
+        made |= host_bytecode(modules::ShaderStage::compute, compute);
+        const D3D12_SHADER_BYTECODE translated[] = {vertex, pixel, compute};
+        for (std::size_t index = 0; index < std::size(shader_at); ++index)
+            if (shader_at[index])
+                std::memcpy(stream.data() + shader_at[index], &translated[index], sizeof vertex);
         void *signature = nullptr;
         if (signature_at)
             std::memcpy(&signature, stream.data() + signature_at, sizeof signature);
@@ -3932,14 +4238,16 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
     overrides.push_back({74, reinterpret_cast<Slot>(&register_page_pool)});
     overrides.push_back({10, reinterpret_cast<Slot>(&create_graphics_pipeline)});
     overrides.push_back({11, reinterpret_cast<Slot>(&create_compute_pipeline)});
-    overrides.push_back({48, reinterpret_cast<Slot>(&create_command_queue)});
+    overrides.push_back({48, reinterpret_cast<Slot>(&create_command_queue_x)});
     overrides.push_back({73, reinterpret_cast<Slot>(&create_command_list)});
     overrides.push_back({12, reinterpret_cast<Slot>(&create_command_list_desktop)});
+    overrides.push_back({9, reinterpret_cast<Slot>(&create_command_allocator)});
     overrides.push_back({29, reinterpret_cast<Slot>(&create_placed_resource)});
     overrides.push_back({30, reinterpret_cast<Slot>(&create_reserved_resource)});
     overrides.push_back({60, reinterpret_cast<Slot>(&create_graphics_pipeline_x)});
     for (const std::size_t ignored : {49, 50, 51, 52, 53, 54, 58, 69, 72, 75})
         overrides.push_back({ignored, reinterpret_cast<Slot>(&ignored_device_method)});
+    overrides.push_back({68, reinterpret_cast<Slot>(&gpu_hardware_configuration)});
     // how a GDK title paces its frames: there is no swap chain to wait for
     overrides.push_back({78, reinterpret_cast<Slot>(&set_frame_interval)});
     overrides.push_back({79, reinterpret_cast<Slot>(&schedule_frame_event)});
@@ -3953,6 +4261,9 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
         for (std::size_t slot = 87; slot <= 92; ++slot)
             overrides.push_back({slot, later[slot - 87]});
         overrides.push_back({90, reinterpret_cast<Slot>(&create_pipeline_state)});
+        overrides.push_back({46, reinterpret_cast<Slot>(&create_placed_srv)});
+        overrides.push_back({47, reinterpret_cast<Slot>(&create_placed_uav)});
+        overrides.push_back({59, reinterpret_cast<Slot>(&default_msaa_parameters)});
     } else {
         for (std::size_t slot = 83; slot <= 103; ++slot)
             overrides.push_back({slot, later[slot - 83]});

@@ -1,4 +1,5 @@
 #include "runtime/modules/console_shader.hpp"
+#include "runtime/modules/console_shader_rdna.hpp"
 #include <catch2/catch.hpp>
 #include <cstring>
 #include <d3dcompiler.h>
@@ -26,6 +27,27 @@ std::size_t count(const std::string &text, const std::string &what) {
     for (auto at = text.find(what); at != std::string::npos; at = text.find(what, at + 1))
         ++found;
     return found;
+}
+
+std::optional<std::string> pixel_move(std::uint32_t move, std::uint32_t selectors, std::string &why,
+                                      bool &needs_sm6) {
+    // LLVM gfx1013: v_mov_b32 v20, 1.0; v_mov_b32_dpp v24, v20; exp mrt0, v24, off, off, off.
+    const std::uint32_t code[] = {0x7e2802f2, move, selectors, 0xf8001801, 24, end_program};
+    constexpr std::size_t region = 0x140, header = 0x28;
+    std::vector<std::uint8_t> file(region + header + sizeof code);
+    const auto put = [&](std::size_t offset, std::uint32_t value) {
+        std::memcpy(file.data() + offset, &value, sizeof value);
+    };
+    std::memcpy(file.data(), "FSSM", 4);
+    put(0xc0, region);
+    put(0xc8, header + sizeof code);
+    std::memcpy(file.data() + region + header, code, sizeof code);
+    const std::uint32_t root[] = {1, 0, 24, 0, 0, 0};
+    const rdna::Shader shader{file,
+                              {reinterpret_cast<const std::uint8_t *>(root), sizeof root},
+                              {},
+                              {{"SV_Target", 0, 3, 4, true, 0, 15, 0}}};
+    return rdna::translate(ShaderStage::pixel, shader, &why, nullptr, &needs_sm6);
 }
 } // namespace
 
@@ -159,4 +181,24 @@ TEST_CASE("a rectangle list's fourth corner comes from a geometry shader") {
     code->Release();
     const std::uint8_t nothing[16] = {};
     CHECK(rectangle_shader(nothing).empty());
+}
+
+TEST_CASE("a pixel DPP8 move can rearrange the four lanes of each quad") {
+    bool needs_sm6 = false;
+    std::string why;
+    // LLVM gfx1013: dpp8:[1,2,3,0,5,6,7,4].
+    const auto source = pixel_move(0x7e3002e9, 0x9f50d114, why, needs_sm6);
+    INFO(why);
+    REQUIRE(source);
+    CHECK(needs_sm6);
+    CHECK(count(*source, "QuadReadLaneAt(") == 4);
+    CHECK(source->find("WaveGetLaneIndex()") != std::string::npos);
+    CHECK(source->find("IsHelperLane() ? 0u : v20") != std::string::npos);
+    CHECK(source->find("src, 1u)") != std::string::npos);
+    CHECK(source->find("src, 0u)") != std::string::npos);
+
+    CHECK_FALSE(pixel_move(0x7e3002e9, 0x9f50d514, why, needs_sm6)); // lane 0 reads lane 5
+    CHECK_FALSE(needs_sm6);
+    CHECK_FALSE(pixel_move(0x7e3002ea, 0x9f50d114, why, needs_sm6)); // fetch inactive lanes
+    CHECK_FALSE(needs_sm6);
 }

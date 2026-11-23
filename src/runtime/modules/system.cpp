@@ -1,6 +1,7 @@
 #include "runtime/modules/system.hpp"
 #include "host/files.hpp"
 #include "runtime/common/runtime.hpp"
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <windows.h>
@@ -29,24 +30,31 @@ HRESULT __cdecl xaudio2_create(void **engine, UINT32 flags, UINT32) {
     return result;
 }
 HRESULT WINAPI dxc_create_instance(const GUID *class_id, const GUID *iid, void **object) {
-    using Create = HRESULT(WINAPI *)(const GUID *, const GUID *, void **);
+    if (!class_id || !iid || !object)
+        return E_POINTER;
+    const auto result = host_dxc_create_instance(*class_id, *iid, object);
+    static std::atomic<bool> shown{false};
+    if (result == CLASS_E_CLASSNOTAVAILABLE && !shown.exchange(true))
+        std::fprintf(stderr, "[Runtime] the title asks for the shader compiler, and there "
+                             "is no dxcompiler.dll next to xvalkyrie or in the system\n");
+    return result;
+}
+} // namespace
+
+HRESULT host_dxc_create_instance(REFCLSID class_id, REFIID iid, void **object) {
+    using Create = HRESULT(WINAPI *)(REFCLSID, REFIID, void **);
     static const auto create = [] {
         auto library =
             LoadLibraryExW((host::executable_directory() / "dxcompiler.dll").c_str(), nullptr,
                            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!library)
             library = LoadLibraryExW(L"dxcompiler.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (!library)
-            std::fprintf(stderr, "[Runtime] the title asks for the shader compiler, and there "
-                                 "is no dxcompiler.dll next to xvalkyrie or in the system\n");
         return library ? reinterpret_cast<Create>(GetProcAddress(library, "DxcCreateInstance"))
                        : nullptr;
     }();
-    if (object)
-        *object = nullptr;
+    *object = nullptr;
     return create ? create(class_id, iid, object) : CLASS_E_CLASSNOTAVAILABLE;
 }
-} // namespace
 
 void install_xaudio2(Registry &registry) {
     const char *const module = "xaudio2_9.dll";

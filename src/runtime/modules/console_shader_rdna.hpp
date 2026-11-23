@@ -28,7 +28,8 @@ struct Shader {
 // The HLSL for the code: what the shader declares and its `main`. A vertex or pixel shader's
 // takes `Input input` and returns `Output`; a compute shader's takes what it needs. Nothing
 // if the code has something that is not handled, and then `why` says what and `at` the
-// instruction it was met at, in words from the first, or ~0.
+// instruction it was met at, in words from the first, or ~0. `needs_sm6` reports whether
+// the generated shader uses Shader Model 6 intrinsics.
 std::optional<std::string> translate(Stage stage, const Shader &shader, std::string *why = nullptr,
-                                     std::uint32_t *at = nullptr);
+                                     std::uint32_t *at = nullptr, bool *needs_sm6 = nullptr);
 } // namespace xv::runtime::modules::rdna

@@ -40,14 +40,23 @@ struct Layout {
     std::array<Method, vtable_slots> vtable{};
     // methods called through pointers stored in the object, by offset / 8
     std::array<Method, object_slots> object{};
+    // where that table starts in the object: the word of its QueryInterface
+    std::size_t table = 124;
+    // the byte of a context that makes titles call SetFastResources_Debug with a table of
+    // what to bind, where they would write the GPU's packets themselves
+    std::size_t out_of_line = 0x390;
     // applies state the title wrote into the object instead of calling a method
     void (*apply_state)(void *object) = nullptr;
 };
 const Layout &layout(Kind kind);
 // Whether the title was built with the first development kits, whose DXGI interfaces have
-// one more method than later ones: swap chains made from then on have their layout
-void first_development_kits(bool yes);
+// one more method than later ones: swap chains made from then on have their layout.
+// `launch` is the kit before those, with the desktop's interfaces; `earliest` is 1 or 2 for
+// the two kits after it (the later one first), whose context still has the desktop's whole
+// table in the object.
+void first_development_kits(bool yes, bool launch = false, int earliest = 0);
 bool first_development_kits();
+bool launch_kit();
 // IDXGISwapChain::Present of a swap chain of ours
 long present_swap_chain(void *swap_chain, unsigned interval); // HRESULT
 // sets the events a title gave DXGIXSetFrameNotification; after each frame presented

@@ -61,6 +61,67 @@ const char *name_of(F format, std::uint32_t op) {
     const auto found = names.find(static_cast<std::uint32_t>(format) << 16 | op);
     return found == names.end() ? nullptr : found->second;
 }
+// The Xbox One GPU's instructions (AMD's GCN, LLVM's "bonaire"; tools/gcn_ops.py): the same
+// formats with other opcodes, some of them laid out another way. They are decoded into the
+// Series form of the same instruction, which is what the rest of the translator reads.
+constexpr Op older_ops[] = {
+#include "runtime/modules/console_shader_gcn_ops.inc"
+};
+const char *older_name_of(F format, std::uint32_t op) {
+    // Compares have the Series numbers, with signalling ones from 0x40 that are taken for
+    // the quiet ones; the table has only those the assembler told of.
+    if (format == F::vopc) {
+        const auto quiet = op >= 0x40 && op < 0x80 ? op - 0x40 : op;
+        const bool wide16 = (quiet & 0xf) > 8 && quiet >= 0x80; // 16-bit ones, newer
+        return wide16 ? nullptr : name_of(F::vopc, quiet);
+    }
+    static const auto names = [] {
+        std::unordered_map<std::uint32_t, const char *> table;
+        for (const auto &known : older_ops)
+            table.emplace(static_cast<std::uint32_t>(known.format) << 16 | known.op, known.name);
+        return table;
+    }();
+    const auto found = names.find(static_cast<std::uint32_t>(format) << 16 | op);
+    return found == names.end() ? nullptr : found->second;
+}
+// the opcode an instruction of this name has on the Series GPU in this format
+std::optional<std::uint32_t> op_of(F format, std::string_view name) {
+    static const auto by_name = [] {
+        std::map<std::pair<F, std::string_view>, std::uint32_t> table;
+        for (const auto &known : ops)
+            table.emplace(std::pair{known.format, std::string_view(known.name)}, known.op);
+        return table;
+    }();
+    const auto found = by_name.find({format, name});
+    return found == by_name.end() ? std::nullopt : std::optional(found->second);
+}
+// What an older instruction is called now, or the one that stands for it: the legacy and
+// clamped forms differ from the plain ones in what they make of NaN and infinity.
+std::string_view newer_name(std::string_view name) {
+    static constexpr std::pair<std::string_view, std::string_view> renamed[] = {
+        {"v_add_i32", "v_add_co_u32"},       {"v_sub_i32", "v_sub_co_u32"},
+        {"v_subrev_i32", "v_subrev_co_u32"}, {"v_addc_u32", "v_add_co_ci_u32"},
+        {"v_subb_u32", "v_sub_co_ci_u32"},   {"v_subbrev_u32", "v_subrev_co_ci_u32"},
+        {"v_min_legacy_f32", "v_min_f32"},   {"v_max_legacy_f32", "v_max_f32"},
+        {"v_mul_legacy_f32", "v_mul_f32"},   {"v_mac_legacy_f32", "v_mac_f32"},
+        {"v_mad_legacy_f32", "v_mad_f32"},   {"v_rcp_clamp_f32", "v_rcp_f32"},
+        {"v_rcp_legacy_f32", "v_rcp_f32"},   {"v_rsq_clamp_f32", "v_rsq_f32"},
+        {"v_rsq_legacy_f32", "v_rsq_f32"},   {"v_log_clamp_f32", "v_log_f32"},
+        {"v_mul_lo_i32", "v_mul_lo_u32"},
+    };
+    for (const auto &[older, newer] : renamed)
+        if (name == older)
+            return newer;
+    return name;
+}
+// a vertex buffer format as the Series GPU numbers it, by the older data and number formats
+constexpr std::uint8_t buffer_formats[128] = {
+    0,  0,  0,  0,  0,  0,  0,  0,  1,  2,  3,  4,  5,  6,  0,  0,  7,  8,  9,  10, 11, 12,
+    0,  13, 14, 15, 16, 17, 18, 19, 0,  0,  0,  0,  0,  0,  20, 21, 0,  22, 23, 24, 25, 26,
+    27, 28, 0,  29, 30, 31, 32, 33, 34, 35, 0,  36, 37, 38, 39, 40, 41, 42, 0,  43, 44, 45,
+    46, 47, 48, 49, 0,  0,  50, 51, 52, 53, 54, 55, 0,  0,  56, 57, 58, 59, 60, 61, 0,  0,
+    0,  0,  0,  0,  62, 63, 0,  64, 65, 66, 67, 68, 69, 70, 0,  71, 0,  0,  0,  0,  72, 73,
+    0,  74, 0,  0,  0,  0,  75, 76, 0,  77, 0,  0,  0,  0,  0,  0,  0,  0};
 
 struct Unsupported {
     std::string what;
@@ -250,6 +311,8 @@ class Translator {
     Translator(Stage stage, const Shader &shader, Facts &facts)
         : stage_(stage), shader_(shader), facts_(facts) {}
 
+    bool needs_sm6() const { return needs_sm6_; }
+
     std::string run() {
         if (!read_root_signature(shader_.root_signature, parameters_))
             give_up("root signature");
@@ -274,8 +337,41 @@ class Translator {
     }
 
   private:
+    // An Xbox One shader: its size, 5 at 0x18, where its code is at 0x28; the program starts
+    // 0x28 into the code and is as long as 0x1dc says.
+    bool read_older_file() {
+        const auto file = shader_.file;
+        if (file.size() < 0x1e0 || word(file, 0) != file.size() || word(file, 0x18) != 5)
+            return false;
+        const auto start = word(file, 0x28) + 0x28, size = word(file, 0x1dc);
+        if (start > file.size() || size > file.size() - start || size % 4)
+            give_up("no code");
+        older_ = true;
+        for (std::uint32_t at = start; at + 4 <= start + size; at += 4)
+            code_.push_back(word(file, at));
+        // the root parameters in order, from the third register; one that would not fit
+        // before the sixteenth is not in registers
+        std::uint32_t reg = 3;
+        for (std::uint32_t p = 0; p < parameters_.size(); ++p) {
+            const std::uint32_t size = parameters_[p].type == 0   ? 1
+                                       : parameters_[p].type == 1 ? parameters_[p].count
+                                                                  : 2;
+            if (reg + size > 16)
+                break;
+            if (parameters_[p].type == 0) {
+                known_[reg] = {Known::table, p};
+            } else if (parameters_[p].type >= 2) {
+                known_[reg] = {Known::root, p};
+                known_[reg + 1] = {Known::root, p, 0, 1};
+            }
+            reg += size;
+        }
+        return true;
+    }
     void read_file() {
         const auto file = shader_.file;
+        if (read_older_file())
+            return;
         if (file.size() < 0x140 || std::memcmp(file.data(), "FSSM", 4))
             give_up("no code");
         const auto region = word(file, 0xc0), size = word(file, 0xc8);
@@ -365,10 +461,139 @@ class Translator {
         data_first_ = code_list_.back().at + code_list_.back().words;
         find_modes();
     }
+    // One instruction of the older GPU, as the Series instruction it is: same place and
+    // length in the code, the fields where the Series format has them.
+    void decode_older(Ins &ins) {
+        const auto at = ins.at;
+        const auto w = code_[at];
+        const auto top = w >> 26;
+        const auto unknown = [&] {
+            char text[48];
+            std::snprintf(text, sizeof text, "older instruction %08x", w);
+            give_up(text);
+        };
+        const auto second = [&] {
+            if (at + 1 >= code_.size())
+                give_up("truncated code");
+            ins.words = 2;
+            return code_[at + 1];
+        };
+        // the same instruction with the Series opcode, where only that differs
+        const auto same = [&](F format, const char *name, std::uint32_t shift, std::uint32_t mask) {
+            if (!name)
+                unknown();
+            const auto op = op_of(format, newer_name(name));
+            if (!op)
+                give_up(std::string("older instruction ") + name);
+            ins.format = format, ins.op = *op;
+            ins.w0 = (w & ~(mask << shift)) | (*op & mask) << shift;
+        };
+        // as a three-operand instruction, which takes any source in any place
+        const auto wide = [&](std::string_view name, std::uint32_t destination, std::uint32_t abs,
+                              bool clamp, std::uint32_t sources, std::uint32_t rest) {
+            std::uint32_t a = sources & 0x1ff, b = (sources >> 9) & 0x1ff;
+            for (const auto &[plain, reversed] :
+                 {std::pair<std::string_view, std::string_view>{"v_lshr_b32", "v_lshrrev_b32"},
+                  {"v_ashr_i32", "v_ashrrev_i32"},
+                  {"v_lshl_b32", "v_lshlrev_b32"}})
+                if (name == plain)
+                    name = reversed, std::swap(a, b);
+            const auto op = op_of(F::vop3, newer_name(name));
+            if (!op)
+                give_up("older instruction " + std::string(name));
+            ins.format = F::vop3, ins.op = *op;
+            ins.w0 = 0x35u << 26 | *op << 16 | (clamp ? 1u << 15 : 0) | abs << 8 | destination;
+            ins.w1 = a | b << 9 | rest;
+        };
+        if (top == 0x34) { // VOP3: opcode in bits 17 to 25, clamp in bit 11
+            const auto op = (w >> 17) & 0x1ff;
+            const auto *name = older_name_of(F::vop3, op);
+            if (!name)
+                name = op < 0x100    ? older_name_of(F::vopc, op)
+                       : op < 0x140  ? older_name_of(F::vop2, op - 0x100)
+                       : op >= 0x180 ? older_name_of(F::vop1, op - 0x180)
+                                     : nullptr;
+            if (!name)
+                unknown();
+            const auto next = second();
+            // a compare has the register its result goes to where the others have abs
+            const bool compare = op < 0x100;
+            wide(name, w & 0xff, compare ? 0 : (w >> 8) & 7, !compare && (w >> 11 & 1),
+                 next & 0x3ffff, next & ~0x3ffffu);
+        } else if (top == 0x32) {
+            same(F::vintrp, older_name_of(F::vintrp, (w >> 16) & 3), 16, 3);
+        } else if (top == 0x36) {
+            ins.w1 = second();
+            same(F::ds, older_name_of(F::ds, (w >> 18) & 0xff), 18, 0xff);
+        } else if (top == 0x38) {
+            ins.w1 = second();
+            if (w >> 15 & 1)
+                give_up("a buffer read by address");
+            same(F::mubuf, older_name_of(F::mubuf, (w >> 18) & 0x7f), 18, 0x7f);
+        } else if (top == 0x3a) { // the format is two fields there, one number here
+            ins.w1 = second() & ~(1u << 21);
+            const auto *const name = older_name_of(F::mtbuf, (w >> 16) & 7);
+            const auto op = name ? op_of(F::mtbuf, name) : std::nullopt;
+            if (!op)
+                unknown();
+            ins.format = F::mtbuf, ins.op = *op;
+            ins.w0 = (w & 0xfc003fff) | (*op & 7) << 16 |
+                     std::uint32_t{buffer_formats[(w >> 19) & 0x7f]} << 19;
+            ins.w1 |= (*op >> 3) << 21;
+        } else if (top == 0x3c) { // no dimension there: an array or not
+            ins.w1 = second();
+            const auto *const name = older_name_of(F::mimg, (w >> 18) & 0x7f);
+            const auto op = name ? op_of(F::mimg, name) : std::nullopt;
+            if (!op)
+                unknown();
+            ins.format = F::mimg, ins.op = *op;
+            ins.w0 =
+                (w & 0xfe03ff00) | (*op & 0x7f) << 18 | (*op >> 7) | (w >> 14 & 1 ? 5u : 1u) << 3;
+        } else if (top == 0x3e) {
+            ins.format = F::exp, ins.op = 0, ins.w0 = w, ins.w1 = second();
+        } else if (w >> 27 == 0x18) { // SMRD: one word, the offset in it and in words
+            const auto *const name = older_name_of(F::smem, (w >> 22) & 0x1f);
+            const auto op = name ? op_of(F::smem, name) : std::nullopt;
+            if (!op)
+                unknown();
+            const auto data = (w >> 15) & 0x7f, base = (w >> 9) & 0x3f, offset = w & 0xff;
+            ins.format = F::smem, ins.op = *op;
+            ins.w0 = 0x3du << 26 | *op << 18 | data << 6 | base;
+            if (w >> 8 & 1)
+                ins.w1 = 0x7du << 25 | offset * 4;
+            else
+                give_up("a load at an offset in a register");
+        } else if (w >> 23 == 0x17d) {
+            same(F::sop1, older_name_of(F::sop1, (w >> 8) & 0xff), 8, 0xff);
+        } else if (w >> 23 == 0x17e) {
+            same(F::sopc, older_name_of(F::sopc, (w >> 16) & 0x7f), 16, 0x7f);
+        } else if (w >> 23 == 0x17f) {
+            same(F::sopp, older_name_of(F::sopp, (w >> 16) & 0x7f), 16, 0x7f);
+        } else if (w >> 28 == 0xb) {
+            same(F::sopk, older_name_of(F::sopk, (w >> 23) & 0x1f), 23, 0x1f);
+        } else if (w >> 30 == 2) {
+            same(F::sop2, older_name_of(F::sop2, (w >> 23) & 0x7f), 23, 0x7f);
+        } else if (w >> 25 == 0x3f) {
+            same(F::vop1, older_name_of(F::vop1, (w >> 9) & 0xff), 9, 0xff);
+        } else if (w >> 25 == 0x3e) {
+            same(F::vopc, older_name_of(F::vopc, (w >> 17) & 0xff), 17, 0xff);
+        } else if (w >> 31 == 0) {
+            const auto *const name = older_name_of(F::vop2, (w >> 25) & 0x3f);
+            if (!name)
+                unknown();
+            if (op_of(F::vop2, newer_name(name)))
+                same(F::vop2, name, 25, 0x3f);
+            else
+                wide(name, (w >> 17) & 0xff, 0, false, (w & 0x1ff) | (256 + ((w >> 9) & 0xff)) << 9,
+                     0);
+        } else {
+            unknown();
+        }
+    }
     Ins decode_at(std::uint32_t at) {
         Ins ins;
         ins.at = at;
-        const auto w = ins.w0 = code_[at];
+        auto w = ins.w0 = code_[at];
         const auto top = w >> 26;
         const auto second = [&] {
             if (at + 1 >= code_.size())
@@ -376,7 +601,9 @@ class Translator {
             ins.w1 = code_[at + 1];
             ins.words = 2;
         };
-        if (top == 0x33)
+        if (older_)
+            decode_older(ins), w = ins.w0;
+        else if (top == 0x33)
             ins.format = F::vop3p, ins.op = (w >> 16) & 0x7f, second();
         else if (top == 0x35)
             ins.format = F::vop3, ins.op = (w >> 16) & 0x3ff, second();
@@ -425,7 +652,7 @@ class Translator {
             return code_[at + ins.words++];
         };
         // more words: the registers of an image instruction's address, or a literal
-        if (ins.format == F::mimg)
+        if (ins.format == F::mimg && !older_)
             for (std::uint32_t n = 0, count = (w >> 1) & 3; n < count; ++n)
                 ins.extra[n] = more();
         if (ins.format == F::vop1 || ins.format == F::vop2 || ins.format == F::vopc) {
@@ -481,6 +708,10 @@ class Translator {
             }
             if (starts(ins.name, "v_cmpx"))
                 exec_changes_ = true;
+            if (ins.format == F::sopk && ((ins.w0 >> 16) & 0x7f) >= 126 &&
+                (ins.name == "s_movk_i32" || ins.name == "s_cmovk_i32" ||
+                 ins.name == "s_addk_i32" || ins.name == "s_mulk_i32"))
+                sopk_writes_exec_ = true;
             if (ends(ins.name, "_b64") || ends(ins.name, "saveexec_b64"))
                 wave64_ = true;
             if (ins.format == F::ds && ins.name != "ds_swizzle_b32" && ins.name != "ds_nop")
@@ -1966,6 +2197,38 @@ class Translator {
         set_v(destination, input_channel(reg, channel));
     }
 
+    void emit_dpp8_move(const Ins &ins) {
+        if (stage_ != Stage::pixel || ins.name != "v_mov_b32" || (ins.w0 & 0x1ff) != 233)
+            give_up("an instruction that reads another lane");
+        if (exec_changes_ || sopk_writes_exec_ || blocks_.size() != 1 || blocks_[0].opens)
+            give_up("a DPP8 move with control flow or changes to EXEC");
+
+        std::array<std::uint32_t, 4> lanes{};
+        for (std::uint32_t lane = 0; lane < lanes.size(); ++lane) {
+            lanes[lane] = (ins.modifier >> (8 + 3 * lane)) & 7;
+            const auto next_quad = (ins.modifier >> (20 + 3 * lane)) & 7;
+            if (lanes[lane] >= 4 || next_quad != lanes[lane] + 4)
+                give_up("a DPP8 move without a repeated quad-local permutation");
+        }
+
+        needs_sm6_ = true;
+        const auto source = v(ins.modifier & 0xff);
+        const auto id = "x" + std::to_string(temporaries_++);
+        const auto local = id + "lane";
+        const auto input = id + "src";
+        line("uint " + local + " = WaveGetLaneIndex() & 3u;");
+        // Quad reads can see helper lanes. A normal DPP8 read of an inactive source yields zero.
+        line("uint " + input + " = IsHelperLane() ? 0u : " + source + ";");
+        for (std::uint32_t lane = 0; lane < lanes.size(); ++lane) {
+            const auto read = id + "q" + std::to_string(lane);
+            line("uint " + read + " = QuadReadLaneAt(" + input + ", " +
+                 std::to_string(lanes[lane]) + "u);");
+        }
+        set_v((ins.w0 >> 17) & 0xff, "(" + local + " < 2u ? (" + local + " == 0u ? " + id +
+                                         "q0 : " + id + "q1) : (" + local + " == 2u ? " + id +
+                                         "q2 : " + id + "q3))");
+    }
+
     // The instructions with one or two sources in one word. A second word may say which
     // byte or half of each source is meant, and which of the destination is written.
     // An instruction whose first source is another lane's register. A compute shader's
@@ -2011,7 +2274,11 @@ class Translator {
     }
     void emit_short(const Ins &ins) {
         if (ins.form == Ins::Form::lanes) {
-            emit_lanes(ins);
+            // a pixel shader's are moves within a quad; a compute shader's sum over its wave
+            if (stage_ == Stage::pixel)
+                emit_dpp8_move(ins);
+            else
+                emit_lanes(ins);
             return;
         }
         const auto destination = (ins.w0 >> 17) & 0xff, modifier = ins.modifier;
@@ -3940,14 +4207,18 @@ class Translator {
     std::string declarations_, prologue_, body_, indent_ = "    ";
     int temporaries_ = 0;
     bool exec_changes_ = false, wave64_ = false;
+    bool older_ = false;      // an Xbox One shader
     bool sums_lanes_ = false; // a compute shader with instructions that read other lanes
     bool unlearned_ = false; // an instruction was left out for a descriptor of a kind not known yet
+    bool needs_sm6_ = false, sopk_writes_exec_ = false;
     bool fetched_ = false, exported_ = false, vertex_id_ = false, instance_id_ = false;
 };
 } // namespace
 
 std::optional<std::string> translate(Stage stage, const Shader &shader, std::string *why,
-                                     std::uint32_t *at) {
+                                     std::uint32_t *at, bool *needs_sm6) {
+    if (needs_sm6)
+        *needs_sm6 = false;
     if (stage != Stage::vertex && stage != Stage::pixel && stage != Stage::compute) {
         if (why)
             *why = "stage";
@@ -3959,7 +4230,11 @@ std::optional<std::string> translate(Stage stage, const Shader &shader, std::str
         Facts facts;
         for (int pass = 0; pass < 64; ++pass) {
             try {
-                return std::make_unique<Translator>(stage, shader, facts)->run();
+                const auto translator = std::make_unique<Translator>(stage, shader, facts);
+                auto source = translator->run();
+                if (needs_sm6)
+                    *needs_sm6 = translator->needs_sm6();
+                return source;
             } catch (const Retry &) {
             }
         }

@@ -115,10 +115,12 @@ BOOL WINAPI title_memory_status(TitleMemory *status) {
                                  reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&process),
                                  sizeof process))
         return FALSE;
-    // what a title gets on an Xbox One X, or less if the host has less to give
+    // What a title gets on an Xbox One X, or less if the host has less in all. How much of
+    // the host's is free at the moment does not count: a console's memory is the title's
+    // alone, and titles lay their heaps out by what is left of it.
     const ULONGLONG budget = std::min<ULONGLONG>(9ull << 30, host.ullTotalPhys);
     const ULONGLONG used = std::min<ULONGLONG>(process.PrivateUsage, budget);
-    const ULONGLONG available = std::min<ULONGLONG>(budget - used, host.ullAvailPhys);
+    const ULONGLONG available = budget - used;
     *status = {sizeof *status, 0, budget, available, 0, 0, 0, used, available, 0, 0};
     return TRUE;
 }

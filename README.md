@@ -42,29 +42,29 @@ the states mean are in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 <table>
   <tr>
-    <th>Rock Band 4</th>
+    <th>UNDERTALE</th>
     <th>DRAGON BALL FighterZ</th>
     <th>Terraria</th>
     <th>Puyo Puyo Champions</th>
-    <th>Mega Man 11</th>
+    <th>Rayman Legends</th>
   </tr>
   <tr>
-    <td><img src="docs/img/compat/rock-band-4.png" alt="Rock Band 4" width="170"></td>
+    <td><img src="docs/img/compat/undertale.webp" alt="UNDERTALE" width="170"></td>
     <td><img src="docs/img/compat/dragon-ball-fighterz.webp" alt="DRAGON BALL FighterZ" width="170"></td>
     <td><img src="docs/img/compat/terraria.webp" alt="Terraria" width="170"></td>
     <td><img src="docs/img/compat/puyo-puyo-champions.webp" alt="Puyo Puyo Champions" width="170"></td>
-    <td><img src="docs/img/compat/mega-man-11.png" alt="Mega Man 11" width="170"></td>
+    <td><img src="docs/img/compat/rayman-legends.webp" alt="Rayman Legends" width="170"></td>
   </tr>
   <tr>
-    <td align="center">Boots</td>
+    <td align="center">Playable</td>
     <td align="center">Menu</td>
     <td align="center">Playable</td>
     <td align="center">Menu</td>
-    <td align="center">Boots</td>
+    <td align="center">Menu</td>
   </tr>
 </table>
 
-[+53 titles](COMPATIBILITY.md#xbox-one)
+[+36 titles](COMPATIBILITY.md#xbox-one)
 
 **Xbox Series X|S**
 
@@ -81,7 +81,7 @@ the states mean are in [COMPATIBILITY.md](COMPATIBILITY.md).
     <td><img src="docs/img/compat/unicorn-overlord.webp" alt="Unicorn Overlord" width="170"></td>
     <td><img src="docs/img/compat/minecraft.webp" alt="Minecraft Preview" width="170"></td>
     <td><img src="docs/img/compat/xdefiant.png" alt="XDefiant" width="170"></td>
-    <td><img src="docs/img/compat/psychonauts-2.png" alt="Psychonauts 2" width="170"></td>
+    <td><img src="docs/img/compat/psychonauts-2.webp" alt="Psychonauts 2" width="170"></td>
   </tr>
   <tr>
     <td align="center">Menu</td>
@@ -93,6 +93,8 @@ the states mean are in [COMPATIBILITY.md](COMPATIBILITY.md).
 </table>
 
 [+3 titles](COMPATIBILITY.md#xbox-series-xs)
+
+49 titles tried: **8** playable · **10** menu · **3** intro · **20** boots · **8** nothing
 
 ## Status
 
@@ -228,6 +230,13 @@ decrypt retail packages.
 
 Issues and pull requests are welcome; [CONTRIBUTING.md](CONTRIBUTING.md) has the ground
 rules. Say where information comes from: guessed offsets, ordinals or ABIs are not merged.
+
+## Acknowledgements
+
+The method order of some console WinRT classes (`Windows.Kinect`,
+`Windows.Xbox.Management.Deployment.PackageTransferManager`, `Windows.Xbox.Input.Controller`)
+was checked against the interface descriptions of
+[WinDurango](https://github.com/WinDurango/WinDurango). No code of it is used here.
 
 ## Legal
 

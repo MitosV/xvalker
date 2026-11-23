@@ -158,21 +158,68 @@ CreateComputer console_xg() {
         detail::system_export("xg_x.dll", "XGCreateTexture2DComputer"));
     return create;
 }
-// SEH only, no objects to unwind here
-bool copy_out(Copy copy, void *computer, void *destination, UINT subresource, const void *source,
-              UINT row_pitch, UINT slice_pitch) {
+// The console's computer for a texture. The first kits' description has one word about
+// ESRAM where later ones have two, so the tile mode and the pitch are a word earlier there:
+// which it is shows in whether the library takes the description.
+HRESULT make_computer(const XgTexture2D &xg, void **computer) {
+    const auto create = console_xg();
+    if (!create)
+        return E_NOTIMPL;
+    static std::atomic<int> layout{0}; // 1 the later one, 2 the first kits', 0 not known yet
+    auto earlier = xg;
+    earlier.esram_usage = xg.tile_mode;
+    earlier.tile_mode = xg.pitch;
+    auto made = create(layout == 2 ? &earlier : &xg, computer);
+    if (SUCCEEDED(made) && layout == 0)
+        layout = 1;
+    else if (FAILED(made) && layout == 0 && SUCCEEDED(made = create(&earlier, computer)))
+        layout = 2;
+    return made;
+}
+bool is_code(const void *address) {
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(address, &info, sizeof info) && info.State == MEM_COMMIT &&
+           (info.Protect &
+            (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+}
+// One subresource out of its tiling, row after row. Later computers copy it themselves. The
+// first kits' one ends with the method that says where an element (a pixel, or a block of
+// a compressed format) is: the elements of a row lie together eight at a time, the width of
+// the smallest tile. SEH only, no objects to unwind here.
+bool copy_out(void *computer, void *destination, UINT mip, UINT slice, UINT mips,
+              const void *source, UINT row_pitch, UINT slice_pitch, UINT element) {
+    using Where = std::int64_t(WINAPI *)(void *, UINT, UINT, UINT64, UINT, UINT, UINT);
+    auto *const vtable = *static_cast<void ***>(computer);
     __try {
-        return SUCCEEDED(
-            copy(computer, destination, 0, subresource, source, row_pitch, slice_pitch));
+        if (is_code(vtable[6])) {
+            const auto first =
+                reinterpret_cast<std::uint64_t(WINAPI *)(void *, UINT, UINT)>(vtable[3]);
+            const auto copy = reinterpret_cast<Copy>(vtable[first(computer, 0, 0) ? 9 : 6]);
+            return SUCCEEDED(
+                copy(computer, destination, 0, slice * mips + mip, source, row_pitch, slice_pitch));
+        }
+        const auto where = reinterpret_cast<Where>(vtable[4]);
+        const UINT width = row_pitch / element, height = slice_pitch / row_pitch;
+        const auto start = where(computer, 0, mip, 0, 0, slice, 0);
+        const UINT run =
+            width >= 8 && where(computer, 0, mip, 7, 0, slice, 0) == start + 7 * element ? 8 : 1;
+        for (UINT y = 0; y < height; ++y)
+            for (UINT x = 0; x < width; x += run) {
+                const auto at = where(computer, 0, mip, x, y, slice, 0);
+                if (at < 0)
+                    return false;
+                std::memcpy(static_cast<std::uint8_t *>(destination) + std::size_t{y} * row_pitch +
+                                std::size_t{x} * element,
+                            static_cast<const std::uint8_t *>(source) + at,
+                            std::size_t{std::min(run, width - x)} * element);
+            }
+        return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 }
 bool detile(ID3D11DeviceContext *context, ID3D11Texture2D *texture,
             const D3D11_TEXTURE2D_DESC &desc, const Placement &placement) {
-    const auto create = console_xg();
-    if (!create)
-        return false;
     const XgTexture2D xg{desc.Width,
                          desc.Height,
                          desc.MipLevels,
@@ -189,12 +236,18 @@ bool detile(ID3D11DeviceContext *context, ID3D11Texture2D *texture,
                          placement.tile_mode,
                          placement.pitch};
     void *computer = nullptr;
-    if (FAILED(create(&xg, &computer)) || !computer)
+    if (const auto made = make_computer(xg, &computer); FAILED(made) || !computer) {
+        if (static std::atomic<bool> told{false}; made != E_NOTIMPL && !told.exchange(true))
+            std::fprintf(stderr,
+                         "[Runtime] the console's XG makes nothing of %ux%u mips %u array %u "
+                         "format %u tile mode %u pitch %u: 0x%08lx\n",
+                         xg.width, xg.height, xg.mips, xg.array_size, xg.format, xg.tile_mode,
+                         xg.pitch, static_cast<unsigned long>(made));
         return false;
+    }
     auto *const vtable = *static_cast<void ***>(computer);
-    const auto first = reinterpret_cast<std::uint64_t(WINAPI *)(void *, UINT, UINT)>(vtable[3]);
-    const auto copy = reinterpret_cast<Copy>(vtable[first(computer, 0, 0) ? 9 : 6]);
     const UINT mips = std::max(desc.MipLevels, 1u);
+    const UINT element = format_size(static_cast<std::uint32_t>(desc.Format)).bytes;
     std::vector<std::byte> linear;
     bool ok = true;
     for (UINT slice = 0; slice < std::max(desc.ArraySize, 1u) && ok; ++slice)
@@ -203,8 +256,8 @@ bool detile(ID3D11DeviceContext *context, ID3D11Texture2D *texture,
             const auto bytes = pitch * rows(desc.Height >> mip, desc.Format);
             linear.resize(bytes);
             const auto index = slice * mips + mip;
-            ok = copy_out(copy, computer, linear.data(), index,
-                          reinterpret_cast<const void *>(placement.start), pitch, bytes);
+            ok = copy_out(computer, linear.data(), mip, slice, mips,
+                          reinterpret_cast<const void *>(placement.start), pitch, bytes, element);
             if (ok)
                 context->UpdateSubresource(texture, index, nullptr, linear.data(), pitch, bytes);
         }
@@ -432,16 +485,10 @@ bool linear_subresources(const Placement &placement, PlacementUpload &upload) {
     const UINT mips = std::max<UINT>(desc.MipLevels, 1),
                slices = std::max<UINT>(desc.DepthOrArraySize, 1);
     void *computer = nullptr;
-    Copy copy = nullptr;
-    if (placement.tile_mode > 1) {
-        const auto create = console_xg();
-        const auto xg = xg_desc(desc, placement.tile_mode);
-        if (!create || FAILED(create(&xg, &computer)) || !computer)
-            return false;
-        auto *const vtable = *static_cast<void ***>(computer);
-        const auto first = reinterpret_cast<std::uint64_t(WINAPI *)(void *, UINT, UINT)>(vtable[3]);
-        copy = reinterpret_cast<Copy>(vtable[first(computer, 0, 0) ? 9 : 6]);
-    }
+    if (placement.tile_mode > 1 &&
+        (FAILED(make_computer(xg_desc(desc, placement.tile_mode), &computer)) || !computer))
+        return false;
+    const UINT element = format_size(static_cast<std::uint32_t>(desc.Format)).bytes;
     bool ok = true;
     std::size_t offset = 0;
     for (UINT slice = 0; slice < slices && ok; ++slice)
@@ -450,9 +497,9 @@ bool linear_subresources(const Placement &placement, PlacementUpload &upload) {
             const auto bytes = std::size_t{pitch} * rows(desc.Height >> mip, desc.Format);
             std::vector<std::byte> linear(bytes);
             if (computer)
-                ok = copy_out(copy, computer, linear.data(), slice * mips + mip,
+                ok = copy_out(computer, linear.data(), mip, slice, mips,
                               reinterpret_cast<const void *>(placement.start), pitch,
-                              static_cast<UINT>(bytes));
+                              static_cast<UINT>(bytes), element);
             else
                 std::memcpy(linear.data(), reinterpret_cast<const void *>(placement.start + offset),
                             bytes);
@@ -476,10 +523,8 @@ std::size_t placed_bytes(const D3D12_RESOURCE_DESC &desc, UINT tile_mode) {
         return linear;
     // a tiling pads to its tiles: the size XG computes for it, where the console's xg_x.dll
     // is the newer one that says (its first method after Release), the linear one otherwise
-    const auto create = console_xg();
-    const auto xg = xg_desc(desc, tile_mode);
     void *computer = nullptr;
-    if (!create || FAILED(create(&xg, &computer)) || !computer)
+    if (FAILED(make_computer(xg_desc(desc, tile_mode), &computer)) || !computer)
         return linear;
     auto *const vtable = *static_cast<void ***>(computer);
     const auto size =

@@ -118,7 +118,7 @@ std::vector<std::uint8_t> make_dll(const std::uint8_t *data, std::size_t size,
     directory.SizeOfZeroFill = zero_fill;
     directory.Characteristics = characteristics;
     std::memcpy(body, &directory, sizeof directory);
-    // the callbacks are the image's, already where they will run: not relocated
+    // the callbacks are ours, already where they will run: not relocated
     std::memcpy(body + callbacks_at, callbacks.data(), 8 * callbacks.size());
     if (size)
         std::memcpy(body + template_at, data, size);
@@ -160,9 +160,44 @@ void trade(void *teb) {
     if (auto **const blocks = tls_array(teb))
         std::swap(blocks[0], blocks[title_index]);
 }
-void NTAPI on_thread(void *, DWORD reason, void *) {
+// A title's own TLS callbacks are called from ours, for two reasons. The loader calls
+// them as it loads the module, before the image has its index: a callback that reaches for
+// its thread's block then gets xvalkyrie.exe's, and one that faults there under a lock of
+// its own leaves it taken for good. And a thread of the host that was running before the
+// module ends without having started as far as the title knows: the end of a thread is
+// only told for one whose start was.
+struct Callbacks {
+    void *module = nullptr;
+    std::vector<PIMAGE_TLS_CALLBACK> functions;
+};
+constexpr std::size_t most_modules = 64; // one bit of a thread's `started` each
+Callbacks modules[most_modules];
+std::atomic<std::size_t> module_count{0};
+const DWORD started = TlsAlloc();
+void tell(std::size_t which, void *module, DWORD reason, void *reserved) {
+    const auto bit = std::uintptr_t{1} << which;
+    const auto known = reinterpret_cast<std::uintptr_t>(TlsGetValue(started));
+    if (reason == DLL_THREAD_DETACH && !(known & bit))
+        return;
+    if (reason == DLL_THREAD_ATTACH || reason == DLL_PROCESS_ATTACH)
+        TlsSetValue(started, reinterpret_cast<void *>(known | bit));
+    for (const auto function : modules[which].functions)
+        function(module, reason, reserved);
+}
+void NTAPI on_thread(void *module, DWORD reason, void *reserved) {
+    for (std::size_t which = 0; which < module_count; ++which)
+        if (modules[which].module == module)
+            return tell(which, module, reason, reserved);
+}
+// The executable's callbacks hear of the process on the thread that runs its entry point,
+// as on the console, and of no thread before that.
+std::atomic<bool> executable_started{false};
+void *executable_module = nullptr;
+void NTAPI on_executable_thread(void *module, DWORD reason, void *reserved) {
     if (reason == DLL_THREAD_ATTACH && traded)
         trade(NtCurrentTeb());
+    if (executable_started)
+        on_thread(module, reason, reserved);
 }
 ULONG *host_index() {
     const auto *const image = reinterpret_cast<const std::uint8_t *>(GetModuleHandleW(nullptr));
@@ -240,11 +275,14 @@ void install_static_tls(const nlohmann::json &tls, std::uint64_t base, std::uint
     const auto start = at("template_start_va"), end = at("template_end_va");
     if (end < start)
         throw std::runtime_error("The TLS template ends before it starts");
-    std::vector<std::uint64_t> callbacks;
-    if (executable)
-        callbacks.push_back(reinterpret_cast<std::uint64_t>(&on_thread));
+    if (module_count == most_modules)
+        throw std::runtime_error("Too many modules with TLS");
+    Callbacks own;
     for (const auto &callback : tls.at("callbacks_va"))
-        callbacks.push_back(base + (callback.get<std::uint64_t>() - image_base));
+        own.functions.push_back(reinterpret_cast<PIMAGE_TLS_CALLBACK>(
+            base + (callback.get<std::uint64_t>() - image_base)));
+    const std::vector<std::uint64_t> callbacks{
+        reinterpret_cast<std::uint64_t>(executable ? &on_executable_thread : &on_thread)};
     const auto bytes = make_dll(reinterpret_cast<const std::uint8_t *>(start), end - start,
                                 tls.at("zero_fill").get<std::uint32_t>(),
                                 tls.at("characteristics").get<std::uint32_t>(), callbacks);
@@ -283,7 +321,21 @@ void install_static_tls(const nlohmann::json &tls, std::uint64_t base, std::uint
     *slot = index;
     VirtualProtect(slot, sizeof index, previous, &previous);
     std::fprintf(stderr, "[Runtime] static TLS: %llu bytes, %zu callbacks, index %lu%s\n",
-                 static_cast<unsigned long long>(end - start), callbacks.size(), index,
+                 static_cast<unsigned long long>(end - start), own.functions.size(), index,
                  index != loaded ? " (traded with xvalkyrie's)" : "");
+    // now that the image knows its index, what the loader would have told its callbacks
+    const std::size_t which = module_count;
+    own.module = module;
+    modules[which] = std::move(own);
+    module_count = which + 1;
+    if (executable)
+        executable_module = module;
+    else
+        tell(which, module, DLL_PROCESS_ATTACH, nullptr);
+}
+void start_static_tls() {
+    if (!executable_module || executable_started.exchange(true))
+        return;
+    on_thread(executable_module, DLL_PROCESS_ATTACH, nullptr);
 }
 } // namespace xv::runtime

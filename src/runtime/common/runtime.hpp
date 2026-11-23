@@ -24,6 +24,8 @@ class Registry {
     void add_api(std::string_view symbol, void *function);
     void *find_api(std::string_view symbol) const;
     bool has(std::string_view module) const;
+    // Every entry `module` has so far under the name `other` as well
+    void alias(std::string_view other, std::string_view module);
     // Lets every import of `module` that has no entry here go to the export of
     // `host_module` with the same name or ordinal, whatever the host policy says.
     void forward(std::string_view module, std::string_view host_module);

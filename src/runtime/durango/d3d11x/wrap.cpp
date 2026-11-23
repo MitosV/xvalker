@@ -1,5 +1,6 @@
 #include "runtime/durango/d3d11x/wrap.hpp"
 #include "backends/graphics/backend.hpp"
+#include "runtime/common/com_forward.hpp"
 #include "runtime/common/runtime.hpp"
 #include "runtime/durango/d3d11x/descriptors.hpp"
 #include "runtime/durango/d3d11x/layout.hpp"
@@ -185,6 +186,48 @@ Word call(void *self, const Method &method, bool in_object, std::size_t index, W
     return result;
 }
 
+void *facet(IUnknown *host, Kind kind);
+// ID3D11VideoDevice is the host's as it is, but for the three methods that make a view of a
+// texture, which the title names by its own object for it
+HRESULT video_query(Forwarder *self, REFIID iid, void **object) {
+    if (iid != __uuidof(IUnknown) && iid != __uuidof(ID3D11VideoDevice))
+        return forwarder_host(self)->QueryInterface(iid, object);
+    forwarder_add_ref(self);
+    *object = self;
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE decoder_output_view(Forwarder *self, void *resource, const void *desc,
+                                              void **view) {
+    return static_cast<ID3D11VideoDevice *>(forwarder_host(self))
+        ->CreateVideoDecoderOutputView(
+            static_cast<ID3D11Resource *>(unwrap(resource)),
+            static_cast<const D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC *>(desc),
+            reinterpret_cast<ID3D11VideoDecoderOutputView **>(view));
+}
+HRESULT STDMETHODCALLTYPE processor_input_view(Forwarder *self, void *resource,
+                                               ID3D11VideoProcessorEnumerator *enumerator,
+                                               const void *desc, void **view) {
+    return static_cast<ID3D11VideoDevice *>(forwarder_host(self))
+        ->CreateVideoProcessorInputView(
+            static_cast<ID3D11Resource *>(unwrap(resource)), enumerator,
+            static_cast<const D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC *>(desc),
+            reinterpret_cast<ID3D11VideoProcessorInputView **>(view));
+}
+HRESULT STDMETHODCALLTYPE processor_output_view(Forwarder *self, void *resource,
+                                                ID3D11VideoProcessorEnumerator *enumerator,
+                                                const void *desc, void **view) {
+    return static_cast<ID3D11VideoDevice *>(forwarder_host(self))
+        ->CreateVideoProcessorOutputView(
+            static_cast<ID3D11Resource *>(unwrap(resource)), enumerator,
+            static_cast<const D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC *>(desc),
+            reinterpret_cast<ID3D11VideoProcessorOutputView **>(view));
+}
+void *video_device(ID3D11VideoDevice *host) {
+    return make_forwarder(host, 20, &video_query,
+                          {{7, reinterpret_cast<void *>(&decoder_output_view)},
+                           {8, reinterpret_cast<void *>(&processor_input_view)},
+                           {9, reinterpret_cast<void *>(&processor_output_view)}});
+}
 HRESULT STDMETHODCALLTYPE query(void *self, REFIID iid, void **object) {
     if (!object)
         return E_POINTER;
@@ -195,6 +238,13 @@ HRESULT STDMETHODCALLTYPE query(void *self, REFIID iid, void **object) {
     const bool same =
         known && (kind == info->kind || (kind == Kind::resource && info->kind >= Kind::buffer &&
                                          info->kind <= Kind::texture3d));
+    // the launch kit's console interfaces are objects of their own
+    if (same && launch_kit() && (info->kind == Kind::device || info->kind == Kind::context) &&
+        iid != __uuidof(ID3D11Device) && iid != __uuidof(ID3D11Device1) &&
+        iid != __uuidof(ID3D11DeviceContext) && iid != __uuidof(ID3D11DeviceContext1)) {
+        *object = facet(info->host, info->kind == Kind::device ? Kind::device_x : Kind::context_x);
+        return S_OK;
+    }
     if (same || iid == __uuidof(IUnknown) ||
         (iid == __uuidof(ID3D11DeviceChild) && info->kind != Kind::device &&
          info->kind != Kind::swap_chain)) {
@@ -220,6 +270,10 @@ HRESULT STDMETHODCALLTYPE query(void *self, REFIID iid, void **object) {
     if (iid == __uuidof(ID3D11Debug) || iid == __uuidof(ID3D11InfoQueue))
         return E_NOINTERFACE;
     const auto result = info->host->QueryInterface(iid, object);
+    if (SUCCEEDED(result) && iid == __uuidof(ID3D11VideoDevice)) {
+        *object = video_device(static_cast<ID3D11VideoDevice *>(*object));
+        return result;
+    }
     // a DXGI device by another name (titles ask with IIDs of their own): ours, so that its
     // adapter and factory lead to our swap chains
     if (SUCCEEDED(result) && info->kind == Kind::device) {
@@ -253,7 +307,9 @@ ULONG STDMETHODCALLTYPE release(void *self) {
         // someone may have been handed the object again in the meantime
         if (info->references)
             return info->references;
-        objects.erase(info->host);
+        if (const auto found = objects.find(info->host);
+            found != objects.end() && found->second == self)
+            objects.erase(found);
     }
     info->host->Release();
     info->magic = 0;
@@ -294,6 +350,19 @@ void *const *vtable_of(Kind kind) {
         tables[which][2] = reinterpret_cast<void *>(&release);
     });
     return tables[which].data();
+}
+// An object for a console interface of `host` that is no part of its wrapper: it shares the
+// host object, which every method of it ends up on, and nothing else
+void *facet(IUnknown *host, Kind kind) {
+    const auto &description = layout(kind);
+    auto *const info = static_cast<Header *>(std::calloc(1, sizeof(Header) + sizeof(Word)));
+    if (!info)
+        throw std::bad_alloc();
+    host->AddRef();
+    new (info) Header{magic, host, &description, kind, 1};
+    auto *const words = reinterpret_cast<void **>(info + 1);
+    words[0] = const_cast<void **>(vtable_of(kind));
+    return words;
 }
 } // namespace
 
@@ -354,16 +423,17 @@ void *wrap(void *host_object, Kind kind) {
     for (std::size_t index = 1; index < description.words; ++index) {
         const auto &method = description.object[index];
         // the three IUnknown methods come first in the in-object table as well
-        if (description.words > 1 && index >= 124 && index <= 126)
-            words[index] = const_cast<void *>(vtable_of(kind)[index - 124]);
-        else if (description.words > 1 && index >= 127)
+        const auto table = description.table;
+        if (description.words > 1 && index >= table && index < table + 3)
+            words[index] = const_cast<void *>(vtable_of(kind)[index - table]);
+        else if (description.words > 1 && index >= table + 3)
             words[index] = slot_function(method, object_entries[index]);
     }
     if (description.words > 1 && kind != Kind::context)
         describe(words, host);
     // titles then hand resource tables to SetFastResources_Debug instead of writing packets
-    if (kind == Kind::context)
-        reinterpret_cast<std::uint8_t *>(words)[0x390] = 1;
+    if (kind == Kind::context && description.out_of_line)
+        reinterpret_cast<std::uint8_t *>(words)[description.out_of_line] = 1;
     objects.emplace(host, words);
     return words;
 }

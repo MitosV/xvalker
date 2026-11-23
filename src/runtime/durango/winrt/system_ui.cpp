@@ -14,6 +14,7 @@
 #include <thread>
 #include <utility>
 #include <windows.h>
+#include <windows.ui.popups.h>
 #include <winstring.h>
 #include <wrl/wrappers/corewrappers.h>
 
@@ -97,6 +98,139 @@ std::wstring text(HSTRING value) {
     const auto *raw = WindowsGetStringRawBuffer(value, &length);
     return {raw, length};
 }
+// Windows.UI.Popups.MessageDialog: what a title has to say is logged, and the dialog is
+// answered at once with no command.
+namespace popups = ABI::Windows::UI::Popups;
+class MessageDialog : public Class<MessageDialog, popups::IMessageDialog> {
+  public:
+    static constexpr wchar_t name[] = L"Windows.UI.Popups.MessageDialog";
+    MessageDialog(HSTRING content, HSTRING title) {
+        content_.Set(content);
+        title_.Set(title);
+    }
+    STDMETHODIMP get_Title(HSTRING *value) override { return title_.CopyTo(value); }
+    STDMETHODIMP put_Title(HSTRING value) override { return title_.Set(value); }
+    STDMETHODIMP get_Commands(
+        ABI::Windows::Foundation::Collections::IVector<popups::IUICommand *> **value) override {
+        if (!commands_)
+            commands_ = static_cast<IUnknown *>(make_vector());
+        commands_->AddRef();
+        *value =
+            static_cast<ABI::Windows::Foundation::Collections::IVector<popups::IUICommand *> *>(
+                static_cast<void *>(commands_));
+        return S_OK;
+    }
+    STDMETHODIMP get_DefaultCommandIndex(UINT32 *value) override {
+        *value = default_;
+        return S_OK;
+    }
+    STDMETHODIMP put_DefaultCommandIndex(UINT32 value) override {
+        default_ = value;
+        return S_OK;
+    }
+    STDMETHODIMP get_CancelCommandIndex(UINT32 *value) override {
+        *value = cancel_;
+        return S_OK;
+    }
+    STDMETHODIMP put_CancelCommandIndex(UINT32 value) override {
+        cancel_ = value;
+        return S_OK;
+    }
+    STDMETHODIMP get_Content(HSTRING *value) override { return content_.CopyTo(value); }
+    STDMETHODIMP put_Content(HSTRING value) override { return content_.Set(value); }
+    STDMETHODIMP
+    ShowAsync(
+        ABI::Windows::Foundation::IAsyncOperation<popups::IUICommand *> **operation) override {
+        std::fprintf(stderr, "[Runtime] message dialog: \"%ls\": \"%ls\", answered at once\n",
+                     text(title_.Get()).c_str(), text(content_.Get()).c_str());
+        std::fflush(stderr);
+        *operation = static_cast<ABI::Windows::Foundation::IAsyncOperation<popups::IUICommand *> *>(
+            make_completed_operation(nullptr));
+        return S_OK;
+    }
+    STDMETHODIMP get_Options(popups::MessageDialogOptions *value) override {
+        *value = options_;
+        return S_OK;
+    }
+    STDMETHODIMP put_Options(popups::MessageDialogOptions value) override {
+        options_ = value;
+        return S_OK;
+    }
+
+  private:
+    HString content_, title_;
+    IUnknown *commands_ = nullptr;
+    UINT32 default_ = 0, cancel_ = 0xffffffff;
+    popups::MessageDialogOptions options_{};
+};
+class UICommand : public Class<UICommand, popups::IUICommand> {
+  public:
+    static constexpr wchar_t name[] = L"Windows.UI.Popups.UICommand";
+    UICommand(HSTRING label, popups::IUICommandInvokedHandler *handler, IInspectable *id)
+        : handler_(handler), id_(id) {
+        label_.Set(label);
+    }
+    STDMETHODIMP get_Label(HSTRING *value) override { return label_.CopyTo(value); }
+    STDMETHODIMP put_Label(HSTRING value) override { return label_.Set(value); }
+    STDMETHODIMP get_Invoked(popups::IUICommandInvokedHandler **value) override {
+        return handler_.CopyTo(value);
+    }
+    STDMETHODIMP put_Invoked(popups::IUICommandInvokedHandler *value) override {
+        handler_ = value;
+        return S_OK;
+    }
+    STDMETHODIMP get_Id(IInspectable **value) override { return id_.CopyTo(value); }
+    STDMETHODIMP put_Id(IInspectable *value) override {
+        id_ = value;
+        return S_OK;
+    }
+
+  private:
+    HString label_;
+    Microsoft::WRL::ComPtr<popups::IUICommandInvokedHandler> handler_;
+    Microsoft::WRL::ComPtr<IInspectable> id_;
+};
+class UICommandFactory
+    : public Class<UICommandFactory, IActivationFactory, popups::IUICommandFactory> {
+  public:
+    static constexpr wchar_t name[] = L"Windows.UI.Popups.UICommand";
+    STDMETHODIMP ActivateInstance(IInspectable **instance) override {
+        if (!instance)
+            return E_POINTER;
+        *instance = Make<UICommand>(nullptr, nullptr, nullptr).Detach();
+        return S_OK;
+    }
+    STDMETHODIMP Create(HSTRING label, popups::IUICommand **command) override {
+        return CreateWithHandlerAndId(label, nullptr, nullptr, command);
+    }
+    STDMETHODIMP CreateWithHandler(HSTRING label, popups::IUICommandInvokedHandler *handler,
+                                   popups::IUICommand **command) override {
+        return CreateWithHandlerAndId(label, handler, nullptr, command);
+    }
+    STDMETHODIMP CreateWithHandlerAndId(HSTRING label, popups::IUICommandInvokedHandler *handler,
+                                        IInspectable *id, popups::IUICommand **command) override {
+        if (!command)
+            return E_POINTER;
+        *command = Make<UICommand>(label, handler, id).Detach();
+        return S_OK;
+    }
+};
+class MessageDialogFactory
+    : public Class<MessageDialogFactory, IActivationFactory, popups::IMessageDialogFactory> {
+  public:
+    static constexpr wchar_t name[] = L"Windows.UI.Popups.MessageDialog";
+    STDMETHODIMP ActivateInstance(IInspectable **) override { return E_NOTIMPL; }
+    STDMETHODIMP Create(HSTRING content, popups::IMessageDialog **dialog) override {
+        return CreateWithTitle(content, nullptr, dialog);
+    }
+    STDMETHODIMP CreateWithTitle(HSTRING content, HSTRING title,
+                                 popups::IMessageDialog **dialog) override {
+        if (!dialog)
+            return E_POINTER;
+        *dialog = Make<MessageDialog>(content, title).Detach();
+        return S_OK;
+    }
+};
 // input scopes: number 0x1d, password 0x1f, telephone number 0x20
 void *keyboard(surface::TextRequest request, std::uint32_t scope) {
     request.password = scope == 0x1f;
@@ -159,6 +293,11 @@ std::wstring console_string(std::wstring_view key) {
         }
     if (key == L"local_folder_name")
         return L"LocalState";
+    if (key == L"package_folder" || key == L"package_folder_name") {
+        std::error_code error;
+        const auto folder = package_directory(std::filesystem::current_path(error));
+        return key == L"package_folder" ? folder.wstring() : folder.filename().wstring();
+    }
     if (key == L"audio_device_id") {
         static const auto id = communications_output();
         return id;
@@ -199,6 +338,12 @@ void *show_keyboard_with_options(void *object) {
 }
 IInspectable *system_ui_class(std::wstring_view name) {
     static const auto options = Make<KeyboardOptionsFactory>();
+    static const auto dialogs = Make<MessageDialogFactory>();
+    if (name == MessageDialogFactory::name)
+        return static_cast<IActivationFactory *>(dialogs.Get());
+    static const auto commands = Make<UICommandFactory>();
+    if (name == UICommandFactory::name)
+        return static_cast<IActivationFactory *>(commands.Get());
     return name == KeyboardOptionsFactory::name ? static_cast<IActivationFactory *>(options.Get())
                                                 : nullptr;
 }

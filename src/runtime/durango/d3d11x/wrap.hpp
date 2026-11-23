@@ -27,6 +27,10 @@ enum class Kind : std::uint8_t {
     child,    // shaders, input layouts and anything else with ID3D11DeviceChild's methods only
     dma,      // ID3D11DMAEngineContextX, over a deferred context of the host
     compute,  // ID3D11ComputeContextX, likewise
+    // The launch kit's ID3D11DeviceX and ID3D11DeviceContextX: interfaces of their own with
+    // the console's methods only, where later kits have them after the desktop's
+    device_x,
+    context_x,
 };
 // Our object for a host object, creating it if there is none yet. Takes over the caller's
 // reference to `host` and returns one reference to ours.

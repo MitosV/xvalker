@@ -150,7 +150,9 @@ json import_profile(const json &pe_report) {
         }
     }
     const bool durango = !xbox_one.empty() || !era.empty();
-    const auto runtimes = int{!scarlett.empty()} + int{durango} + int{!pc.empty()};
+    // the first Xbox One kits named the console's Direct3D d3d11.dll, as the desktop's is
+    const bool desktop = !pc.empty() && era.empty();
+    const auto runtimes = int{!scarlett.empty()} + int{durango} + int{desktop};
     auto findings = json::array();
     const auto finding = [&](const char *text, const std::set<std::string> &names) {
         if (names.empty())
@@ -171,7 +173,7 @@ json import_profile(const json &pe_report) {
         {"target_indication", runtimes > 1        ? "mixed"
                               : !scarlett.empty() ? "scarlett"
                               : durango           ? "xbox_one"
-                              : !pc.empty()       ? "pc"
+                              : desktop           ? "pc"
                                                   : "unknown"},
         {"modules", std::move(modules)},
         {"game_os_api_names", inside},

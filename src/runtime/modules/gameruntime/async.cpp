@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
+#include <set>
 #include <utility>
 
 // XAsync: one asynchronous operation, tracked in a block the title owns. Whoever implements
@@ -38,9 +39,16 @@ struct State {
     bool finishing = false, completed = false, cleaned = false;
 };
 std::mutex blocks; // guards the `internal` words of every block
+// The operations there are. A title copies a block, or completes one whose operation is long
+// over: what such a block names is no operation any more.
+std::set<const State *> live;
 
 void release(State *state) {
     if (--state->references == 0) {
+        {
+            const std::lock_guard lock(blocks);
+            live.erase(state);
+        }
         if (state->queue)
             close(state->queue);
         delete state;
@@ -49,8 +57,9 @@ void release(State *state) {
 State *acquire(XAsyncBlock *block) {
     const std::lock_guard lock(blocks);
     auto *const state = static_cast<State *>(block->internal[0]);
-    if (state)
-        ++state->references;
+    if (!state || !live.contains(state))
+        return nullptr;
+    ++state->references;
     return state;
 }
 HRESULT final_status(XAsyncBlock *block) {
@@ -140,6 +149,10 @@ HRESULT begin(XAsyncBlock *block, void *context, const void *identity, Provider 
     if (!block || !provider)
         return E_INVALIDARG;
     auto *const state = new State;
+    {
+        const std::lock_guard lock(blocks);
+        live.insert(state);
+    }
     state->block = block;
     state->provider = provider;
     state->identity = identity;
