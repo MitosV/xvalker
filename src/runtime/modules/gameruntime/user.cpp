@@ -27,10 +27,27 @@ const char controller_identity[] = "XUserFindControllerForUserWithUiAsync";
 constexpr HRESULT e_user_not_found = static_cast<HRESULT>(0x89245104);
 std::atomic<std::uint64_t> tokens{0};
 
+// XV_LOCAL_USER=1: the user is a made-up local one (see xbox_user_id, gamertag, token_async)
+bool local_user() {
+    static const bool enabled = [] {
+        const auto *const text = std::getenv("XV_LOCAL_USER");
+        return text && *text == '1';
+    }();
+    return enabled;
+}
+constexpr std::uint64_t local_xuid = 2535400000000001;
+constexpr HRESULT e_offline = static_cast<HRESULT>(0x80072EFD); // WSAECONNREFUSED-like: no network
+
 std::uint64_t xbox_user_id() {
+    if (local_user())
+        return local_xuid;
     return std::wcstoull(console_settings().xbox_user_id.c_str(), nullptr, 10);
 }
 std::string gamertag() {
+    if (local_user()) {
+        const auto *const name = std::getenv("XV_GAMERTAG");
+        return name && *name ? name : "Player";
+    }
     const auto &wide = console_settings().gamertag;
     const int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()),
                                          nullptr, 0, nullptr, nullptr);
@@ -156,7 +173,7 @@ HRESULT WINAPI resolve_privilege_result(void *, XAsyncBlock *block) {
 // Xbox Live tokens: there is no service to give one
 HRESULT WINAPI token_async(void *, User *, std::uint32_t, const void *, const void *, std::size_t,
                            const void *, std::size_t, const void *, XAsyncBlock *block) {
-    return finish(block, token_identity, E_FAIL);
+    return finish(block, token_identity, local_user() ? e_offline : E_FAIL);
 }
 HRESULT WINAPI token_result_size(void *, XAsyncBlock *block, std::size_t *size) {
     return result_size(block, size);
