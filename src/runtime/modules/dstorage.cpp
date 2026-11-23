@@ -35,6 +35,9 @@ constexpr GUID status_iid{
 constexpr GUID queue_iid{
     0xa3f6649a, 0x8c2c, 0x4b3a, {0x8b, 0x6e, 0x10, 0x18, 0x6a, 0x04, 0xb9, 0xbc}};
 
+// The console's own results
+constexpr HRESULT E_DSTORAGE_DECOMPRESSION_ERROR = static_cast<HRESULT>(0x89240030u);
+
 template <class Interface> class Object : public Interface {
   public:
     explicit Object(const GUID &iid) : iid_(iid) {}
@@ -191,8 +194,19 @@ XvBcpackDecode bcpack_decoder() {
 }
 
 HRESULT read(const Request &request) {
-    constexpr UINT64 zlib = 1, bcpack = 0xf << 1, destination_pages = 1ull << 21,
-                     from_memory = 1ull << 22, source_pages = 1ull << 23;
+    constexpr UINT64 zlib = 1, bcpack = 0xf << 1, swizzle = 0xffffull << 5,
+                     destination_pages = 1ull << 21, from_memory = 1ull << 22,
+                     source_pages = 1ull << 23;
+    if (request.options & swizzle) {
+        // the console's hardware texture swizzle: the mode says how the destination is
+        // laid out, and this runtime does not know it
+        if (static std::atomic<bool> shown{false}; !shown.exchange(true))
+            std::fprintf(stderr,
+                         "[Runtime] DirectStorage: a request with the swizzle mode %llu is "
+                         "not done\n",
+                         static_cast<unsigned long long>((request.options & swizzle) >> 5));
+        return E_DSTORAGE_DECOMPRESSION_ERROR;
+    }
     if (request.options & (destination_pages | source_pages)) {
         if (static std::atomic<bool> shown{false}; !shown.exchange(true))
             std::fprintf(stderr,
