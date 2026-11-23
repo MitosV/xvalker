@@ -265,6 +265,16 @@ identical in both halves, as are the `scc`, `execz`/`vccz` branch decisions and
 `s_bcnt1`/`s_ff1` reductions computed from them. The exchange array reserves 66 dwords
 per logical wave (64 lane slots + 2 ballot words).
 
+## `src/gpu/recomp/wave32_host.rs` and `mod.rs` (full-mask SGPR reads on a 32-lane host)
+
+With masks identical in both halves, `v_readfirstlane` publishes its source VGPR through
+`xcl_xchg_rla` and reads the first active lane of the full mask; a `v_readlane` with an
+SGPR-selected lane does the same. `ds_swizzle_b32` and `v_permlane16/x16_b32` preserve
+bit 5 of the logical lane, so they stay within one half and are no longer refused. Mask
+branches, mask-derived SCC branches, and `s_bcnt*`/`s_ff1` reductions now decide on the
+full value and are also no longer refused. Lane reads through DPP that are not part of a
+recognized reduction remain refused.
+
 ## `src/gpu/recomp/emit.rs` (groupshared budget with cross-half exchange)
 
 The groupshared exchange added 64–1024 dwords on top of the emitter's full 32 KB

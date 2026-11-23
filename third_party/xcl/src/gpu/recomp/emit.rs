@@ -2906,8 +2906,18 @@ impl Em {
             "v_readfirstlane_b32" => {
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
+                let lane = format!("first_lane({el}, {eh})");
+                let src = if self.opt.host_wave == 32
+                    && self.opt.wave64
+                    && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
+                {
+                    // The first active lane of the full mask can be in either half.
+                    format!("xcl_xchg_rla({a}, {lane})")
+                } else {
+                    format!("rla({a}, {lane})")
+                };
                 let t = self.t();
-                self.line(&format!("uint {t} = rla({a}, first_lane({el}, {eh}));"));
+                self.line(&format!("uint {t} = {src};"));
                 self.write32(&dst, &t);
                 return Ok(());
             }
