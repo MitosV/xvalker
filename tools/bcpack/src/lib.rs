@@ -15,6 +15,8 @@ pub mod abi;
 pub mod request;
 
 mod compat_common_shim;
+mod bc1_history;
+mod bc1_quad;
 mod bc345;
 
 // The vendored module reaches for `compat_common::online::util::sha256`.
@@ -33,6 +35,20 @@ pub fn record_raw(category: &str, what: &str, message: &str) {
 
 #[path = "../../../third_party/bcpack/mod.rs"]
 pub mod bcpack;
+
+/// The BC1 tables the vendored module assembles the blocks with: the preset
+/// window of the built-in history (the one the reference decoder measured) and
+/// the quadrant codes.
+fn bc1_tables() -> &'static (bcpack::bc1::Window, bcpack::bc1::QuadTable) {
+    static TABLES: std::sync::OnceLock<(bcpack::bc1::Window, bcpack::bc1::QuadTable)> =
+        std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        (
+            bcpack::bc1::Window::from_slots(&bc1_history::BC1_HISTORY),
+            bcpack::bc1::QuadTable::from_codes(bc1_quad::BC1_QUAD_CODES),
+        )
+    })
+}
 
 fn fail(message: String) -> i32 {
     record_raw("bcpack", "BCPack", &message);
@@ -70,7 +86,10 @@ pub unsafe extern "C" fn xv_bcpack_decode(
     let src = std::slice::from_raw_parts(src, src_size);
     let dst = std::slice::from_raw_parts_mut(dst, dst_size);
     let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
-        1 => bcpack::decode(1, src, dst).map(|_| ()),
+        1 => {
+            let (window, quads) = bc1_tables();
+            bcpack::decode_bc1_with(src, dst, window, quads).map(|_| ())
+        }
         3..=5 => bc345::decode_strict(mode, src, dst),
         other => Err(fail(format!(
             "mode {other} has no confirmed public block mapping"
