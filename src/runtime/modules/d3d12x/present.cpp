@@ -255,6 +255,72 @@ struct Shown {
     }
 };
 
+// XV_FRAME_PACE=1: frame events at the interval the title asked for, by the performance
+// counter, and never before the host's fence of the frame before has completed.
+// XV_SYNC_PRESENT=1: PresentX waits for the GPU to be done with the host's Present.
+bool pace_enabled() {
+    static const bool enabled = [] {
+        const auto *const text = std::getenv("XV_FRAME_PACE");
+        return text && *text == '1';
+    }();
+    return enabled;
+}
+bool sync_present_enabled() {
+    static const bool enabled = [] {
+        const auto *const text = std::getenv("XV_SYNC_PRESENT");
+        return text && *text == '1';
+    }();
+    return enabled;
+}
+UINT64 counter_microseconds() {
+    static const UINT64 frequency = [] {
+        LARGE_INTEGER value;
+        QueryPerformanceFrequency(&value);
+        return static_cast<UINT64>(value.QuadPart);
+    }();
+    return counter() * 1000000 / frequency;
+}
+void sleep_until_microseconds(UINT64 target) {
+    for (;;) {
+        const auto now = counter_microseconds();
+        if (now >= target)
+            return;
+        if (target - now > 2000)
+            Sleep(static_cast<DWORD>((target - now - 1500) / 1000));
+        else
+            SwitchToThread();
+    }
+}
+// the host's fence of the last frame (a reference of our own) and the value that frame signalled
+std::mutex pace_mutex;
+ID3D12Fence *pace_fence = nullptr;
+UINT64 pace_value = 0;
+void publish_pace_fence(ID3D12Fence *fence, UINT64 value) {
+    const std::lock_guard lock(pace_mutex);
+    if (pace_fence != fence) {
+        if (pace_fence)
+            pace_fence->Release();
+        pace_fence = fence;
+        fence->AddRef();
+    }
+    pace_value = value;
+}
+void wait_for_last_host_frame() {
+    ID3D12Fence *fence;
+    UINT64 value;
+    {
+        const std::lock_guard lock(pace_mutex);
+        fence = pace_fence;
+        value = pace_value;
+        if (fence)
+            fence->AddRef();
+    }
+    if (!fence)
+        return;
+    wait_for(fence, value);
+    fence->Release();
+}
+
 // XV_FRAME_TRACE: how the title paces its frames, the first calls of each kind
 bool frame_trace(std::atomic<int> &shown, int most = 12) {
     static const bool enabled = std::getenv("XV_FRAME_TRACE") != nullptr;
@@ -322,6 +388,12 @@ HRESULT present_x(ID3D12CommandQueue *queue, UINT planes, const void *plane_para
         // one display refresh per frame interval of the title's
         const UINT refreshes = std::clamp((interval_microseconds.load() + 8333) / 16667, 1u, 4u);
         result = state.chain->Present(refreshes, 0);
+        if (sync_present_enabled()) {
+            queue->Signal(state.fence, ++state.value);
+            wait_for(state.fence, state.value);
+        }
+        if (pace_enabled())
+            publish_pace_fence(state.fence, state.value);
     }
     if (back)
         back->Release();
@@ -399,6 +471,37 @@ void run_schedules() {
         std::this_thread::sleep_until(origin);
     }
 }
+// run_schedules for XV_FRAME_PACE: the same schedules on the performance counter, each signal
+// held back until the host's fence of the last frame has completed
+void run_paced_schedules() {
+    auto origin = counter_microseconds();
+    for (;;) {
+        const UINT64 frame = std::max(interval_microseconds.load(), 1000u);
+        std::vector<std::pair<UINT, std::vector<HANDLE>>> due;
+        {
+            const std::lock_guard lock(schedule_mutex);
+            const bool shown = flipped.exchange(false);
+            for (std::size_t type = 0; type < std::size(schedules); ++type) {
+                const auto &schedule = schedules[type];
+                if (schedule.enabled && !schedule.objects.empty() && (type != 2 || shown))
+                    due.emplace_back(schedule.offset_microseconds, schedule.objects);
+            }
+        }
+        std::stable_sort(due.begin(), due.end(),
+                         [](const auto &a, const auto &b) { return a.first < b.first; });
+        for (const auto &[offset, objects] : due) {
+            sleep_until_microseconds(origin + std::min<UINT64>(offset, frame));
+            wait_for_last_host_frame();
+            for (const auto object : objects)
+                if (!SetEvent(object))
+                    ReleaseSemaphore(object, 1, nullptr);
+        }
+        origin += frame;
+        if (origin + frame * 4 < counter_microseconds())
+            origin = counter_microseconds(); // fell behind: no burst to catch up
+        sleep_until_microseconds(origin);
+    }
+}
 HRESULT STDMETHODCALLTYPE schedule_frame_event(ID3D12Device *, UINT type, UINT offset,
                                                void *signal_list, UINT flags) {
     const auto *const list = static_cast<const FrameObjects *>(signal_list);
@@ -429,7 +532,9 @@ HRESULT STDMETHODCALLTYPE schedule_frame_event(ID3D12Device *, UINT type, UINT o
         schedule.enabled = !(flags & 1); // DISABLE_SIGNAL
     }
     static std::once_flag started;
-    std::call_once(started, [] { std::thread(run_schedules).detach(); });
+    std::call_once(started, [] {
+        std::thread(pace_enabled() ? run_paced_schedules : run_schedules).detach();
+    });
     return S_OK;
 }
 // The start of the next frame. A title that presents is held to the display's rate by the
@@ -449,7 +554,15 @@ HRESULT STDMETHODCALLTYPE wait_frame_event(ID3D12Device *, UINT type, UINT timeo
     const std::lock_guard lock(wait_mutex);
     const auto called = counter();
     const auto frame = std::chrono::microseconds(interval_microseconds.load());
-    if (presents_seen == presents.load() && Clock::now() < last + frame)
+    if (pace_enabled()) {
+        // XV_FRAME_PACE: one frame event per interval of the title's, whether it presented or not
+        static UINT64 target = 0;
+        const UINT64 length = interval_microseconds.load();
+        const UINT64 now = counter_microseconds();
+        target = !target || now > target + length * 4 ? now : target + length;
+        sleep_until_microseconds(target);
+        wait_for_last_host_frame();
+    } else if (presents_seen == presents.load() && Clock::now() < last + frame)
         std::this_thread::sleep_until(last + frame);
     last = Clock::now();
     presents_seen = presents.load();
