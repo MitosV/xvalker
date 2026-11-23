@@ -255,6 +255,16 @@ exceeded the 32 KB group limit and DXC reported "vertex plus primitive output si
 greater than 32768" (19 MS programs). Round the stride the same way before deciding
 how many groups a mesh record needs.
 
+## `src/gpu/recomp/emit.rs` (full wave64 masks on a 32-lane host)
+
+A split logical wave64 runs its two halves in separate native wave32 subgroups, so a
+`v_cmp` ballot only sees 32 lanes. Each half now publishes its ballot word to two
+groupshared slots per logical wave, barrier, and both halves read the combined 64-bit
+mask. SGPRs derived from a mask (EXEC/VCC, `v_cmp`, `s_and/or/xor_b64`) are therefore
+identical in both halves, as are the `scc`, `execz`/`vccz` branch decisions and
+`s_bcnt1`/`s_ff1` reductions computed from them. The exchange array reserves 66 dwords
+per logical wave (64 lane slots + 2 ballot words).
+
 ## `src/gpu/recomp/emit.rs` (groupshared budget with cross-half exchange)
 
 The groupshared exchange added 64–1024 dwords on top of the emitter's full 32 KB

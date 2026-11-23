@@ -313,13 +313,20 @@ impl Em {
         std::mem::take(&mut self.out)
     }
 
-    /// Groupshared slots reserved for cross-half exchange: 64 per logical wave64 in
-    /// the workgroup. The emitter already budgets the D3D12 LDS limit (32 KB), so the
-    /// program's own array shrinks by the same number of dwords when both are used.
+    /// Groupshared slots reserved per logical wave64: 64 lane slots plus two words
+    /// for the halves' ballots, combined into one full 64-bit mask.
+    const XCHG_STRIDE: u32 = 66;
+
+    /// Groupshared slots reserved for cross-half exchange and mask synchronization.
+    /// The emitter already budgets the D3D12 LDS limit (32 KB), so the program's own
+    /// array shrinks by the same number of dwords when both are used. A split host
+    /// needs the slots even without a lane exchange: every v_cmp publishes its ballot.
     fn xchg_slots(&self) -> u32 {
-        if !matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
-            || self.opt.host_map.exchange.is_empty()
-        {
+        if !matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_)) {
+            return 0;
+        }
+        let split = self.opt.host_wave == 32 && self.opt.wave64;
+        if !split && self.opt.host_map.exchange.is_empty() {
             return 0;
         }
         let threads = match &self.opt.mode {
@@ -327,7 +334,7 @@ impl Em {
             Mode::Mesh(ms) => ms.threads,
             _ => 64,
         };
-        64 * threads.max(1).div_ceil(64)
+        Self::XCHG_STRIDE * threads.max(1).div_ceil(64)
     }
 
     fn lds_words(&self) -> u32 {
@@ -3544,8 +3551,11 @@ impl Em {
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
-        h.push_str(PRELUDE);
         let xchg_slots = self.xchg_slots();
+        if xchg_slots > 0 {
+            h.push_str("#define XCL_BALLOT_SYNC 1\n");
+        }
+        h.push_str(PRELUDE);
         let lds_words = self.lds_words();
         let lds_mask = self.lds_mask();
         if xchg_slots > 0 {
@@ -3579,7 +3589,7 @@ impl Em {
                 }
                 let _ = writeln!(h, "[WaveSize({lanes})]\n[numthreads({threads}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex)\n{{");
                 if host_split {
-                    h.push_str("    xcl_half = (gi >> 5) & 1u;\n    xcl_logical_wave64 = true;\n    xcl_xchg_base = (gi >> 6) * 64u;\n    uint xcl_hw_lane = WaveGetLaneIndex() + 32u * xcl_half;\n    lane_id = xcl_hw_lane;\n");
+                    h.push_str(&format!("    xcl_half = (gi >> 5) & 1u;\n    xcl_logical_wave64 = true;\n    xcl_xchg_base = (gi >> 6) * {}u;\n    uint xcl_hw_lane = WaveGetLaneIndex() + 32u * xcl_half;\n    lane_id = xcl_hw_lane;\n", Self::XCHG_STRIDE));
                 } else if split {
                     h.push_str("    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n");
                 } else {
@@ -3648,7 +3658,7 @@ impl Em {
                     "[WaveSize({lanes})]\n[numthreads({x}, {y}, {z})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
                 );
                 if host_split {
-                    h.push_str("    xcl_half = ((gi & 63u) >> 5);\n    xcl_logical_wave64 = true;\n    xcl_xchg_base = (gi / 64u) * 64u;\n    lane_id = WaveGetLaneIndex() + 32u * xcl_half;\n");
+                    h.push_str(&format!("    xcl_half = ((gi & 63u) >> 5);\n    xcl_logical_wave64 = true;\n    xcl_xchg_base = (gi / 64u) * {}u;\n    lane_id = WaveGetLaneIndex() + 32u * xcl_half;\n", Self::XCHG_STRIDE));
                 } else {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
@@ -3689,7 +3699,7 @@ impl Em {
                 let t = ms.threads;
                 let _ = writeln!(h, "[WaveSize({native_lanes})]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{{");
                 if split_wave32 {
-                    h.push_str("    xcl_half = (gi >> 5) & 1u;\n    xcl_logical_wave64 = true;\n    xcl_xchg_base = (gi / 64u) * 64u;\n    lane_id = WaveGetLaneIndex() + 32u * xcl_half;\n");
+                    h.push_str(&format!("    xcl_half = (gi >> 5) & 1u;\n    xcl_logical_wave64 = true;\n    xcl_xchg_base = (gi / 64u) * {}u;\n    lane_id = WaveGetLaneIndex() + 32u * xcl_half;\n", Self::XCHG_STRIDE));
                 } else {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
@@ -4540,11 +4550,13 @@ uint rla_local(uint v, uint l) { return WaveReadLaneAt(v, l & 31u); }
 // Base slot of the current logical wave in xcl_xchg (64 lanes per wave).
 static uint xcl_xchg_base = 0u;
 bool lanebit(uint lo, uint hi) { return ((select(lane_id < 32u, lo, hi) >> (lane_id & 31u)) & 1u) != 0u; }
+#ifndef XCL_BALLOT_SYNC
 uint2 ballot(bool b) {
     uint4 m = WaveActiveBallot(b);
     if (xcl_logical_wave64) return xcl_half != 0u ? uint2(0u, m.x) : uint2(m.x, 0u);
     return uint2(select(and(xcl_w32, xcl_half != 0u), m.y, m.x), select(xcl_w32, 0u, m.y));
 }
+#endif
 uint rla(uint v, uint l) {
     uint w;
     if (xcl_logical_wave64) w = (l >> 5) == xcl_half ? WaveReadLaneAt(v, l & 31u) : 0u;
@@ -4741,5 +4753,18 @@ uint xcl_xchg_write(uint v, uint lane) {
     uint r = xcl_xchg[xcl_xchg_base + (lane & 63u)];
     GroupMemoryBarrierWithGroupSync();
     return r;
+}
+// The two halves compute the 32-bit halves of a wave64 mask from their own lanes.
+// SGPR values must be identical in both halves, so publish both words through LDS and
+// read the full mask. Both halves must reach the barriers: mask branches are scalar
+// decisions made from the full value.
+uint2 ballot(bool b) {
+    uint4 m = WaveActiveBallot(b);
+    if (!xcl_logical_wave64) return uint2(select(and(xcl_w32, xcl_half != 0u), m.y, m.x), select(xcl_w32, 0u, m.y));
+    if (WaveGetLaneIndex() == 0u) xcl_xchg[xcl_xchg_base + 64u + xcl_half] = m.x;
+    GroupMemoryBarrierWithGroupSync();
+    uint2 full = uint2(xcl_xchg[xcl_xchg_base + 64u], xcl_xchg[xcl_xchg_base + 65u]);
+    GroupMemoryBarrierWithGroupSync();
+    return full;
 }
 "#;
