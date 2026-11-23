@@ -44,6 +44,8 @@ struct Physical {
     std::vector<bool> used = std::vector<bool>(physical_size / page),
                       dirty = std::vector<bool>(physical_size / page);
     std::map<std::uintptr_t, Reservation> reservations;
+    // the page number and the view that holds it, when it is mapped somewhere
+    std::map<ULONG_PTR, std::uintptr_t> mapped;
 };
 Physical &physical() {
     static Physical state;
@@ -93,6 +95,9 @@ void unmap(Physical &state, Reservation &reservation, std::uintptr_t address) {
                      MEM_PRESERVE_PLACEHOLDER);
     if (view->second.owned)
         release_page(state, view->second.page);
+    if (const auto found = state.mapped.find(view->second.page);
+        found != state.mapped.end() && found->second == address)
+        state.mapped.erase(found);
     reservation.views.erase(view);
 }
 bool map(Physical &state, Reservation &reservation, std::uintptr_t address, ULONG_PTR number,
@@ -110,10 +115,14 @@ bool map(Physical &state, Reservation &reservation, std::uintptr_t address, ULON
     if ((protect & protections) != PAGE_READWRITE)
         VirtualProtect(at, page, protect & protections, &previous);
     reservation.views[address] = {number, owned};
+    // the first view of a page is the one that is remembered: a page can be
+    // mapped in more than one reservation
+    if (!state.mapped.contains(number))
+        state.mapped[number] = address;
     return true;
 }
-void *reserve(void *address, std::uintptr_t size, DWORD type) {
-    auto &state = physical();
+// A reservation of placeholders, one every 64 KiB. The caller holds the lock.
+void *reserve_unlocked(Physical &state, void *address, std::uintptr_t size, DWORD type) {
     if (!state.section)
         return nullptr;
     size = (size + page - 1) & ~(page - 1);
@@ -131,9 +140,13 @@ void *reserve(void *address, std::uintptr_t size, DWORD type) {
     for (std::uintptr_t offset = 0; offset + page < size; offset += page)
         VirtualFree(reinterpret_cast<void *>(start + offset), page,
                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
-    const std::lock_guard lock(state.mutex);
     state.reservations[start] = {size, {}};
     return base;
+}
+void *reserve(void *address, std::uintptr_t size, DWORD type) {
+    auto &state = physical();
+    const std::lock_guard lock(state.mutex);
+    return reserve_unlocked(state, address, size, type);
 }
 bool commit(std::uintptr_t address, std::uintptr_t size, DWORD protect) {
     auto &state = physical();
@@ -343,6 +356,112 @@ HANDLE WINAPI xmem_get_auxiliary_title_memory() {
 void WINAPI xmem_release_auxiliary_title_memory(HANDLE) {}
 
 } // namespace
+
+// A view of a physical page: the one the title mapped, or one of its own for the
+// moment when the title has not mapped it yet
+struct PageView {
+    std::uintptr_t address = 0;
+    bool temporary = false;
+};
+PageView view_of(Physical &state, ULONG_PTR number) {
+    if (const auto found = state.mapped.find(number); found != state.mapped.end())
+        return {found->second, false};
+    // not mapped anywhere: a view of its own, for the moment
+    auto *const at = reserve_unlocked(state, nullptr, page, 0);
+    if (!at)
+        return {};
+    const auto start = reinterpret_cast<std::uintptr_t>(at);
+    auto &reservation = state.reservations[start];
+    if (!map(state, reservation, start, number, PAGE_READWRITE, false)) {
+        state.reservations.erase(start);
+        VirtualFree(at, 0, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        return {};
+    }
+    return {start, true};
+}
+void release_view(Physical &state, const PageView &view) {
+    if (!view.temporary)
+        return;
+    const auto found = state.reservations.find(view.address);
+    if (found == state.reservations.end())
+        return;
+    unmap(state, found->second, view.address);
+    state.reservations.erase(found);
+    VirtualFree(reinterpret_cast<void *>(view.address), 0,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+}
+
+// The title's physical pages: `pages` are the page numbers from
+// AllocateTitlePhysicalPages, 64 KiB each, and `offset` is a byte offset in the first
+// one. False when a page is not a live allocation.
+bool read_title_physical_pages(const ULONG_PTR *pages, ULONG_PTR count, ULONG_PTR offset,
+                               void *destination, std::size_t size) {
+    auto &state = physical();
+    const std::lock_guard lock(state.mutex);
+    auto *const out = static_cast<std::uint8_t *>(destination);
+    std::vector<PageView> views;
+    std::size_t done = 0;
+    ULONG_PTR at = offset;
+    bool good = true;
+    for (ULONG_PTR i = 0; done < size && good; ++i) {
+        if (i >= count || at >= page) {
+            good = false;
+            break;
+        }
+        const auto number = pages[i];
+        if (number >= state.used.size() || !state.used[number]) {
+            good = false;
+            break;
+        }
+        const auto view = view_of(state, number);
+        if (!view.address) {
+            good = false;
+            break;
+        }
+        views.push_back(view);
+        const auto chunk = std::min<std::size_t>(page - at, size - done);
+        std::memcpy(out + done, reinterpret_cast<const void *>(view.address + at), chunk);
+        done += chunk;
+        at = 0;
+    }
+    for (const auto &view : views)
+        release_view(state, view);
+    return good;
+}
+bool write_title_physical_pages(const ULONG_PTR *pages, ULONG_PTR count, ULONG_PTR offset,
+                                const void *source, std::size_t size) {
+    auto &state = physical();
+    const std::lock_guard lock(state.mutex);
+    const auto *const in = static_cast<const std::uint8_t *>(source);
+    std::vector<PageView> views;
+    std::size_t done = 0;
+    ULONG_PTR at = offset;
+    bool good = true;
+    for (ULONG_PTR i = 0; done < size && good; ++i) {
+        if (i >= count || at >= page) {
+            good = false;
+            break;
+        }
+        const auto number = pages[i];
+        if (number >= state.used.size() || !state.used[number]) {
+            good = false;
+            break;
+        }
+        const auto view = view_of(state, number);
+        if (!view.address) {
+            good = false;
+            break;
+        }
+        views.push_back(view);
+        const auto chunk = std::min<std::size_t>(page - at, size - done);
+        std::memcpy(reinterpret_cast<void *>(view.address + at), in + done, chunk);
+        done += chunk;
+        at = 0;
+    }
+    for (const auto &view : views)
+        release_view(state, view);
+    return good;
+}
 
 void *commit_title_memory(void *address, std::size_t size) {
     return virtual_alloc(address, size, MEM_COMMIT, PAGE_READWRITE);

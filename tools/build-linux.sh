@@ -76,5 +76,17 @@ cmake --build "$build" --parallel "$(nproc)"
 for dll in dxcompiler.dll dxil.dll; do
     cp -f "$cache/$dll" "$build/$dll"
 done
+# The Rust parts (tools/*/build.sh: BCPack, XCL's recompiler, tiling, BVH) are optional DLLs the
+# runtime loads when they are there; without cargo and the Windows target they are skipped.
+if command -v cargo >/dev/null 2>&1 &&
+    rustup target list --installed 2>/dev/null | grep -qx x86_64-pc-windows-gnu; then
+    for script in "$here"/tools/*/build.sh; do
+        [ -f "$script" ] || continue
+        echo "build-linux: $(basename "$(dirname "$script")")"
+        bash "$script" "$build" || { echo "build-linux: $script failed" >&2; exit 1; }
+    done
+else
+    echo "build-linux: no cargo with x86_64-pc-windows-gnu: the Rust DLLs are not built"
+fi
 echo "build-linux: done"
 ls -1 "$build"/*.exe "$build"/dxcompiler.dll "$build"/dxil.dll

@@ -28,3 +28,9 @@ libc = "0.2"
 # The test modules of the vendored files that need XCL's Windows-only modules
 # (`gpu::recomp::dxc`, `gpu::recomp::runner`) or its Windows-only memory probe.
 xcl_vendored_tests = []
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(xcl_runtime)"] }
