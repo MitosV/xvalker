@@ -1371,7 +1371,9 @@ std::string program_folder() {
     const auto at = text.find_last_of(L"\\/");
     if (at == std::wstring::npos)
         return {};
-    return std::string(text.substr(0, at).begin(), text.substr(0, at).end());
+    // Keep one temporary: iterators from two substr() calls do not name the same range.
+    const auto folder = text.substr(0, at);
+    return std::string(folder.begin(), folder.end());
 #else
     char path[4096]{};
     const auto size = readlink("/proc/self/exe", path, sizeof path - 1);
