@@ -2,8 +2,9 @@
 //! `src/runtime/modules/dstorage.cpp` loads lazily.
 //!
 //! The BC1 decoder and the rANS lane decoder are the vendored, byte-identical
-//! `xbox-emulator` module in `third_party/bcpack/`. Modes without a confirmed
-//! public block mapping (BC2, BC3, BC4, BC5, BC6H, BC7) fail with
+//! `xbox-emulator` module in `third_party/bcpack/`. BC3, BC4 and BC5 are a
+//! Rust port of Leonida's strict rebuilders (see `bc345.rs`). Modes without a
+//! confirmed public block mapping (BC2, BC6H, BC7) fail with
 //! `E_DSTORAGE_DECOMPRESSION_ERROR` and a log line.
 
 extern crate self as compat_common;
@@ -14,6 +15,7 @@ pub mod abi;
 pub mod request;
 
 mod compat_common_shim;
+mod bc345;
 
 // The vendored module reaches for `compat_common::online::util::sha256`.
 pub use compat_common_shim::online;
@@ -39,7 +41,7 @@ fn fail(message: String) -> i32 {
 
 /// Decode one BCPack chunk.
 ///
-/// * `mode`: `DSTORAGE_BCPACK_MODE` (1 = BC1).
+/// * `mode`: `DSTORAGE_BCPACK_MODE` (1 = BC1, 3 = BC3, 4 = BC4, 5 = BC5).
 /// * `src`, `src_size`: the packed chunk.
 /// * `dst`, `dst_size`: the destination; `dst_size` is the chunk's decoded
 ///   byte count and must be a whole number of blocks for the mode.
@@ -69,6 +71,7 @@ pub unsafe extern "C" fn xv_bcpack_decode(
     let dst = std::slice::from_raw_parts_mut(dst, dst_size);
     let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
         1 => bcpack::decode(1, src, dst).map(|_| ()),
+        3..=5 => bc345::decode_strict(mode, src, dst),
         other => Err(fail(format!(
             "mode {other} has no confirmed public block mapping"
         ))),
