@@ -255,6 +255,26 @@ exceeded the 32 KB group limit and DXC reported "vertex plus primitive output si
 greater than 32768" (19 MS programs). Round the stride the same way before deciding
 how many groups a mesh record needs.
 
+## `src/gpu/recomp/emit.rs` (full wave64 masks on a 32-lane host)
+
+A split logical wave64 runs its two halves in separate native wave32 subgroups, so a
+`v_cmp` ballot only sees 32 lanes. Each half now publishes its ballot word to two
+groupshared slots per logical wave, barrier, and both halves read the combined 64-bit
+mask. SGPRs derived from a mask (EXEC/VCC, `v_cmp`, `s_and/or/xor_b64`) are therefore
+identical in both halves, as are the `scc`, `execz`/`vccz` branch decisions and
+`s_bcnt1`/`s_ff1` reductions computed from them. The exchange array reserves 66 dwords
+per logical wave (64 lane slots + 2 ballot words).
+
+## `src/gpu/recomp/wave32_host.rs` and `mod.rs` (full-mask SGPR reads on a 32-lane host)
+
+With masks identical in both halves, `v_readfirstlane` publishes its source VGPR through
+`xcl_xchg_rla` and reads the first active lane of the full mask; a `v_readlane` with an
+SGPR-selected lane does the same. `ds_swizzle_b32` and `v_permlane16/x16_b32` preserve
+bit 5 of the logical lane, so they stay within one half and are no longer refused. Mask
+branches, mask-derived SCC branches, and `s_bcnt*`/`s_ff1` reductions now decide on the
+full value and are also no longer refused. Lane reads through DPP that are not part of a
+recognized reduction remain refused.
+
 ## `src/gpu/recomp/emit.rs` (groupshared budget with cross-half exchange)
 
 The groupshared exchange added 64–1024 dwords on top of the emitter's full 32 KB
@@ -263,3 +283,11 @@ used ... is 33024, exceeding maximum: 32768". Reserve 64 dwords per logical wave
 the workgroup for `xcl_xchg`, size `xcl_lds` from the same 8192-dword budget, and use
 the matching index mask for both. This also keeps multi-wave workgroups from indexing
 past the exchange array.
+
+## `src/gpu/recomp/emit.rs` (MUBUF vector access with an overlapping index)
+
+`MUBUF` loads/stores with `IDXEN` emit one bounds check per component. When `VDATA`
+overlaps `VADDR` (e.g. `buffer_load_dwordx3 v[0:2], v[0:1], ... idxen`), the first
+component's write replaced the index VGPR, so the remaining checks used loaded data
+instead of the index and zeroed those components. Snapshot `VADDR` into a local at
+the start of the instruction and use it for the address and every bounds check.

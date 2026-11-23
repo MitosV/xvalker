@@ -462,7 +462,7 @@ void install_acphal(Registry &registry) {
     for (const auto &[name, function] : decoder)
         registry.add("xapu.dll", name, function);
     for (const auto *name :
-         {"XDspConnect", "XDspDisconnect", "XDspActivate", "XDspDeactivate", "XDspSubmitCommand"})
+         {"XDspConnect", "XDspConnectWithMaximumStreamLimit", "XDspDisconnect", "XDspActivate", "XDspDeactivate", "XDspSubmitCommand"})
         registry.add("chad.dll", name, erase(no_audio_dsp));
     registry.add("windows.media.mediacontrol.dll",
                  "CreateRenderAudioStateMonitorForCategoryAndDeviceRole",

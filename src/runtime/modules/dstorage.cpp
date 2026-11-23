@@ -36,6 +36,26 @@ constexpr GUID status_iid{
     0xcd66d752, 0x2786, 0x44f7, {0x90, 0x70, 0xe2, 0xa6, 0xfd, 0xad, 0x3f, 0x1b}};
 constexpr GUID queue_iid{
     0xa3f6649a, 0x8c2c, 0x4b3a, {0x8b, 0x6e, 0x10, 0x18, 0x6a, 0x04, 0xb9, 0xbc}};
+// Later kits name the factory and the queue by other IIDs (seen next to the status array's in
+// a title that asks for no other); they are taken for the same interfaces, and a method past
+// the ones known answers E_NOTIMPL with a log line.
+constexpr GUID later_factory_iid{
+    0x62959d11, 0xd45f, 0x4884, {0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae}};
+constexpr GUID later_queue_iid{
+    0x3c02cb0c, 0xc050, 0x4195, {0x99, 0xa1, 0xa1, 0xce, 0x94, 0xba, 0x33, 0xc5}};
+bool same_interface(REFIID asked, const GUID &own) {
+    if (asked == own)
+        return true;
+    const bool later = (own == factory_iid && asked == later_factory_iid) ||
+                       (own == queue_iid && asked == later_queue_iid);
+    if (later)
+        if (static std::atomic<int> shown{0}; shown++ < 4) {
+            std::fprintf(stderr, "[Runtime] DirectStorage: a later kit's IID for the %s\n",
+                         own == factory_iid ? "factory" : "queue");
+            std::fflush(stderr);
+        }
+    return later;
+}
 
 // The console's DSTORAGE_REQUEST_OPTIONS: bit 0 zlib, bits 1 to 4 BCPack, bits 5 to 20
 // the swizzle mode, bit 21 the destination in physical pages, bit 22 the source in
@@ -66,7 +86,7 @@ template <class Interface> class Object : public Interface {
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
         if (!object)
             return E_POINTER;
-        if (iid != IID_IUnknown && iid != iid_) {
+        if (iid != IID_IUnknown && !same_interface(iid, iid_)) {
             *object = nullptr;
             return E_NOINTERFACE;
         }

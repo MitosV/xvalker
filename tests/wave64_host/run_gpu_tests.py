@@ -21,6 +21,9 @@ TESTS = {
     "idempotent": lambda i: 0 if i < 32 else 32,
     "uniform": lambda i: 0xABCDEF01,
     "exchange": lambda i: i + 32 if i < 32 else i - 32,
+    "mask_branch": lambda i: 200,
+    "readfirstlane": lambda i: 130,
+    "bcnt": lambda i: 16,
 }
 
 

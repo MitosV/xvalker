@@ -1,0 +1,82 @@
+diff --git a/crates/xcl/src/gpu/recomp/emit.rs b/crates/xcl/src/gpu/recomp/emit.rs
+index 3ebd7bc..35a420f 100644
+--- a/crates/xcl/src/gpu/recomp/emit.rs
++++ b/crates/xcl/src/gpu/recomp/emit.rs
+@@ impl Em {
+             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
+             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
+         }
+-        h.push_str(PRELUDE);
++        // s4-r4 timeout study: shrink the loop guard so a bad fake input cannot keep a
++        // guarded loop running for minutes (XCL_CMP_LOOP_BUDGET, default 1u << 16).
++        let budget = std::env::var("XCL_CMP_LOOP_BUDGET").unwrap_or_default();
++        if budget.is_empty() {
++            h.push_str(PRELUDE);
++        } else {
++            h.push_str(&PRELUDE.replace("1u << 16", &budget));
++        }
+         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
+         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
+         h.push_str(PRELUDE_MEM);
+diff --git a/crates/xcl/src/gpu/recomp/runner.rs b/crates/xcl/src/gpu/recomp/runner.rs
+index 85d20f4..4d0f250 100644
+--- a/crates/xcl/src/gpu/recomp/runner.rs
++++ b/crates/xcl/src/gpu/recomp/runner.rs
+@@ -5,6 +5,12 @@
+ //! 64 lanes × 256 VGPRs; u1 `res` = the same layout after the program plus exports;
+ //! u2 `mem` = flat memory for scalar/buffer loads.
+ 
++/// Fence timeout for the comparison harness; the default 10 s is too short for the
++/// loop-guard-bounded shaders in the s4-r4 timeout study (XCL_CMP_GPU_TIMEOUT_MS).
++fn gpu_timeout_ms() -> u32 {
++    std::env::var("XCL_CMP_GPU_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000)
++}
++
+ use std::mem::{transmute_copy, ManuallyDrop};
+ use std::sync::Mutex;
+ 
+@@ -478,7 +484,7 @@ pub fn run_with_statics(
+         gpu.queue.Signal(&gpu.fence, gpu.value).map_err(e)?;
+         let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
+         gpu.fence.SetEventOnCompletion(gpu.value, ev).map_err(e)?;
+-        windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
++        windows::Win32::System::Threading::WaitForSingleObject(ev, gpu_timeout_ms());
+         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
+         if gpu.fence.GetCompletedValue() < gpu.value {
+             return Err(format!("GPU did not finish within 10 s (device removed: {:?})", dev.GetDeviceRemovedReason()));
+@@ -830,7 +836,7 @@ pub fn draw_on_multi(
+         queue.Signal(&fence, 1).map_err(e)?;
+         let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
+         fence.SetEventOnCompletion(1, ev).map_err(e)?;
+-        windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
++        windows::Win32::System::Threading::WaitForSingleObject(ev, gpu_timeout_ms());
+         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
+         if fence.GetCompletedValue() < 1 {
+             return Err(format!("GPU did not finish within 10 s ({:?})", dev.GetDeviceRemovedReason()));
+@@ -1041,7 +1047,7 @@ pub fn mesh_draw_split(
+         gpu.queue.Signal(&gpu.fence, gpu.value).map_err(e)?;
+         let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
+         gpu.fence.SetEventOnCompletion(gpu.value, ev).map_err(e)?;
+-        windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
++        windows::Win32::System::Threading::WaitForSingleObject(ev, gpu_timeout_ms());
+         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
+         if gpu.fence.GetCompletedValue() < gpu.value {
+             return Err(format!("GPU did not finish within 10 s ({:?})", dev.GetDeviceRemovedReason()));
+@@ -1162,7 +1168,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
+         gpu.queue.Signal(&gpu.fence, gpu.value).map_err(e)?;
+         let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
+         gpu.fence.SetEventOnCompletion(gpu.value, ev).map_err(e)?;
+-        windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
++        windows::Win32::System::Threading::WaitForSingleObject(ev, gpu_timeout_ms());
+         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
+         if gpu.fence.GetCompletedValue() < gpu.value {
+             return Err(format!("GPU did not finish within 10 s ({:?})", dev.GetDeviceRemovedReason()));
+@@ -1241,7 +1247,7 @@ pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Re
+         gpu.queue.Signal(&gpu.fence, gpu.value).map_err(e)?;
+         let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
+         gpu.fence.SetEventOnCompletion(gpu.value, ev).map_err(e)?;
+-        windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
++        windows::Win32::System::Threading::WaitForSingleObject(ev, gpu_timeout_ms());
+         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
+         if gpu.fence.GetCompletedValue() < gpu.value {
+             return Err(format!("GPU did not finish within 10 s ({:?})", dev.GetDeviceRemovedReason()));

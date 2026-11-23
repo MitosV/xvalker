@@ -270,22 +270,36 @@ std::uint64_t place_in_ring(void *list, const void *data, std::size_t bytes) {
     arena.next += aligned;
     return console;
 }
+// the widest wave of the host's GPU, from its device (64 until one is known)
+std::atomic<UINT> host_wave_lanes{64};
 } // namespace
 
 bool available() { return library().module != nullptr; }
+
+void note_device(ID3D12Device *device) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 options{};
+    if (!device || FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options,
+                                                      sizeof options)))
+        return;
+    host_wave_lanes = options.WaveLaneCountMax;
+    std::fprintf(stderr, "[Runtime] XCL: the host's waves are %u to %u lanes\n",
+                 options.WaveLaneCountMin, options.WaveLaneCountMax);
+}
 
 const Shader *shader(modules::ShaderStage stage, Bytes container, std::string *why) {
     if (!available() || !profile_of(stage))
         return nullptr;
     const auto key = std::string(1, "vpc"[static_cast<int>(stage)]) + "-" + name_of(container) +
-                     "-xcl-v" + std::to_string(shader_version);
+                     "-xcl-v" + std::to_string(shader_version) + "-w" +
+                     std::to_string(host_wave_lanes.load());
     {
         const std::lock_guard lock(shaders_mutex);
         if (const auto found = shaders.find(key); found != shaders.end())
             return &found->second;
     }
     XclResult result{};
-    const auto status = library().translate(container.data(), container.size(), XCL_FLAG_NONE,
+    const auto status = library().translate(container.data(), container.size(),
+                                            host_wave_lanes < 64 ? XCL_FLAG_HOST_WAVE32 : XCL_FLAG_NONE,
                                             &result);
     if (status != 0) {
         if (why && result.error)

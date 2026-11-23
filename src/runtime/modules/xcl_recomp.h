@@ -34,6 +34,9 @@ extern "C" {
 #define XCL_FLAG_FORCE_WAVE64 (1u << 0)
 /* Force wave32 semantics even when the program looks like a wave64 program. */
 #define XCL_FLAG_FORCE_WAVE32 (1u << 1)
+/* The host GPU runs 32-lane waves only: a wave64 program runs as two 32-lane halves, and one
+ * whose cross-half semantics cannot be kept that way is refused (the error says why). */
+#define XCL_FLAG_HOST_WAVE32 (1u << 2)
 
 /* The result of a translation. Every pointer is owned by the result and released by
  * xcl_free(). */

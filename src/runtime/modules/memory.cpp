@@ -528,6 +528,19 @@ BOOL WINAPI xmem_free_physical_pages(ULONG_PTR count, ULONG_PTR *pages) {
 void *WINAPI xmem_map_physical_pages(void *address, ULONG_PTR count, ULONG_PTR *pages) {
     return map_title_physical_pages(address, count, mem_large_pages, PAGE_READWRITE, pages);
 }
+// XMemMapPhysicalPagesScatter: one page at each of `count` addresses (a page array of null
+// commits new pages, as XMemMapPhysicalPages does)
+BOOL WINAPI xmem_map_physical_pages_scatter(void **addresses, ULONG_PTR count, ULONG_PTR *pages) {
+    if (!addresses) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    for (ULONG_PTR n = 0; n < count; ++n)
+        if (!map_title_physical_pages(addresses[n], 1, mem_large_pages, PAGE_READWRITE,
+                                      pages ? pages + n : nullptr))
+            return FALSE;
+    return TRUE;
+}
 // XMEM_WORKING_SET_STATISTICS: what a title may use, from what the host has
 struct WorkingSet {
     SIZE_T game_limit, game_used, tools_limit, tools_used;
@@ -609,6 +622,7 @@ void install_xmem(Registry &registry) {
         {"XMemAllocatePhysicalPages", erase(xmem_allocate_physical_pages)},
         {"XMemFreePhysicalPages", erase(xmem_free_physical_pages)},
         {"XMemMapPhysicalPages", erase(xmem_map_physical_pages)},
+        {"XMemMapPhysicalPagesScatter", erase(xmem_map_physical_pages_scatter)},
         {"XMemGetWorkingSetStatistics", erase(xmem_working_set_statistics)},
         {"XMemGetWin32HeapStatistics", erase(not_implemented)},
         {"XMemIsToolsMemAvailable", erase(no)},
