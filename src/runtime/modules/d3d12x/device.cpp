@@ -692,6 +692,14 @@ D3D12_CPU_DESCRIPTOR_HANDLE host_handle(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
         return {heap->host.ptr + (handle.ptr - heap->base) / heap->stride * heap->host_stride};
     return handle;
 }
+D3D12_CPU_DESCRIPTOR_HANDLE host_uav_handle(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    if (xcl_backend()) {
+        const auto found = console_heap::slot(handle.ptr);
+        if (found && !found->sampler)
+            return {static_cast<SIZE_T>(found->pc_uav)};
+    }
+    return host_handle(handle);
+}
 D3D12_CPU_DESCRIPTOR_HANDLE host_slot(const ShadowHeap &heap, std::uintptr_t at) {
     return {heap.host.ptr + (at - heap.base) / heap.stride * heap.host_stride};
 }
@@ -3637,15 +3645,15 @@ void STDMETHODCALLTYPE clear_uav_uint(void *self, D3D12_GPU_DESCRIPTOR_HANDLE gp
                                       const D3D12_RECT *rects) {
     bind_heap_of(self, gpu.ptr);
     host_of(self)->ClearUnorderedAccessViewUint(
-        host_gpu(gpu), feedback_clear_view(host_of(self), host_view(cpu), resource), resource,
-        values, count, rects);
+        host_gpu(gpu), feedback_clear_view(host_of(self), host_uav_handle(cpu), resource),
+        resource, values, count, rects);
 }
 void STDMETHODCALLTYPE clear_uav_float(void *self, D3D12_GPU_DESCRIPTOR_HANDLE gpu, Handle cpu,
                                        ID3D12Resource *resource, const FLOAT *values, UINT count,
                                        const D3D12_RECT *rects) {
     bind_heap_of(self, gpu.ptr);
-    host_of(self)->ClearUnorderedAccessViewFloat(host_gpu(gpu), host_view(cpu), resource, values,
-                                                 count, rects);
+    host_of(self)->ClearUnorderedAccessViewFloat(host_gpu(gpu), host_uav_handle(cpu), resource,
+                                                 values, count, rects);
 }
 void STDMETHODCALLTYPE ignored_list_method(void *) {}
 template <std::size_t... Index>

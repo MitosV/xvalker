@@ -360,20 +360,25 @@ std::uintptr_t register_heap(ID3D12Device *device, void *owner, ID3D12Descriptor
     }
     std::memset(memory, 0, std::size_t{n} * (sampler ? sampler_slot : image_slot));
     const auto base = reinterpret_cast<std::uintptr_t>(memory);
-    {
-        const std::lock_guard lock(heaps_mutex);
-        heaps.push_back({owner, pc_heap, base, n, pc_cpu, pc_gpu, pc_stride, sampler,
-                         first, !sampler});
-    }
+    std::uint64_t actual_cpu = pc_cpu, actual_gpu = pc_gpu;
+    UINT actual_inc = pc_stride;
     if (!sampler) {
         const std::lock_guard lock(shared_mutex);
-        *host = shared.cpu + std::uint64_t{first} * shared.inc;
-        *gpu = shared.gpu + std::uint64_t{first} * shared.inc;
-        *host_stride = shared.inc;
+        actual_cpu = shared.cpu + std::uint64_t{first} * shared.inc;
+        actual_gpu = shared.gpu + std::uint64_t{first} * shared.inc;
+        actual_inc = shared.inc;
+        *host = actual_cpu;
+        *gpu = actual_gpu;
+        *host_stride = actual_inc;
     } else {
         *host = pc_cpu;
         *gpu = pc_gpu;
         *host_stride = pc_stride;
+    }
+    {
+        const std::lock_guard lock(heaps_mutex);
+        heaps.push_back({owner, pc_heap, base, n, actual_cpu, actual_gpu, actual_inc, sampler,
+                         first, !sampler});
     }
     return base;
 }
