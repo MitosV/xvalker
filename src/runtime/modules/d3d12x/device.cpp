@@ -4,6 +4,7 @@
 #include "runtime/modules/d3d12x.hpp"
 #include "runtime/modules/d3d12x/internal.hpp"
 #include "runtime/modules/d3d12x/uma.hpp"
+#include "runtime/modules/d3d12x/xcl_backend.hpp"
 #include "runtime/modules/placement.hpp"
 #include <algorithm>
 #include <array>
@@ -1627,6 +1628,7 @@ HRESULT STDMETHODCALLTYPE create_root_signature(ID3D12Device *self, UINT node, c
     if (SUCCEEDED(result) && signature && *signature) {
         read_root_signature(*signature, blob, size);
         remember_signature(static_cast<ID3D12RootSignature *>(*signature), blob, size);
+        xcl::remember_root_signature(*signature, blob, size);
     }
     if (FAILED(result)) {
         std::fprintf(stderr, "[Runtime] CreateRootSignature from %zu bytes: 0x%08lx\n",
@@ -1791,6 +1793,65 @@ bool host_graphics_pair(ID3D12Device *device, D3D12_SHADER_BYTECODE &vs, D3D12_S
     const bool pixel = host_bytecode(ShaderStage::pixel, ps);
     return vertex || pixel;
 }
+// The XCL shader backend translates every stage of a pipeline or none: a pipeline with a
+// shader the recompiler turns down goes through the current translator unchanged.
+ID3D12RootSignature *xcl_compute_shader(ID3D12Device *self, D3D12_SHADER_BYTECODE &cs) {
+    if (!xcl_backend() || !xcl::available())
+        return nullptr;
+    const auto container = shader_bytes(cs);
+    // A console container carries RDNA2 code in an XDAT part, often next to DXIL. XCL gets
+    // first refusal even then; a foreign blob is declined quickly and takes the old path.
+    if (container.size() < 32 || std::memcmp(container.data(), "DXBC", 4))
+        return nullptr;
+    std::string why;
+    const auto *const made = xcl::shader(modules::ShaderStage::compute, container, &why);
+    if (!made) {
+        if (static std::atomic<bool> shown{false}; !shown.exchange(true))
+            std::fprintf(stderr, "[Runtime] XCL compute declined: %s\n", why.c_str());
+        return nullptr;
+    }
+    if (static std::atomic<bool> shown{false}; !shown.exchange(true))
+        std::fprintf(stderr, "[Runtime] XCL compute translated (%zu DXIL bytes)\n",
+                     made->dxil.size());
+    auto *const signature = xcl::abi_root_signature(self, false, {made});
+    if (!signature)
+        return nullptr;
+    cs = {made->dxil.data(), made->dxil.size()};
+    return signature;
+}
+ID3D12RootSignature *xcl_graphics_shaders(ID3D12Device *self, D3D12_SHADER_BYTECODE &vs,
+                                          D3D12_SHADER_BYTECODE &ps) {
+    if (!xcl_backend() || !xcl::available())
+        return nullptr;
+    const auto vertex = shader_bytes(vs), pixel = shader_bytes(ps);
+    const auto console = [](std::span<const std::uint8_t> bytes) {
+        return bytes.size() >= 32 && !std::memcmp(bytes.data(), "DXBC", 4);
+    };
+    if (!console(vertex) || !console(pixel))
+        return nullptr;
+    std::string why;
+    const auto *const made_vs =
+        xcl::shader(modules::ShaderStage::vertex, vertex, &why);
+    if (!made_vs) {
+        if (static std::atomic<bool> shown{false}; !shown.exchange(true))
+            std::fprintf(stderr, "[Runtime] XCL vertex declined: %s\n", why.c_str());
+        return nullptr;
+    }
+    const auto *const made_ps = xcl::shader(modules::ShaderStage::pixel, pixel, &why);
+    if (!made_ps) {
+        if (static std::atomic<bool> shown{false}; !shown.exchange(true))
+            std::fprintf(stderr, "[Runtime] XCL pixel declined: %s\n", why.c_str());
+        return nullptr;
+    }
+    if (static std::atomic<bool> shown{false}; !shown.exchange(true))
+        std::fprintf(stderr, "[Runtime] XCL graphics translated\n");
+    auto *const signature = xcl::abi_root_signature(self, true, {made_vs, made_ps});
+    if (!signature)
+        return nullptr;
+    vs = {made_vs->dxil.data(), made_vs->dxil.size()};
+    ps = {made_ps->dxil.data(), made_ps->dxil.size()};
+    return signature;
+}
 // A pipeline without a root signature has it in its shaders, and the shader made for the
 // host does not carry it. On the host a pipeline is bound to the root signature it was made
 // with, and the title sets its own on its lists: the pipeline gets the newest one the title
@@ -1939,6 +2000,21 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
     if (desc) {
         host = *desc;
         host.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+        // XCL's ABI replaces the title's root signature only when both drawing shaders were
+        // translated; a mixed pipeline keeps the current translator entirely
+        if (!host.GS.pShaderBytecode && !host.HS.pShaderBytecode && !host.DS.pShaderBytecode)
+            if (auto *const abi = xcl_graphics_shaders(self, host.VS, host.PS)) {
+                host.pRootSignature = abi;
+                const auto xcl_result =
+                    original<Create>(self, 10)(self, &host, iid, state);
+                if (SUCCEEDED(xcl_result) && state && *state)
+                    xcl::remember_pipeline(static_cast<ID3D12PipelineState *>(*state), abi, true);
+                else if (FAILED(xcl_result))
+                    std::fprintf(stderr, "[Runtime] CreateGraphicsPipelineState with XCL: "
+                                         "0x%08lx\n",
+                                 static_cast<unsigned long>(xcl_result));
+                return xcl_result;
+            }
         // The console's R10G10B10_SNORM_A2_UNORM (189), what packed normals are in, is no
         // vertex format of the host's: its bits are read unsigned there
         if (host.InputLayout.pInputElementDescs) {
@@ -2041,6 +2117,16 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
     if (desc) {
         host = *desc;
         host.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+        if (auto *const abi = xcl_compute_shader(self, host.CS)) {
+            host.pRootSignature = abi;
+            const auto xcl_result = original<Create>(self, 11)(self, &host, iid, state);
+            if (SUCCEEDED(xcl_result) && state && *state)
+                xcl::remember_pipeline(static_cast<ID3D12PipelineState *>(*state), abi, false);
+            else if (FAILED(xcl_result))
+                std::fprintf(stderr, "[Runtime] CreateComputePipelineState with XCL: 0x%08lx\n",
+                             static_cast<unsigned long>(xcl_result));
+            return xcl_result;
+        }
         if (host_bytecode(modules::ShaderStage::compute, host.CS) && !host.pRootSignature)
             host.pRootSignature = from_shader = shader_root_signature(self, false, {desc->CS});
     }
@@ -2951,6 +3037,7 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
     list->heaps[0] = list->heaps[1] = nullptr;
     list->topology = 0;
     list->indices = {};
+    xcl::clear_list(self);
     return host_of(self)->Reset(allocator, state);
 }
 // the host's GPU handle for a console one, which is the descriptor's address in the shadow
@@ -2964,21 +3051,25 @@ D3D12_GPU_DESCRIPTOR_HANDLE host_gpu(D3D12_GPU_DESCRIPTOR_HANDLE handle) {
 // as the table says, once bound
 void STDMETHODCALLTYPE set_compute_root_signature(void *self, ID3D12RootSignature *signature) {
     static_cast<ListProxy *>(self)->compute_root = signature;
+    xcl::set_root_signature(self, signature, false);
     host_of(self)->SetComputeRootSignature(signature);
 }
 void STDMETHODCALLTYPE set_graphics_root_signature(void *self, ID3D12RootSignature *signature) {
     static_cast<ListProxy *>(self)->graphics_root = signature;
+    xcl::set_root_signature(self, signature, true);
     host_of(self)->SetGraphicsRootSignature(signature);
 }
 void STDMETHODCALLTYPE set_compute_root_table(void *self, UINT parameter,
                                               D3D12_GPU_DESCRIPTOR_HANDLE table) {
     decode_table(static_cast<ListProxy *>(self)->compute_root, parameter, table.ptr);
+    xcl::write_table(self, parameter, table.ptr, false);
     bind_heap_of(self, table.ptr);
     host_of(self)->SetComputeRootDescriptorTable(parameter, host_gpu(table));
 }
 void STDMETHODCALLTYPE set_graphics_root_table(void *self, UINT parameter,
                                                D3D12_GPU_DESCRIPTOR_HANDLE table) {
     decode_table(static_cast<ListProxy *>(self)->graphics_root, parameter, table.ptr);
+    xcl::write_table(self, parameter, table.ptr, true);
     bind_heap_of(self, table.ptr);
     host_of(self)->SetGraphicsRootDescriptorTable(parameter, host_gpu(table));
 }
@@ -3048,6 +3139,7 @@ D3D12_INDEX_BUFFER_VIEW quad_indices(UINT quads) {
 void STDMETHODCALLTYPE draw_instanced(void *self, UINT vertices, UINT instances, UINT first,
                                       UINT first_instance) {
     count_draw(self);
+    xcl::before_draw(self, host_of(self));
     auto *const list = static_cast<ListProxy *>(self);
     if (list->topology == quad_list) {
         const auto view = quad_indices(vertices / 4);
@@ -3064,6 +3156,7 @@ void STDMETHODCALLTYPE draw_instanced(void *self, UINT vertices, UINT instances,
 void STDMETHODCALLTYPE draw_indexed_instanced(void *self, UINT indices, UINT instances, UINT first,
                                               INT base, UINT first_instance) {
     count_draw(self);
+    xcl::before_draw(self, host_of(self));
     if (static std::atomic<bool> shown{false};
         static_cast<ListProxy *>(self)->topology == quad_list && !shown.exchange(true)) {
         std::fprintf(stderr, "[Runtime] an indexed quad list is drawn as a triangle list, which "
@@ -3203,22 +3296,55 @@ std::uint64_t root_constants(std::uint64_t address) {
 }
 void STDMETHODCALLTYPE set_graphics_root_cbv(void *self, UINT index, std::uint64_t address) {
     trace_address("SetGraphicsRootConstantBufferView", address);
+    xcl::write_view(self, index, address, true);
     host_of(self)->SetGraphicsRootConstantBufferView(index, root_constants(address));
 }
 void STDMETHODCALLTYPE set_compute_root_cbv(void *self, UINT index, std::uint64_t address) {
+    xcl::write_view(self, index, address, false);
     host_of(self)->SetComputeRootConstantBufferView(index, root_constants(address));
 }
 void STDMETHODCALLTYPE set_compute_root_srv(void *self, UINT index, std::uint64_t address) {
+    xcl::write_view(self, index, address, false);
     host_of(self)->SetComputeRootShaderResourceView(index, root_address(address));
 }
 void STDMETHODCALLTYPE set_graphics_root_srv(void *self, UINT index, std::uint64_t address) {
+    xcl::write_view(self, index, address, true);
     host_of(self)->SetGraphicsRootShaderResourceView(index, root_address(address));
 }
 void STDMETHODCALLTYPE set_compute_root_uav(void *self, UINT index, std::uint64_t address) {
+    xcl::write_view(self, index, address, false);
     host_of(self)->SetComputeRootUnorderedAccessView(index, root_address(address));
 }
 void STDMETHODCALLTYPE set_graphics_root_uav(void *self, UINT index, std::uint64_t address) {
+    xcl::write_view(self, index, address, true);
     host_of(self)->SetGraphicsRootUnorderedAccessView(index, root_address(address));
+}
+// Root constants are captured for the XCL ABI; the title's own call still goes to the host
+void STDMETHODCALLTYPE set_compute_root_constant(void *self, UINT index, UINT value, UINT at) {
+    xcl::write_constant(self, index, at, 1, &value, false);
+    host_of(self)->SetComputeRoot32BitConstant(index, value, at);
+}
+void STDMETHODCALLTYPE set_graphics_root_constant(void *self, UINT index, UINT value, UINT at) {
+    xcl::write_constant(self, index, at, 1, &value, true);
+    host_of(self)->SetGraphicsRoot32BitConstant(index, value, at);
+}
+void STDMETHODCALLTYPE set_compute_root_constants(void *self, UINT index, UINT count,
+                                                  const void *values, UINT at) {
+    xcl::write_constant(self, index, at, count, values, false);
+    host_of(self)->SetComputeRoot32BitConstants(index, count, values, at);
+}
+void STDMETHODCALLTYPE set_graphics_root_constants(void *self, UINT index, UINT count,
+                                                   const void *values, UINT at) {
+    xcl::write_constant(self, index, at, count, values, true);
+    host_of(self)->SetGraphicsRoot32BitConstants(index, count, values, at);
+}
+void STDMETHODCALLTYPE set_pipeline_state(void *self, ID3D12PipelineState *pipeline) {
+    xcl::set_pipeline(self, pipeline);
+    host_of(self)->SetPipelineState(pipeline);
+}
+void STDMETHODCALLTYPE dispatch_x(void *self, UINT groups_x, UINT groups_y, UINT groups_z) {
+    xcl::before_draw(self, host_of(self));
+    host_of(self)->Dispatch(groups_x, groups_y, groups_z);
 }
 void STDMETHODCALLTYPE so_set_targets(void *self, UINT start, UINT count,
                                       const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) {
@@ -3370,6 +3496,12 @@ std::array<Slot, list_slots> list_vtable_of(std::index_sequence<Index...>) {
     vtable[44] = reinterpret_cast<Slot>(&set_graphics_root_srv);
     vtable[45] = reinterpret_cast<Slot>(&set_compute_root_uav);
     vtable[46] = reinterpret_cast<Slot>(&set_graphics_root_uav);
+    vtable[37] = reinterpret_cast<Slot>(&set_compute_root_constant);
+    vtable[38] = reinterpret_cast<Slot>(&set_graphics_root_constant);
+    vtable[39] = reinterpret_cast<Slot>(&set_compute_root_constants);
+    vtable[40] = reinterpret_cast<Slot>(&set_graphics_root_constants);
+    vtable[25] = reinterpret_cast<Slot>(&set_pipeline_state);
+    vtable[78] = reinterpret_cast<Slot>(&dispatch_x);
     vtable[49] = reinterpret_cast<Slot>(&so_set_targets);
     vtable[47] = reinterpret_cast<Slot>(&set_index_buffer);
     vtable[48] = reinterpret_cast<Slot>(&set_vertex_buffers);
