@@ -42,6 +42,8 @@ pub(super) struct Em {
     pub static_used: Vec<([u32; 4], bool)>,
     /// highest VGPR the program references (v_movrel* ranges)
     pub max_vgpr: u64,
+    /// PC of the instruction being emitted (the host-wave map is indexed by PC)
+    pc: u64,
 }
 
 /// Instructions without an effect in this execution model.
@@ -303,6 +305,7 @@ impl Em {
             static_ss: BTreeMap::new(),
             static_used: Vec::new(),
             max_vgpr: 0,
+            pc: 0,
         }
     }
 
@@ -551,6 +554,7 @@ impl Em {
     // ---------------------------------------------------------------- one instruction
 
     pub fn inst(&mut self, d: &Decoded, next: u64) -> Flow {
+        self.pc = d.pc;
         let name = d.inst.name.to_ascii_lowercase();
         let text = rdna2::format(d);
         self.line(&format!("// {:04x}: {text}", d.pc));
@@ -2876,8 +2880,15 @@ impl Em {
                 return Ok(());
             }
             "v_readlane_b32" => {
+                let idempotent = self.opt.host_map.idempotent.contains(&self.pc);
                 let t = self.t();
-                self.line(&format!("uint {t} = rla({a}, {b} & {wmask}u);"));
+                if idempotent {
+                    // Each half reduced its own lanes; the upper half's lane 32+k is
+                    // the invoking half's lane k for an idempotent operation.
+                    self.line(&format!("uint {t} = rla_local({a}, {b} & 31u);"));
+                } else {
+                    self.line(&format!("uint {t} = rla({a}, {b} & {wmask}u);"));
+                }
                 self.write32(&dst, &t);
                 return Ok(());
             }
@@ -3615,7 +3626,7 @@ impl Em {
                 let t = ms.threads;
                 let _ = writeln!(h, "[WaveSize({native_lanes})]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{{");
                 if split_wave32 {
-                    h.push_str("    xcl_half = (gi >> 5) & 1u;\n    xcl_logical_wave64 = true;\n    lane_id = WaveGetLaneIndex() + 32u * xcl_half;\n");
+                    h.push_str("    xcl_half = (gi >> 5) & 1u;\n    xcl_logical_wave64 = true;\n        lane_id = WaveGetLaneIndex() + 32u * xcl_half;\n");
                 } else {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
@@ -4455,6 +4466,9 @@ static uint xcl_half = 0u;
 // A logical wave64 split over two native wave32s. Each half carries only its own mask;
 // geometry mode rejects cross-half lane reads before generating this form.
 static bool xcl_logical_wave64 = false;
+// An idempotent wave reduction is folded in each half separately: reading the upper
+// half's lane 32+k is the same as reading lane k of the invoking half.
+uint rla_local(uint v, uint l) { return WaveReadLaneAt(v, l & 31u); }
 bool lanebit(uint lo, uint hi) { return ((select(lane_id < 32u, lo, hi) >> (lane_id & 31u)) & 1u) != 0u; }
 uint2 ballot(bool b) {
     uint4 m = WaveActiveBallot(b);
@@ -4638,3 +4652,4 @@ uint fclass64(double f) {
     return n ? 3u : 8u;
 }
 "#;
+

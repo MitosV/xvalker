@@ -54,7 +54,9 @@
 pub(crate) mod emit;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
+pub mod wave64_host;
 pub use emit::mesh_passthrough;
+pub use wave64_host::HostWaveMap;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -466,6 +468,9 @@ pub struct Options {
     pub mesh_wave32: bool,
     /// host subgroup size: 32 runs a logical wave64 in two native wave32 halves (0: native wave64)
     pub host_wave: u32,
+    /// per-instruction rewrites for a 32-lane host (idempotent reduction / uniform read /
+    /// groupshared exchange), filled by `translate` when `host_wave == 32`
+    pub host_map: HostWaveMap,
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
     pub static_sampler_base: u32,
@@ -480,7 +485,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, mesh_wave32: false, host_wave: 0, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, mesh_wave32: false, host_wave: 0, host_map: HostWaveMap::default(), static_sampler_base: 0, mem_windows: 1, structured: true }
     }
 }
 
@@ -1042,6 +1047,10 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
 /// (VS / PS: the driver picks the wave size): reads of a lane ≥ 32 or of a lane chosen at run
 /// time. A wave32 program in 64-lane waves is handled (the halves act as separate waves).
 pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
+    wave_hazards_with(code, &HostWaveMap::default())
+}
+
+fn wave_hazards_with(code: &[u8], map: &HostWaveMap) -> BTreeSet<&'static str> {
     let mut out = BTreeSet::new();
     let mut off = 0;
     while off + 4 <= code.len() {
@@ -1049,6 +1058,9 @@ pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
         off += d.len;
         match d.inst.name {
             "V_READLANE_B32" | "V_WRITELANE_B32" => {
+                if map.is_rewritten(d.pc) {
+                    continue;
+                }
                 let lane = rdna2::field_value(d.enc, &d.words, "SRC1").unwrap_or(0);
                 match lane {
                     0..=105 => {
@@ -1064,7 +1076,9 @@ pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
                 }
             }
             "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" => {
-                out.insert("ds_(b)permute: arbitrary lane");
+                if !map.exchange.contains(&d.pc) {
+                    out.insert("ds_(b)permute: arbitrary lane");
+                }
             }
             _ => {}
         }
@@ -1076,6 +1090,10 @@ pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
 /// preserving one logical wave64. Split geometry and split mesh translation reject these
 /// rather than silently changing cross-half lane or mask semantics.
 pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
+    geometry_wave32_hazards_with(code, &HostWaveMap::default())
+}
+
+fn geometry_wave32_hazards_with(code: &[u8], map: &HostWaveMap) -> BTreeSet<&'static str> {
     let mut out = BTreeSet::new();
     let mut mask_regs = BTreeSet::from([106u64, 107, 126, 127]); // VCC and EXEC
     let mut mask_scc = false;
@@ -1111,7 +1129,8 @@ pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
         if mask_scc && matches!(n, "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1") {
             out.insert("branch on a half-local scalar condition");
         }
-        if matches!(
+        let rewritten = map.is_rewritten(d.pc) || map.reduction_chain.contains(&d.pc);
+        if (matches!(
             n,
             "V_READLANE_B32"
                 | "V_WRITELANE_B32"
@@ -1121,7 +1140,9 @@ pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
                 | "DS_BPERMUTE_B32"
                 | "DS_PERMUTE_B32"
                 | "DS_SWIZZLE_B32"
-        ) || d.enc.name.contains("DPP")
+        ) || d.enc.name.contains("DPP"))
+            && !rewritten
+            && !map.exchange.contains(&d.pc)
         {
             out.insert("cross-half lane exchange");
         }
@@ -1163,19 +1184,23 @@ pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
 /// also preserve mask semantics; VS, PS and CS have one invocation per lane and only need
 /// the lane exchanges to be representable in a half.
 pub fn host_hazards(code: &[u8], mode: &Mode, host_wave: u32) -> BTreeSet<&'static str> {
+    host_hazards_with(code, mode, host_wave, &wave64_host::analyze(code))
+}
+
+fn host_hazards_with(code: &[u8], mode: &Mode, host_wave: u32, map: &HostWaveMap) -> BTreeSet<&'static str> {
     if host_wave != 32 {
         return BTreeSet::new();
     }
     match mode {
-        Mode::Mesh(_) | Mode::Geometry(_) => geometry_wave32_hazards(code),
-        _ => wave_hazards(code),
+        Mode::Mesh(_) | Mode::Geometry(_) => geometry_wave32_hazards_with(code, map),
+        _ => wave_hazards_with(code, map),
     }
 }
 
 /// Translate a complete ES+GS program for the adapter-selected geometry path.
 pub fn translate_geometry(code: &[u8], interface: GsInterface, geometry_wave32: bool) -> Result<Translation, String> {
     if geometry_wave32 {
-        let hazards = geometry_wave32_hazards(code);
+        let hazards = host_hazards(code, &Mode::Geometry(interface.clone()), 32);
         if !hazards.is_empty() {
             return Err(format!("geometry program requires unsupported cross-half wave64 semantics: {hazards:?}"));
         }
@@ -1190,7 +1215,7 @@ pub fn translate_geometry(code: &[u8], interface: GsInterface, geometry_wave32: 
 /// when it needs cross-half semantics, as for split geometry.
 pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, mesh_wave32: bool) -> Result<Translation, String> {
     if wave64 && mesh_wave32 {
-        let hazards = geometry_wave32_hazards(code);
+        let hazards = host_hazards(code, &Mode::Mesh(ms.clone()), 32);
         if !hazards.is_empty() {
             return Err(format!("mesh program requires unsupported cross-half wave64 semantics: {hazards:?}"));
         }
@@ -1281,12 +1306,15 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    let host_map = if opt.host_wave == 32 { wave64_host::analyze(code) } else { HostWaveMap::default() };
     if opt.wave64 {
-        let hazards = host_hazards(code, &opt.mode, opt.host_wave);
+        let hazards = host_hazards_with(code, &opt.mode, opt.host_wave, &host_map);
         if !hazards.is_empty() {
             return Err(format!("wave64 program needs unsupported cross-half semantics on a {}-lane host: {hazards:?}", opt.host_wave));
         }
     }
+    let mut opt = opt.clone();
+    opt.host_map = host_map;
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {

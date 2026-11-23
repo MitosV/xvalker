@@ -226,3 +226,9 @@ No other vendored file is changed by these edits.
 (a cfg that is never set), so the Windows DLL does not build XCL's runtime capture code.
 `src/rpf.rs` is unchanged; its Windows branch uses `windows-sys`, a Windows-only dependency of
 `tools/xcl-recomp`.
+## `src/gpu/recomp/wave64_host.rs` and emit/hazard changes (idempotent reductions)
+
+A 32-lane host cannot read a wave64's lane `32+k`. A VGPR whose value is a min/max/and/or
+reduction over DPP/permlanex16 is reduced in each half separately; `v_readlane_b32 ..., 32+k`
+is emitted as `WaveReadLaneAt(v, k & 31)` (`rla_local`). The hazard detectors skip those
+reads and the recognized DPP/permlane chain. `add`/`xor` are not classified as idempotent.
